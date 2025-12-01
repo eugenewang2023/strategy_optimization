@@ -1,0 +1,6 @@
+entry_idx,entry_price,exit_idx,exit_price,reason
+76,0.40957,77,0.411145,trailingTP
+90,0.4139815,91,0.42294,trailingTP
+116,0.416685,117,0.416307,trailingTP
+139,0.40091,140,0.4033025,trailingTP
+178,0.398065,179,0.39696,trailingTP

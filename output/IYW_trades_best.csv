@@ -1,0 +1,16 @@
+entry_idx,entry_price,exit_idx,exit_price,reason
+2,165.53,3,164.56,trailingTP
+16,165.31,17,165.405,trailingTP
+23,164.89,24,161.17,sellSignal
+29,160.3,30,158.91,trailingTP
+43,161.195,44,162.035,trailingTP
+75,149.5,76,150.125,trailingTP
+87,139.54,88,132.94,trailingTP
+96,135.35,97,140.2,trailingTP
+119,158.95,120,158.19,trailingTP
+168,181.68,169,182.08,trailingTP
+180,181.44,181,181.21,trailingTP
+188,182.85,189,182.83,trailingTP
+220,199.72,221,199.61,trailingTP
+235,204.86,236,203.315,trailingTP
+248,198.67,248,198.67,endClose
