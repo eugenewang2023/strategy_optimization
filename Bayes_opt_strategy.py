@@ -31,7 +31,7 @@ def backtest_df_fixed(df, atrPeriod, slMultiplier, tpMultiplier, trailMultiplier
 
     for c in ['Open','High','Low','Close','Volume']:
         if c not in df.columns:
-            raise ValueError(f"CSV missing required column: {c}")
+            raise ValueError(f"file missing required column: {c}")
 
     high = df['High'].astype(float).values
     low  = df['Low'].astype(float).values
@@ -185,10 +185,10 @@ def run_optimization():
     # load CSVs
     csvs = {}
     for fn in os.listdir(DATA_DIR):
-        if fn.lower().endswith(".csv"):
+        if fn.lower().endswith(".parquet"):
             path = os.path.join(DATA_DIR, fn)
             try:
-                df = pd.read_csv(path)
+                df = pd.read_parquet(path)
                 csvs[os.path.splitext(fn)[0].upper()] = df
             except Exception as e:
                 print(f"Failed to load {fn}: {e}")
