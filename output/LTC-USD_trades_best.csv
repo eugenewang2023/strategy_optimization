@@ -1,7 +1,0 @@
-entry_idx,entry_price,exit_idx,exit_price,reason
-52,83.846,53,83.6667,trailingTP
-90,84.855,91,86.798,trailingTP
-115,86.207,116,85.641,trailingTP
-139,86.16905,140,86.96385,trailingTP
-178,86.0425,179,85.683,trailingTP
-198,85.6538,199,84.88235,trailingTP
