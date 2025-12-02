@@ -1,2 +1,2 @@
-echo python Bayes_opt_strategy.py
-python Bayes_opt_strategy.py
+echo python Bayes_opt_dynamic_SR.py
+python Bayes_opt_dynamic_SR.py
