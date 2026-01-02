@@ -1,0 +1,12 @@
+# Cache files
+adapt_RSI/__pycache__/*
+adapt_RSI/cache/*
+adapt_RSI/data/*
+adapt_RSI/result/*
+
+Dynamic_SR/__pycache__/*
+Dynamic_SR/cache/*
+Dynamic_SR/data/*
+Dynamic_SR/result/*
+
+# Log files
