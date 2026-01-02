@@ -196,8 +196,44 @@ def calculate_all_rsi_numba(close: np.ndarray, min_period: int, max_period: int)
     for p_idx in prange(num_periods):
         period = min_period + p_idx
         all_rsi[:, p_idx] = rsi_numba(close, period)
-    
     return all_rsi
+
+@jit(nopython=True, cache=True)
+def run_simulation_numba(close, buy_signal, sell_signal, initial_capital, pos_size_pct, comm_pct):
+    n = len(close)
+    equity_curve = np.zeros(n)
+    capital = initial_capital
+    position = 0.0
+    entry_price = 0.0
+    
+    trade_pnls = [] # Numba handles lists of floats well
+    
+    for i in range(n):
+        # Entry Logic
+        if buy_signal[i] and position == 0:
+            pos_value = capital * pos_size_pct
+            position = pos_value / close[i]
+            entry_price = close[i]
+            # Deduct position + commission
+            capital -= (pos_value + (pos_value * comm_pct))
+        
+        # Exit Logic
+        elif sell_signal[i] and position > 0:
+            exit_val = position * close[i]
+            exit_comm = exit_val * comm_pct
+            capital += (exit_val - exit_comm)
+            
+            # Record PnL for metrics later
+            trade_pnl = (exit_val - exit_comm) - (position * entry_price)
+            trade_pnls.append(trade_pnl)
+            
+            position = 0.0
+            entry_price = 0.0
+            
+        # Update Equity
+        cur_pos_val = position * close[i] if position > 0 else 0.0
+        equity_curve[i] = capital + cur_pos_val
+    return equity_curve, trade_pnls
 
 @dataclass
 class StrategyParams:
@@ -389,119 +425,63 @@ class BayesianRSIATROptimizer:
                     # Update Trailing Stop
                     new_stop = ha_low[i] - trail_offset[i]
                     if new_stop > trail_stop:
-                        trail_stop = new_stop
-                        
+                        trail_stop = new_stop                 
         return buy_signal, sell_signal
 
     def backtest_single(self, df: pd.DataFrame, params: StrategyParams) -> Dict[str, Any]:
-        """Run backtest on single file"""
         try:
             df = self.calculate_indicators_fast(df, params)
-            close = df['close'].values
+            
+            # Define arrays for Numba
+            close_arr = df['close'].values
+            
+            # 1. Generate Signals (Heikin Ashi logic)
             buy_signal, sell_signal = self.calculate_signals_vectorized(
-                df['close'].values, 
+                close_arr, 
                 df['ha_close'].values, 
                 df['ha_low'].values, 
                 df['adaptive_rsi'].values, 
                 df['slow_rsi'].values, 
                 df['lower_channel'].values, 
                 df['trail_offset'].values
-                )
-            signal_count = int(np.sum(buy_signal))
-            # print(f" Buy/Sell signals: {buy_signal.sum()}/{sell_signal.sum()}")
+            )
             
-            # Portfolio simulation
-            capital = params.initial_capital
-            position = 0.0
-            entry_price = 0.0
+            # 2. Run High-Speed Simulation
+            equity_curve, trade_pnls = run_simulation_numba(
+                close_arr, 
+                buy_signal, 
+                sell_signal, 
+                params.initial_capital, 
+                params.position_size_pct, 
+                params.commission_pct
+            )
             
-            equity_curve = np.zeros(len(df))
-            returns = np.zeros(len(df))
-            trades = []
+            # 3. Calculate Metrics from the results
+            n_trades = len(trade_pnls)
+            total_ret_pct = ((equity_curve[-1] - params.initial_capital) / params.initial_capital) * 100
             
-            for i in range(len(df)):
-                if buy_signal[i] and position == 0:
-                    position_value = capital * params.position_size_pct
-                    position = position_value / close[i]
-                    entry_price = close[i]
-                    
-                    commission = position_value * params.commission_pct
-                    capital -= commission
-                    
-                    trades.append({'entry_idx': i, 'entry_price': entry_price})
-                
-                elif sell_signal[i] and position > 0 and trades:
-                    exit_value = position * close[i]
-                    capital += exit_value
-                    
-                    commission = exit_value * params.commission_pct
-                    capital -= commission
-                    
-                    trade = trades[-1]
-                    trade_pnl = exit_value - (position * trade['entry_price'])
-                    trades[-1]['pnl'] = trade_pnl
-                    trades[-1]['return_pct'] = trade_pnl / (position * trade['entry_price']) * 100
-                    
-                    position = 0.0
-                    entry_price = 0.0
-                
-                current_position_value = position * close[i] if position > 0 else 0.0
-                equity = capital + current_position_value
-                equity_curve[i] = equity
-                
-                if i > 0:
-                    returns[i] = (equity_curve[i] - equity_curve[i-1]) / equity_curve[i-1]
+            # Sharpe Ratio
+            returns = np.diff(equity_curve) / equity_curve[:-1]
+            sharpe = (np.mean(returns) / np.std(returns) * np.sqrt(252)) if (len(returns) > 0 and np.std(returns) > 0) else 0.0
             
-            # Calculate metrics
-            total_return = equity_curve[-1] - params.initial_capital
-            total_return_pct = total_return / params.initial_capital * 100
-            
-            daily_returns = returns[returns != 0]
-            if len(daily_returns) > 1:
-                sharpe_ratio = np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252)
-            else:
-                sharpe_ratio = 0.0
-            
-            cumulative_max = np.maximum.accumulate(equity_curve)
-            drawdowns = (equity_curve - cumulative_max) / cumulative_max
-            max_drawdown = np.min(drawdowns) * 100
-            
-            completed_trades = [t for t in trades if 'pnl' in t]
-            n_trades = len(completed_trades)
-            
-            if n_trades > 0:
-                winning_trades = [t for t in completed_trades if t['pnl'] > 0]
-                win_rate = len(winning_trades) / n_trades * 100
-                avg_return = np.mean([t['return_pct'] for t in completed_trades])
-            else:
-                win_rate = 0.0
-                avg_return = 0.0
-            
+            # Drawdown
+            cum_max = np.maximum.accumulate(equity_curve)
+            drawdown = (equity_curve - cum_max) / cum_max
+            max_dd = np.min(drawdown) * 100
+
             return {
-                'total_return': total_return,
-                'total_return_pct': total_return_pct,
-                'sharpe_ratio': sharpe_ratio,
-                'max_drawdown': max_drawdown,
+                'total_return_pct': total_ret_pct,
+                'sharpe_ratio': sharpe,
+                'max_drawdown': max_dd,
                 'n_trades': n_trades,
-                'signal_count': signal_count,
-                'win_rate': win_rate,
-                'avg_return': avg_return,
                 'final_equity': equity_curve[-1]
             }
-            
+
         except Exception as e:
             logger.error(f"backtest_single error: {e}")
-            return {
-                'total_return': -float('inf'),
-                'total_return_pct': -float('inf'),
-                'sharpe_ratio': -float('inf'),
-                'max_drawdown': 100.0,
-                'n_trades': 0,
-                'win_rate': 0.0,
-                'avg_return': 0.0,
-                'final_equity': params.initial_capital
-            }
+            return {'total_return_pct': -100.0, 'n_trades': 0}
         
+
     def run_backtest(self, files: list, sample_size: int, **kwargs) -> dict:
         """
         Run backtest across multiple files using provided strategy parameters.
@@ -532,98 +512,84 @@ class BayesianRSIATROptimizer:
         return agg_metrics
 
     def objective(self, trial, files, sample_size, n_files):
-        # --- Start from defaults ---
-        params = DEFAULT_PARAMS.copy()
+            # --- Start from defaults ---
+            params = DEFAULT_PARAMS.copy()
 
-        # --- Parameters to optimize (subset only) ---
-        param_ranges = {
-            "base_period": (10, 20),
-            "min_period": (3, 10),
-            "max_period": (20, 40),
-            "fast_period": (2, 10),
-            "slow_period": (5, 20),
-            "channel_length": (20, 60),
-            "channel_multi": (1.5, 3.0),
-            "atr_period": (10, 20),
-            "sl_multiplier": (1.2, 3.0),
-            "tp_multiplier": (1.5, 3.0),
-            "trail_multiplier": (1.0, 2.0),
-            "steepness": (5, 15),
-            "fast_steepness": (5, 15),
-            "slow_steepness": (5, 15)
-        }
+            # --- Parameters to optimize ---
+            param_ranges = {
+                "base_period": (10, 20),
+                "min_period": (3, 10),
+                "max_period": (20, 40),
+                "fast_period": (2, 10),
+                "slow_period": (15, 45), # Increased range to force a gap
+                "channel_length": (20, 60),
+                "channel_multi": (1.5, 3.0),
+                "atr_period": (10, 20),
+                "sl_multiplier": (1.5, 4.0), # Wider stops for HA smoothing
+                "tp_multiplier": (1.5, 5.0),
+                "trail_multiplier": (1.0, 3.0),
+                "steepness": (1, 10),      # Lowered: avoid binary 0/100 RSI
+                "fast_steepness": (1, 10), 
+                "slow_steepness": (1, 10)
+            }
 
-        # --- Safety check ---
-        assert all(
-            isinstance(v, tuple) and len(v) == 2
-            for v in param_ranges.values()
-        ), "param_ranges must contain (low, high) tuples"
+            # --- Sample ONLY the ranged parameters ---
+            for name, (low, high) in param_ranges.items():
+                if isinstance(low, int) and isinstance(high, int):
+                    params[name] = trial.suggest_int(name, low, high)
+                else:
+                    params[name] = trial.suggest_float(name, low, high)
 
-        # --- Sample ONLY the ranged parameters ---
-        for name, (low, high) in param_ranges.items():
-            if isinstance(low, int) and isinstance(high, int):
-                params[name] = trial.suggest_int(name, low, high)
-            else:
-                params[name] = trial.suggest_float(name, low, high)
+            # --- HARD CONSTRAINTS (Calculated after sampling) ---
+            # 1. Force Fast < Slow gap (Critical for HA)
+            if params["fast_period"] >= params["slow_period"]:
+                # Instead of returning None, suggest a valid range or penalize
+                return -20.0 
 
-        # --- Force known-working parameters for the first trial ---
-        if trial.number == 0:
-            params.update({
-                "fast_period": 5,
-                "slow_period": 14,
-                "channel_multi": 1.8,
-                "sl_multiplier": 1.5
-            })
+            # 2. Adaptive RSI logic constraints
+            if params["min_period"] >= params["base_period"] or params["max_period"] <= params["base_period"]:
+                return -20.0
 
-        # --- STEP 3: DEBUG FORCE for first few trials ---
-        if trial.number < 5:
-            params["channel_multi"] = 1.5  # slightly higher to increase trigger probability
-            params["sl_multiplier"] = 1.5  # make stop loss wider
+            # --- Force known-working parameters for Trial 0 to kickstart Optuna ---
+            if trial.number == 0:
+                params.update({
+                    "fast_period": 5,
+                    "slow_period": 25,
+                    "steepness": 2.0,
+                    "fast_steepness": 2.0,
+                    "slow_steepness": 2.0,
+                    "channel_multi": 2.0,
+                    "sl_multiplier": 3.0
+                })
 
-        # --- HARD CONSTRAINTS ---
-        if params["fast_period"] >= params["slow_period"]:
-            print("Skipping invalid fast/slow combo:", params)
-            return None  # tells Optuna to ignore this trial
-        if params["min_period"] >= params["base_period"]:
-            return -10.0
-        if params["max_period"] <= params["base_period"]:
-            return -10.0
+            try:
+                # --- Run backtest ---
+                result = self.run_backtest(
+                    files=files[:n_files],
+                    sample_size=sample_size,
+                    **params
+                )
 
-        try:
-            # --- Run backtest ---
-            result = self.run_backtest(
-                files=files[:n_files],
-                sample_size=sample_size,
-                **params
-            )
-
-            print("Trial params:", params)
-            trades = result.get("total_trades", 0)
-
-            # --- Retry/backoff for first few trials if zero trades ---
-            if trades == 0 and trial.number < 5:
-                # slight nudge for first few trials
-                params["channel_multi"] *= 1.5  # bigger nudge
-                params["sl_multiplier"] *= 1.5
-                result = self.run_backtest(files=files[:n_files], sample_size=sample_size, **params)
                 trades = result.get("total_trades", 0)
+                
+                # --- Handle Zero Trades ---
                 if trades == 0:
-                    print("⚠️ Still no trades for params:", params)
+                    # Assign a worse score than any losing strategy (-10)
+                    # This ensures Optuna treats 0 trades as a total failure
                     return -10.0
 
-            # --- Penalize zero-trade trials ---
-            if trades == 0:
-                print("⚠️ No trades for params:", params)
-                return -10.0
+                # --- Objective Logic ---
+                # We want to maximize Sharpe Ratio, but we also want to reward 
+                # strategies that actually trade. 
+                sharpe = result.get("avg_sharpe", 0.0)
+                # Add a small bonus for trade frequency to avoid "lucky" 1-trade trials
+                # score = sharpe + (min(trades, 50) / 500) 
+                return sharpe
 
-            # --- Return objective metric (Sharpe) ---
-            return result.get("sharpe", 0.0)
-
-        except Exception as e:
-            print(f"Backtest error: {e}")
-            return -10.0
-
-
+            except Exception as e:
+                print(f"Backtest error in Trial {trial.number}: {e}")
+                return -20.0
+            
     def aggregate_metrics(self, results: List[Dict]) -> Dict[str, Any]:
         """Aggregate metrics across files safely"""
 
