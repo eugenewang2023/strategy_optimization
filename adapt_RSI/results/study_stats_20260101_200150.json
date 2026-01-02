@@ -1,0 +1,18 @@
+{
+  "best_value": -10.0,
+  "best_params": {
+    "base_period": 13,
+    "min_period": 8,
+    "max_period": 30,
+    "fast_period": 6,
+    "slow_period": 11,
+    "channel_length": 34,
+    "channel_multi": 1.1522752509513796,
+    "sl_multiplier": 1.8929409166199482,
+    "tp_multiplier": 2.6011150117432087
+  },
+  "n_trials": 10,
+  "completed_trials": 10,
+  "pruned_trials": 0,
+  "failed_trials": 0
+}

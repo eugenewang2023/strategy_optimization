@@ -1,0 +1,16 @@
+# Bayesian Optimization Requirements
+numpy>=1.24.0
+pandas>=2.0.0
+numba>=0.57.0
+optuna>=3.3.0
+plotly>=5.15.0
+pyarrow>=12.0.0
+tqdm>=4.65.0
+scipy>=1.11.0
+joblib>=1.3.0
+
+# Optional for additional features
+hyperopt>=0.2.7        # Alternative optimization library
+scikit-optimize>=0.9.0 # Another optimization alternative
+matplotlib>=3.7.0      # For additional plotting
+seaborn>=0.12.0        # For statistical visualizations

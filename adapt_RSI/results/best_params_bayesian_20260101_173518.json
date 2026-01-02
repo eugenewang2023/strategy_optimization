@@ -1,0 +1,17 @@
+{
+  "base_period": 11,
+  "min_period": 1,
+  "max_period": 23,
+  "fast_period": 3,
+  "slow_period": 6,
+  "channel_length": 96,
+  "channel_multi": 3.396896099223678,
+  "atr_period": 17,
+  "sl_multiplier": 1.2615344229334267,
+  "tp_multiplier": 0.9395245130287274,
+  "trail_multiplier": 2.084275776885255,
+  "steepness": 7,
+  "fast_steepness": 2,
+  "slow_steepness": 8,
+  "score": 0.0
+}

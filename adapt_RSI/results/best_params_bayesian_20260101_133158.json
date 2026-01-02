@@ -1,0 +1,22 @@
+{
+  "base_period": 10,
+  "min_period": 4,
+  "max_period": 59,
+  "fast_period": 12,
+  "slow_period": 19,
+  "channel_length": 75,
+  "channel_multi": 3.0760538835198696,
+  "atr_period": 19,
+  "sl_multiplier": 7.066112369369904,
+  "tp_multiplier": 11.552121246680436,
+  "trail_multiplier": 3.1512768767949595,
+  "steepness": 19.085822813101693,
+  "fast_steepness": 7.382222020744102,
+  "slow_steepness": 7.619350519676518,
+  "sigmoid_margin": 0.13648417853884823,
+  "median_length": 17,
+  "trim_percent": 0.3190379916438509,
+  "use_replacement": false,
+  "position_size_pct": 0.12464314434256739,
+  "score": -10.0
+}

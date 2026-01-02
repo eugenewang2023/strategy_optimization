@@ -1,0 +1,28 @@
+{
+  "best_value": -10.0,
+  "best_params": {
+    "base_period": 14,
+    "min_period": 10,
+    "max_period": 53,
+    "fast_period": 26,
+    "slow_period": 41,
+    "channel_length": 82,
+    "channel_multi": 4.380552164437852,
+    "atr_period": 10,
+    "sl_multiplier": 3.2072661306428247,
+    "tp_multiplier": 10.319143628526946,
+    "trail_multiplier": 3.2403747571080217,
+    "steepness": 5.78784292638895,
+    "fast_steepness": 15.623369205099802,
+    "slow_steepness": 16.124086219397512,
+    "sigmoid_margin": 0.2084916956750748,
+    "median_length": 30,
+    "trim_percent": 0.22973322431073195,
+    "use_replacement": false,
+    "position_size_pct": 0.1636081746213237
+  },
+  "n_trials": 10,
+  "completed_trials": 10,
+  "pruned_trials": 0,
+  "failed_trials": 0
+}
