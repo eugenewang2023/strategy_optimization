@@ -1,4 +1,0 @@
-number,value,datetime_start,datetime_complete,duration,params_atr_period,params_base_period,params_channel_length,params_channel_multi,params_fast_period,params_fast_steepness,params_max_period,params_min_period,params_sl_multiplier,params_slow_period,params_slow_steepness,params_steepness,params_tp_multiplier,params_trail_multiplier,state
-0,-10.0,2026-01-01 15:17:09.130528,2026-01-01 15:17:15.219707,0 days 00:00:06.089179,14,9,100,3.2,10,11.0,40,4,3.946398788362281,30,7.0,9.0,5.598658484197037,2.7340279606636546,COMPLETE
-1,-10.0,2026-01-01 15:17:15.352839,2026-01-01 15:17:15.462127,0 days 00:00:00.109288,14,9,100,3.2,10,11.0,28,3,3.973235229154987,30,7.0,9.0,5.601115011743209,3.5621088666940683,COMPLETE
-2,-10.0,2026-01-01 15:17:15.578882,2026-01-01 15:17:15.699783,0 days 00:00:00.120901,14,9,100,3.2,10,11.0,40,3,3.966488528160084,30,7.0,9.0,5.212339110678276,2.772737450810651,COMPLETE
