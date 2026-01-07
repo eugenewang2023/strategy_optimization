@@ -1,2 +1,6 @@
-echo python Bayes_opt_dynamic_SR.py
-python Bayes_opt_dynamic_SR.py
+nTrails=2000
+nFiles=200
+fillOpt=same_close
+
+echo python Bayes_opt_dynamic_SR.py --trials $nTrails --files $nFiles --fill $fillOpt 
+python Bayes_opt_dynamic_SR.py --trials $nTrails --files $nFiles --fill $fillOpt 
