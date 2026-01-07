@@ -1,0 +1,17 @@
+{
+  "best_value": 3.358581508345467,
+  "best_params": {
+    "sl_multiplier": 2.5262643503365596,
+    "tp_multiplier": 3.059666542767009,
+    "trail_multiplier": 2.9583339572248146,
+    "channel_multi": 3.1434038038530407,
+    "channel_length": 39,
+    "atr_period": 18,
+    "sigmoid_margin": 0.26094951861649074,
+    "trim_percent": 0.03890313395051366
+  },
+  "n_trials": 2000,
+  "completed_trials": 2000,
+  "pruned_trials": 0,
+  "failed_trials": 0
+}

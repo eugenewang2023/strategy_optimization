@@ -1,0 +1,11 @@
+{
+  "best_value": 2.7288296727917216,
+  "best_params": {
+    "sigmoid_margin": 0.11236203565420874,
+    "trim_percent": 0.2852142919229748
+  },
+  "n_trials": 2000,
+  "completed_trials": 2000,
+  "pruned_trials": 0,
+  "failed_trials": 0
+}

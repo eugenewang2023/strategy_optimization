@@ -1,0 +1,12 @@
+{
+  "best_value": 0.8754952628707738,
+  "best_params": {
+    "sl_multiplier": 2.912139968434072,
+    "tp_multiplier": 4.570351922786028,
+    "trail_multiplier": 1.5594128078850475
+  },
+  "n_trials": 200,
+  "completed_trials": 200,
+  "pruned_trials": 0,
+  "failed_trials": 0
+}

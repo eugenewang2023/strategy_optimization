@@ -1,0 +1,16 @@
+{
+  "best_value": 0.8224871532233407,
+  "best_params": {
+    "base_period": 16,
+    "channel_length": 40,
+    "channel_multi": 2.7150897038028767,
+    "atr_period": 12,
+    "sl_multiplier": 1.6626289824631988,
+    "tp_multiplier": 5.7699849176399995,
+    "trail_multiplier": 2.9312640661491187
+  },
+  "n_trials": 50,
+  "completed_trials": 50,
+  "pruned_trials": 0,
+  "failed_trials": 0
+}

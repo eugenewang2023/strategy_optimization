@@ -1,0 +1,18 @@
+{
+  "best_value": 0.8990024027257778,
+  "best_params": {
+    "atr_period": 12,
+    "base_period": 16,
+    "min_period": 11,
+    "max_period": 18,
+    "fast_period": 9,
+    "slow_period": 48,
+    "steepness": 9,
+    "fast_steepness": 6,
+    "slow_steepness": 4
+  },
+  "n_trials": 200,
+  "completed_trials": 200,
+  "pruned_trials": 0,
+  "failed_trials": 0
+}

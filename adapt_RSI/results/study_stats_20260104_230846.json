@@ -1,0 +1,23 @@
+{
+  "best_value": 2.713496505889296,
+  "best_params": {
+    "sl_multiplier": 2.799255934200879,
+    "tp_multiplier": 4.4846809457906565,
+    "trail_multiplier": 1.637430988641266,
+    "channel_multi": 2.1360986348821474,
+    "channel_length": 44,
+    "atr_period": 23,
+    "base_period": 10,
+    "min_period": 3,
+    "max_period": 11,
+    "fast_period": 11,
+    "slow_period": 34,
+    "steepness": 3,
+    "fast_steepness": 9,
+    "slow_steepness": 5
+  },
+  "n_trials": 500,
+  "completed_trials": 500,
+  "pruned_trials": 0,
+  "failed_trials": 0
+}
