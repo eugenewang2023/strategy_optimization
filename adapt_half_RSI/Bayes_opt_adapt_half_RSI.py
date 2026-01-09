@@ -1,351 +1,252 @@
 #!/usr/bin/env python3
 """
-bayes_opt_half_RSI.py
+Bayes_opt_adapt_half_RSI.py  (Pine-match + 3 fill modes)  **HYBRID OBJECTIVE (like half_RSI)**
 
-Goal: Match TradingView Pine strategy:
-"half_RSI_hr (HA signals + Real risk)"  (your pasted Pine)
+Matches Pine strategy: adapt_half_RSI_hh (HA signals + HA risk)
 
-This version matches the Pine logic you included:
-
-DATA SOURCING (chart-type independent):
-- REAL OHLC is the input data.
+DATA (chart-type independent):
+- REAL OHLC comes from your file columns open/high/low/close.
 - Heikin Ashi is computed from REAL OHLC.
 
-SIGNALS (Heikin Ashi):
-- sigClose = haClose
-- sigHL2   = (haHigh + haLow)/2
-- fast_window = round(slow_window/2)
-- fast_rsi = rsi(sigClose, fast_window)
-- slow_rsi = 100 - rsi(sigClose, slow_window)
-- hot = fast_rsi - slow_rsi
-- hot_sm = sma(hot, smooth_len)
-- cross_up = crossover(hot_sm, 0)
-- longCondition = cross_up and (uptrend or above_lowerTF)
-  where:
-    midChannel = sma(sigHL2, channelLength)
-    uptrend = sigClose > midChannel
-    lowerTF_Length = max(1, channelLength//2)
-    midChannel_lowerTF = sma(sigHL2, lowerTF_Length)
-    above_lowerTF = sigClose > midChannel_lowerTF
+SIGNALS (HA):
+- baseRSI = RSI(haClose, basePeriod)
+- adaptivePeriod = round(((100-baseRSI)/100) * (maxPeriod-minPeriod) + minPeriod), clipped
+- slow_period = adaptivePeriod
+- fast_period = round(adaptivePeriod/2), min 2
+- fast_rsi = RSI(haClose, fast_period) (period selected from precomputed RSI 2..34)
+- slow_rsi = RSI(haClose, slow_period) (period selected from precomputed RSI 2..34)
+- longCondition = crossover(fast_rsi, slow_rsi)
+- NO trend filter, NO shorts
 
-RISK / EXITS (REAL OHLC + realATR):
-- riskClose = realClose
-- riskHigh  = realHigh
-- riskLow   = realLow
-- atr = realATR(atrPeriod) == ta.atr(atrPeriod) sourced from REAL OHLC
-- On entry (signal bar):
+EXITS / RISK (Pine logic):
+- riskClose/riskHigh/riskLow are HA series
+- atr = REAL ATR(atrPeriod) (Wilder/RMA of REAL TR)
+Entry initializes:
     trail_stop_level = riskClose - atr*slMultiplier
-    trail_offset = max(atr*trailMultiplier, atr*0.5)
-    take_profit_low = riskClose + atr*tpMultiplier
+    trail_offset     = max(atr*trailMultiplier, atr*0.5)
+    take_profit_low  = riskClose + atr*tpMultiplier
     take_profit_high = take_profit_low + trail_offset
-- While in position:
+In position:
     if not tp_touched and riskHigh > take_profit_high: tp_touched = True
     if tp_touched:
         tp_crossdown = riskClose < take_profit_low
         take_profit_low = max(take_profit_low, riskClose - trail_offset)
     longExit = (riskLow < trail_stop_level) or tp_crossdown
-    new_stop = riskHigh - atr*slMultiplier
-    trail_stop_level = max(trail_stop_level, new_stop)
+    trail_stop_level = max(trail_stop_level, riskHigh - atr*slMultiplier)
+Flat resets vars.
 
-OBJECTIVE:
+EXECUTION / FILL MODEL (--fill):
+- same_close : enter/exit at REAL close[i]
+- next_open  : enter/exit at REAL open[i+1]
+- intrabar   : conservative intrabar exits:
+    * STOP breach: fill at stop_level, but if open[i] <= stop_level (gap-through), fill at open[i].
+    * TP-crossdown: fill at REAL close[i] (conservative market-at-close).
+    * If both same bar, STOP has priority (worst-case).
+
+OBJECTIVE (NO STOCK DOMINATES; equal weight per file):
 - Optimize BOTH:
-    1) avg_return_overall: mean of per-ticker total_return
-    2) pct_positive_return: fraction of tickers with total_return > 0
+    1) avg_return_overall: mean of per-file total_return (decimal, not %)
+    2) pct_positive_return: fraction of files with total_return > 0
 - score = (1 + avg_return_overall) * (pct_positive_return ** alpha)
-  alpha default 0.5 and configurable via --alpha
+  alpha default 0.5 (configurable via --alpha)
 
-Penalties (optional):
-- light penalties for too few trades and for drawdown (same structure as your script)
+Optional penalties (same spirit as half_RSI):
+- trade penalty (aggregated across files):
+    * total_trades < 3  => -3
+    * total_trades < 10 => -1
+- drawdown penalty: score -= 0.25 * sum(abs(maxdd))  where maxdd is per-file drawdown fraction (e.g. 0.18)
+
+Outputs:
+- best_params_score_*.json
+- trials_score_*.csv
+- per_file_results_score_*.csv (best params on ALL files)
+- study_stats_score_*.json
 """
 
-import os, json, math, time, random
+import os
+import json
+import hashlib
+import logging
+import warnings
+import random
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Optional, Dict, List, Any
 
 import numpy as np
 import pandas as pd
+from numba import jit, prange
 
-# Optional plotting for equity curves
-try:
-    import matplotlib.pyplot as plt
-    HAS_PLT = True
-except Exception:
-    HAS_PLT = False
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import MedianPruner
+from optuna.trial import TrialState
 
-# ----------------- USER CONFIG -----------------
-DATA_DIR = Path("data")
-OUT_DIR  = Path("output")
-
-INITIAL_CAPITAL = 100000.0
-POSITION_SIZE_PCT = 0.10     # TradingView default_qty_value=10
-COMMISSION_PCT = 0.0006      # 0.06% (Pine: commission_value=0.06 with commission_type=strategy.commission.percent)
-# ------------------------------------------------
-
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # =========================
-# Helpers: SMA, Wilder RMA, ATR, RSI (TradingView-style)
+# Defaults (Pine-ish)
 # =========================
 
-def sma(x: np.ndarray, length: int) -> np.ndarray:
-    n = len(x)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if length <= 0:
-        return out
-    csum = np.cumsum(np.nan_to_num(x, nan=0.0))
-    isn = np.isnan(x).astype(np.int32)
-    nan_csum = np.cumsum(isn)
-    for i in range(length - 1, n):
-        nan_count = nan_csum[i] - (nan_csum[i - length] if i >= length else 0)
-        if nan_count > 0:
-            out[i] = np.nan
-        else:
-            s = csum[i] - (csum[i - length] if i >= length else 0.0)
-            out[i] = s / length
-    return out
+DEFAULT_PARAMS = {
+    "atr_period": 57,
+    "sl_multiplier": 0.741,
+    "tp_multiplier": 2.357,
+    "trail_multiplier": 16.08,
 
+    "base_period": 27,
+    "min_period": 20,
+    "max_period": 21,
 
-def rma_wilder(x: np.ndarray, length: int) -> np.ndarray:
-    """
-    TradingView ta.rma(): Wilder smoothing.
-    Seed = SMA(length) at first full non-na window.
-    alpha = 1/length.
-    """
-    n = len(x)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if length <= 0 or n < length:
-        return out
-
-    if np.isnan(x[:length]).any():
-        start = None
-        for i in range(length - 1, n):
-            w = x[i - length + 1:i + 1]
-            if not np.isnan(w).any():
-                out[i] = float(np.mean(w))
-                start = i + 1
-                break
-        if start is None:
-            return out
-    else:
-        out[length - 1] = float(np.mean(x[:length]))
-        start = length
-
-    alpha = 1.0 / float(length)
-    for i in range(start, n):
-        if np.isnan(x[i]) or np.isnan(out[i - 1]):
-            out[i] = np.nan
-        else:
-            out[i] = out[i - 1] + alpha * (x[i] - out[i - 1])
-    return out
-
-
-def true_range(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
-    n = len(close)
-    tr = np.full(n, np.nan, dtype=np.float64)
-    if n == 0:
-        return tr
-    tr[0] = high[0] - low[0]
-    for i in range(1, n):
-        if np.isnan(high[i]) or np.isnan(low[i]) or np.isnan(close[i - 1]):
-            tr[i] = np.nan
-            continue
-        hl = high[i] - low[i]
-        hc = abs(high[i] - close[i - 1])
-        lc = abs(low[i] - close[i - 1])
-        tr[i] = max(hl, hc, lc)
-    return tr
-
-
-def atr_wilder(high: np.ndarray, low: np.ndarray, close: np.ndarray, length: int) -> np.ndarray:
-    """
-    Match Pine ta.atr(length): RMA of true range.
-    """
-    tr = true_range(high, low, close)
-    return rma_wilder(tr, length)
-
-
-def rsi_tv(price: np.ndarray, length: int) -> np.ndarray:
-    """
-    Match TradingView ta.rsi():
-    rsi = 100 - 100 / (1 + rma(gain, len) / rma(loss, len))
-    """
-    n = len(price)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if length <= 0 or n < 2:
-        return out
-
-    ch = np.diff(price, prepend=np.nan)
-    gain = np.where(ch > 0, ch, 0.0)
-    loss = np.where(ch < 0, -ch, 0.0)
-
-    avg_gain = rma_wilder(gain, length)
-    avg_loss = rma_wilder(loss, length)
-
-    for i in range(n):
-        ag = avg_gain[i]
-        al = avg_loss[i]
-        if np.isnan(ag) or np.isnan(al):
-            out[i] = np.nan
-        else:
-            if al == 0.0:
-                out[i] = 100.0 if ag > 0 else 0.0
-            else:
-                rs = ag / al
-                out[i] = 100.0 - (100.0 / (1.0 + rs))
-    return out
-
-
-def shift_series(x: np.ndarray, shift: int) -> np.ndarray:
-    """
-    Pine: x[shift] means past value.
-    shift=0 -> x
-    shift>0 -> x shifted right, out[i] = x[i-shift]
-    """
-    n = len(x)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if shift <= 0:
-        return x.astype(np.float64, copy=True)
-    out[shift:] = x[:-shift]
-    return out
-
+    # backtest settings
+    "initial_capital": 100000.0,
+    "position_size_pct": 0.10,   # 10% equity
+    "commission_pct": 0.0006,    # 0.06%
+}
 
 # =========================
-# Heikin Ashi from REAL OHLC
+# Numba indicators
 # =========================
 
-def heikin_ashi_from_real(
-    open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    n = len(close)
-    ha_close = (open_ + high + low + close) / 4.0
+@jit(nopython=True, cache=True)
+def calculate_heikin_ashi_numba(open_arr, high_arr, low_arr, close_arr):
+    n = len(close_arr)
+    ha_open = np.zeros(n)
+    ha_high = np.zeros(n)
+    ha_low = np.zeros(n)
+    ha_close = np.zeros(n)
 
-    ha_open = np.full(n, np.nan, dtype=np.float64)
-    ha_high = np.full(n, np.nan, dtype=np.float64)
-    ha_low  = np.full(n, np.nan, dtype=np.float64)
-
-    if n == 0:
-        return ha_open, ha_high, ha_low, ha_close
-
-    ha_open[0] = (open_[0] + close[0]) / 2.0
-    ha_high[0] = max(high[0], ha_open[0], ha_close[0])
-    ha_low[0]  = min(low[0],  ha_open[0], ha_close[0])
+    ha_close[0] = (open_arr[0] + high_arr[0] + low_arr[0] + close_arr[0]) / 4.0
+    ha_open[0] = (open_arr[0] + close_arr[0]) / 2.0
+    ha_high[0] = max(high_arr[0], ha_open[0], ha_close[0])
+    ha_low[0] = min(low_arr[0], ha_open[0], ha_close[0])
 
     for i in range(1, n):
+        ha_close[i] = (open_arr[i] + high_arr[i] + low_arr[i] + close_arr[i]) / 4.0
         ha_open[i] = (ha_open[i - 1] + ha_close[i - 1]) / 2.0
-        ha_high[i] = max(high[i], ha_open[i], ha_close[i])
-        ha_low[i]  = min(low[i],  ha_open[i], ha_close[i])
+        ha_high[i] = max(high_arr[i], ha_open[i], ha_close[i])
+        ha_low[i] = min(low_arr[i], ha_open[i], ha_close[i])
 
     return ha_open, ha_high, ha_low, ha_close
 
 
+@jit(nopython=True, cache=True)
+def rsi_numba(close: np.ndarray, period: int = 14) -> np.ndarray:
+    n = len(close)
+    rsi = np.full(n, np.nan)
+    if period <= 0 or n < period:
+        return rsi
+
+    deltas = np.zeros(n)
+    deltas[1:] = close[1:] - close[:-1]
+
+    gain = np.zeros(n)
+    loss = np.zeros(n)
+
+    for i in range(1, period):
+        if deltas[i] > 0:
+            gain[i] = deltas[i]
+        else:
+            loss[i] = -deltas[i]
+
+    avg_gain = np.sum(gain[1:period]) / period
+    avg_loss = np.sum(loss[1:period]) / period
+
+    if avg_loss == 0.0:
+        rsi[period - 1] = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi[period - 1] = 100.0 - (100.0 / (1.0 + rs))
+
+    for i in range(period, n):
+        if deltas[i] > 0:
+            g = deltas[i]
+            l = 0.0
+        else:
+            g = 0.0
+            l = -deltas[i]
+
+        avg_gain = ((avg_gain * (period - 1)) + g) / period
+        avg_loss = ((avg_loss * (period - 1)) + l) / period
+
+        if avg_loss == 0.0:
+            rsi[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+
+    return rsi
+
+
+@jit(nopython=True, cache=True)
+def calculate_all_rsi_numba(close: np.ndarray, min_period: int, max_period: int) -> np.ndarray:
+    n = len(close)
+    num_periods = max_period - min_period + 1
+    out = np.full((n, num_periods), np.nan)
+    for p_idx in prange(num_periods):
+        p = min_period + p_idx
+        out[:, p_idx] = rsi_numba(close, p)
+    return out
+
+
+@jit(nopython=True, cache=True)
+def rma_numba(src: np.ndarray, length: int) -> np.ndarray:
+    n = len(src)
+    out = np.full(n, np.nan)
+    if length <= 0 or n < length:
+        return out
+
+    s = 0.0
+    for i in range(length):
+        s += src[i]
+    out[length - 1] = s / length
+
+    alpha = 1.0 / length
+    for i in range(length, n):
+        out[i] = out[i - 1] + alpha * (src[i] - out[i - 1])
+    return out
+
+
+@jit(nopython=True, cache=True)
+def true_range_real_numba(high_arr: np.ndarray, low_arr: np.ndarray, close_arr: np.ndarray) -> np.ndarray:
+    n = len(close_arr)
+    tr = np.zeros(n)
+    tr[0] = high_arr[0] - low_arr[0]
+    for i in range(1, n):
+        hl = high_arr[i] - low_arr[i]
+        hc = abs(high_arr[i] - close_arr[i - 1])
+        lc = abs(low_arr[i] - close_arr[i - 1])
+        tr[i] = max(hl, hc, lc)
+    return tr
+
 # =========================
-# Pine-like cross helpers
+# Signals + exits with reason/stop_level for intrabar fills
 # =========================
 
-def crossover(cur_x: float, prev_x: float, cur_y: float, prev_y: float) -> bool:
-    return (cur_x > cur_y) and (prev_x <= prev_y)
+@jit(nopython=True, cache=True)
+def build_signals_and_exits_with_reason_numba(
+    fast_rsi: np.ndarray,
+    slow_rsi: np.ndarray,
+    risk_close: np.ndarray,   # HA close
+    risk_high: np.ndarray,    # HA high
+    risk_low: np.ndarray,     # HA low
+    atr_real: np.ndarray,     # REAL ATR (Wilder)
+    sl_mult: float,
+    tp_mult: float,
+    trail_mult: float,
+    min_bars: int
+):
+    n = len(risk_close)
+    buy = np.zeros(n, dtype=np.bool_)
+    sell = np.zeros(n, dtype=np.bool_)
+    exit_reason = np.zeros(n, dtype=np.int8)     # 0 none, 1 stop, 2 tp_crossdown
+    stop_level_out = np.full(n, np.nan)
 
-def crossunder(cur_x: float, prev_x: float, cur_y: float, prev_y: float) -> bool:
-    return (cur_x < cur_y) and (prev_x >= prev_y)
-
-
-# =========================
-# Backtest: half_RSI_hr (HA signals + Real risk)
-# =========================
-
-@dataclass
-class HalfRSIParams:
-    channelLength: int = 107
-    channelMulti: float = 4.85  # not used for entries/exits in this port; kept for parity
-
-    atrPeriod: int = 29
-    slMultiplier: float = 5.16
-    tpMultiplier: float = 4.94
-    trailMultiplier: float = 2.78
-
-    slow_window: int = 32
-    smooth_len: int = 12
-
-    initial_capital: float = INITIAL_CAPITAL
-    position_size_pct: float = POSITION_SIZE_PCT
-    commission_pct: float = COMMISSION_PCT
-
-    fill_mode: str = "next_open"  # "next_open" or "same_close"
-
-
-def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
-    df = df.copy().reset_index(drop=True)
-    df.columns = [c.lower() for c in df.columns]
-
-    for col in ["open", "high", "low", "close"]:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
-
-    real_o = df["open"].astype(float).to_numpy()
-    real_h = df["high"].astype(float).to_numpy()
-    real_l = df["low"].astype(float).to_numpy()
-    real_c = df["close"].astype(float).to_numpy()
-    n = len(df)
-
-    if n < 5:
-        return {
-            "equity_curve": [p.initial_capital],
-            "trades": [],
-            "sharpe": 0.0,
-            "maxdd": 0.0,
-            "num_trades": 0,
-            "final_equity": p.initial_capital,
-            "total_return": 0.0,
-        }
-
-    # HA from REAL (signals)
-    ha_o, ha_h, ha_l, ha_c = heikin_ashi_from_real(real_o, real_h, real_l, real_c)
-    sigClose = ha_c
-    sigHL2 = (ha_h + ha_l) / 2.0
-
-    # RISK series are REAL (per your Pine: riskClose=realClose, riskHigh=realHigh, riskLow=realLow)
-    riskClose = real_c
-    riskHigh  = real_h
-    riskLow   = real_l
-
-    # realATR(atrPeriod) == ATR on REAL OHLC (Wilder)
-    atr_exit = atr_wilder(real_h, real_l, real_c, int(p.atrPeriod))
-
-    # Trend filters (signals)
-    midChannel = sma(sigHL2, int(p.channelLength))
-    uptrend = sigClose > midChannel
-
-    lowerTF_Length = max(1, int(p.channelLength // 2))
-    midChannel_lowerTF = sma(sigHL2, lowerTF_Length)
-    above_lowerTF = sigClose > midChannel_lowerTF
-
-    # RSI signals on HA close, with shift (Pine: fast_rsi = rsi(sigClose, fast_window)[shift])
-    slow_len = max(2, int(p.slow_window))
-    fast_window = max(1, int(round(float(slow_len) / 2.0)))
-
-    fast_rsi_raw = rsi_tv(sigClose, fast_window)
-    slow_rsi_raw = rsi_tv(sigClose, slow_len)
-
-    sh = max(0, int(p.shift))
-    fast_rsi = shift_series(fast_rsi_raw, sh)
-    slow_rsi = 100.0 - shift_series(slow_rsi_raw, sh)
-
-    hot = fast_rsi - slow_rsi
-    sm = max(1, int(p.smooth_len))
-    hot_sm = sma(hot, sm)
-
-    # State
     in_pos = False
-    pending_entry = False
-    entry_fill_idx = None
-    qty = 0.0
 
-    cash = float(p.initial_capital)
-    equity_curve = np.zeros(n, dtype=np.float64)
-    trades: List[Dict[str, Any]] = []
-
-    # Pine-like vars (persist while in position)
     tp_touched = False
     tp_crossdown = False
     trail_offset = np.nan
@@ -353,136 +254,79 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
     take_profit_high = np.nan
     take_profit_low = np.nan
 
-    prev_hot_sm = hot_sm[0] if n > 0 else np.nan
+    prev_fast = np.nan
+    prev_slow = np.nan
 
     for i in range(n):
-        # Handle pending entry fill (next_open)
-        if p.fill_mode == "next_open":
-            if pending_entry and entry_fill_idx == i:
-                fill_price = real_o[i]  # market filled on next bar open
-                pos_value = cash * float(p.position_size_pct)
-                qty = pos_value / fill_price if fill_price > 0 else 0.0
-                commission = pos_value * float(p.commission_pct)
-                cash -= (pos_value + commission)
-                in_pos = True
-                pending_entry = False
-                trades[-1].update({
-                    "fill_idx": int(i),
-                    "fill_price": float(fill_price),
-                    "commission_entry": float(commission),
-                    "qty": float(qty),
-                })
+        if i < min_bars:
+            prev_fast = fast_rsi[i]
+            prev_slow = slow_rsi[i]
+            continue
 
-        # Signal: cross_up = ta.crossover(hot_sm, 0)
-        if i > 0 and (not np.isnan(hot_sm[i])) and (not np.isnan(prev_hot_sm)):
-            cross_up = crossover(hot_sm[i], prev_hot_sm, 0.0, 0.0)
-        else:
-            cross_up = False
+        fr = fast_rsi[i]
+        sr = slow_rsi[i]
+        rc = risk_close[i]
+        rh = risk_high[i]
+        rl = risk_low[i]
+        atr = atr_real[i]
 
-        # longCondition = cross_up and (uptrend or above_lowerTF)
-        if cross_up and (not np.isnan(uptrend[i])) and (not np.isnan(above_lowerTF[i])):
-            longCondition = bool(uptrend[i] or above_lowerTF[i])
-        else:
-            longCondition = False
+        if np.isnan(fr) or np.isnan(sr) or np.isnan(rc) or np.isnan(rh) or np.isnan(rl) or np.isnan(atr):
+            prev_fast = fr
+            prev_slow = sr
+            continue
 
-        # ENTRY (levels set using REAL close + REAL atr)
-        if longCondition and (not in_pos) and (not pending_entry):
+        # crossover(fast, slow)
+        long_condition = False
+        if not np.isnan(prev_fast) and not np.isnan(prev_slow):
+            if (fr > sr) and (prev_fast <= prev_slow):
+                long_condition = True
+
+        # ENTRY
+        if (not in_pos) and long_condition:
             tp_touched = False
             tp_crossdown = False
 
-            atr_i = atr_exit[i]
-            if (not np.isnan(atr_i)) and (not np.isnan(riskClose[i])):
-                # Initial stop / offsets use REAL
-                trail_stop_level = riskClose[i] - (atr_i * float(p.slMultiplier))
-                min_trail_offset = atr_i * 0.5
-                trail_offset = max(atr_i * float(p.trailMultiplier), min_trail_offset)
-                take_profit_low = riskClose[i] + (atr_i * float(p.tpMultiplier))
-                take_profit_high = take_profit_low + trail_offset
+            trail_stop_level = rc - (atr * sl_mult)
 
-                trades.append({
-                    "signal_idx": int(i),
-                    "side": "LONG",
-                    "signal_price": float(riskClose[i]),  # Pine uses riskClose (REAL) for level placement
-                    "slow_window": int(slow_len),
-                    "fast_window": int(fast_window),
-                    "shift": int(sh),
-                    "smooth_len": int(sm),
-                })
+            min_trail_offset = atr * 0.5
+            toff = atr * trail_mult
+            trail_offset = toff if toff >= min_trail_offset else min_trail_offset
 
-                if p.fill_mode == "same_close":
-                    fill_price = riskClose[i]  # same-bar close fill model
-                    pos_value = cash * float(p.position_size_pct)
-                    qty = pos_value / fill_price if fill_price > 0 else 0.0
-                    commission = pos_value * float(p.commission_pct)
-                    cash -= (pos_value + commission)
-                    in_pos = True
-                    trades[-1].update({
-                        "fill_idx": int(i),
-                        "fill_price": float(fill_price),
-                        "commission_entry": float(commission),
-                        "qty": float(qty),
-                    })
-                else:
-                    if i + 1 < n:
-                        pending_entry = True
-                        entry_fill_idx = i + 1
-                    else:
-                        trades[-1].update({"ignored": True})
+            take_profit_low = rc + (atr * tp_mult)
+            take_profit_high = take_profit_low + trail_offset
 
-        # POSITION MANAGEMENT / EXITS (ALL REAL)
-        if in_pos:
-            # if not tp_touched and riskHigh > take_profit_high => tp_touched := true
-            if (not tp_touched) and (not np.isnan(take_profit_high)) and (not np.isnan(riskHigh[i])) and (riskHigh[i] > take_profit_high):
-                tp_touched = True
+            buy[i] = True
+            in_pos = True
 
-            # if tp_touched:
-            #   tp_crossdown := riskClose < take_profit_low
-            #   take_profit_low := max(take_profit_low, riskClose - trail_offset)
-            if tp_touched and (not np.isnan(take_profit_low)) and (not np.isnan(riskClose[i])) and (not np.isnan(trail_offset)):
-                tp_crossdown = bool(riskClose[i] < take_profit_low)
-                new_low = riskClose[i] - trail_offset
-                take_profit_low = max(take_profit_low, new_low)
+        # POSITION MGMT
+        elif in_pos:
+            # TP touched: bar-high > tp_high
+            if (not tp_touched) and (not np.isnan(take_profit_high)):
+                if rh > take_profit_high:
+                    tp_touched = True
 
-            # longExit = (riskLow < trail_stop_level) or tp_crossdown
-            if (not np.isnan(riskLow[i])) and (not np.isnan(trail_stop_level)) and (riskLow[i] < trail_stop_level):
-                longExit = True
-                exit_reason = "SL_breach(realLow < trail_stop_level)"
-            elif tp_crossdown:
-                longExit = True
-                exit_reason = "TP_crossdown(realClose < take_profit_low)"
+            # TP ratchet + crossdown
+            if tp_touched and (not np.isnan(take_profit_low)) and (not np.isnan(trail_offset)):
+                tp_crossdown = rc < take_profit_low
+                new_low = rc - trail_offset
+                if new_low > take_profit_low:
+                    take_profit_low = new_low
             else:
-                longExit = False
-                exit_reason = None
+                tp_crossdown = False
 
-            if longExit:
-                # strategy.close fills next open in backtest; keep your fill_mode
-                if p.fill_mode == "next_open":
-                    if i + 1 < n:
-                        fill_price = real_o[i + 1]
-                        fill_idx = i + 1
-                    else:
-                        fill_price = riskClose[i]
-                        fill_idx = i
-                else:
-                    fill_price = riskClose[i]
-                    fill_idx = i
+            # stop breach: bar-low < trail_stop_level
+            stop_breach = False
+            if not np.isnan(trail_stop_level):
+                stop_breach = rl < trail_stop_level
 
-                exit_value = qty * fill_price
-                commission = exit_value * float(p.commission_pct)
-                cash += (exit_value - commission)
+            # STOP priority
+            if stop_breach or tp_crossdown:
+                sell[i] = True
+                stop_level_out[i] = trail_stop_level
+                exit_reason[i] = 1 if stop_breach else 2
 
-                trades[-1].update({
-                    "exit_idx": int(fill_idx),
-                    "exit_price": float(fill_price),
-                    "commission_exit": float(commission),
-                    "reason": exit_reason
-                })
-
-                qty = 0.0
+                # flat reset
                 in_pos = False
-                pending_entry = False
-                entry_fill_idx = None
-
                 tp_touched = False
                 tp_crossdown = False
                 trail_offset = np.nan
@@ -490,301 +334,789 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
                 take_profit_high = np.nan
                 take_profit_low = np.nan
             else:
-                # Update trailing stop level (only moves up): new_stop = riskHigh - atr*slMult
-                atr_i = atr_exit[i]
-                if (not np.isnan(atr_i)) and (not np.isnan(riskHigh[i])) and (not np.isnan(trail_stop_level)):
-                    new_stop = riskHigh[i] - (atr_i * float(p.slMultiplier))
-                    trail_stop_level = max(trail_stop_level, new_stop)
-        else:
-            # when flat, reset (safety)
-            tp_touched = False
-            tp_crossdown = False
-            trail_offset = np.nan
-            trail_stop_level = np.nan
-            take_profit_high = np.nan
-            take_profit_low = np.nan
+                # trail stop only up
+                new_stop = rh - (atr * sl_mult)
+                if np.isnan(trail_stop_level) or new_stop > trail_stop_level:
+                    trail_stop_level = new_stop
 
-        # Mark-to-market equity (REAL close)
-        mtm = qty * real_c[i] if in_pos else 0.0
-        equity_curve[i] = cash + mtm
+        prev_fast = fr
+        prev_slow = sr
 
-        prev_hot_sm = hot_sm[i]
+    return buy, sell, exit_reason, stop_level_out
 
-    # Close any open position at end (REAL close)
-    if in_pos and qty > 0:
-        fill_price = real_c[-1]
-        exit_value = qty * fill_price
-        commission = exit_value * float(p.commission_pct)
-        cash += (exit_value - commission)
-        trades[-1].update({
-            "exit_idx": int(n - 1),
-            "exit_price": float(fill_price),
-            "commission_exit": float(commission),
-            "reason": "endClose"
-        })
+# =========================
+# Unified simulator with fill modes (tracks GP/GL)
+# =========================
+
+@jit(nopython=True, cache=True)
+def run_simulation_with_fill_modes_pf_numba(
+    open_arr,
+    close_arr,
+    buy_signal,
+    sell_signal,
+    exit_reason,     # 0 none, 1 stop, 2 tp_crossdown
+    stop_level,      # trailing stop level on bar i when sell fires
+    initial_capital,
+    pos_size_pct,
+    comm_pct,
+    fill_mode_code   # 0 same_close, 1 next_open, 2 intrabar
+):
+    n = len(close_arr)
+    equity_curve = np.zeros(n)
+
+    cash = initial_capital
+    qty = 0.0
+    entry_price = 0.0
+    entry_comm = 0.0
+
+    trade_count = 0
+    gross_profit = 0.0
+    gross_loss = 0.0
+
+    for i in range(n):
+        # mark to market at REAL close
+        mark = close_arr[i]
+        if np.isnan(mark) or mark <= 0:
+            equity_curve[i] = cash + (qty * mark if qty > 0 else 0.0)
+            continue
+
+        # ENTRY
+        if buy_signal[i] and qty == 0.0:
+            if fill_mode_code == 1:
+                fill = open_arr[i + 1] if (i + 1) < n else np.nan
+            else:
+                fill = close_arr[i]  # same_close or intrabar enter at close[i]
+
+            if (not np.isnan(fill)) and fill > 0:
+                pos_value = cash * pos_size_pct
+                if pos_value > 0:
+                    qty = pos_value / fill
+                    entry_price = fill
+                    entry_comm = pos_value * comm_pct
+                    cash -= (pos_value + entry_comm)
+
+        # EXIT
+        if sell_signal[i] and qty > 0.0:
+            if fill_mode_code == 0:
+                fill = close_arr[i]
+            elif fill_mode_code == 1:
+                fill = open_arr[i + 1] if (i + 1) < n else close_arr[i]
+            else:
+                # intrabar conservative
+                if exit_reason[i] == 1:
+                    stp = stop_level[i]
+                    o = open_arr[i]
+                    if np.isnan(stp):
+                        fill = close_arr[i]
+                    else:
+                        if (not np.isnan(o)) and o > 0 and o <= stp:
+                            fill = o
+                        else:
+                            fill = stp
+                else:
+                    fill = close_arr[i]  # tp_crossdown at close
+
+            if (not np.isnan(fill)) and fill > 0:
+                exit_value = qty * fill
+                exit_comm = exit_value * comm_pct
+
+                pnl = (fill - entry_price) * qty - entry_comm - exit_comm
+                if pnl > 0:
+                    gross_profit += pnl
+                elif pnl < 0:
+                    gross_loss += -pnl
+
+                cash += (exit_value - exit_comm)
+                trade_count += 1
+
+                qty = 0.0
+                entry_price = 0.0
+                entry_comm = 0.0
+
+        equity_curve[i] = cash + (qty * mark if qty > 0 else 0.0)
+
+    # Close any open position at last close
+    if qty > 0.0:
+        fill = close_arr[-1]
+        if not np.isnan(fill) and fill > 0:
+            exit_value = qty * fill
+            exit_comm = exit_value * comm_pct
+            pnl = (fill - entry_price) * qty - entry_comm - exit_comm
+            if pnl > 0:
+                gross_profit += pnl
+            elif pnl < 0:
+                gross_loss += -pnl
+            cash += (exit_value - exit_comm)
+            trade_count += 1
         qty = 0.0
-        in_pos = False
         equity_curve[-1] = cash
 
-    eq = equity_curve.copy()
-    if len(eq) < 2:
-        sharpe = 0.0
-        maxdd = 0.0
-    else:
-        rets = np.diff(eq) / np.maximum(eq[:-1], 1e-12)
-        sharpe = float((np.mean(rets) / (np.std(rets) + 1e-12)) * math.sqrt(252.0)) if len(rets) > 1 else 0.0
-        peak = np.maximum.accumulate(eq)
-        dd = (eq - peak) / np.maximum(peak, 1e-12)
-        maxdd = float(np.min(dd))
-
-    final_equity = float(eq[-1])
-    total_return = float(final_equity / float(p.initial_capital) - 1.0)
-
-    completed = [t for t in trades if ("exit_price" in t and "fill_price" in t and not t.get("ignored", False))]
-    num_trades = len(completed)
-
-    return {
-        "final_equity": final_equity,
-        "total_return": total_return,
-        "sharpe": float(sharpe),
-        "maxdd": float(maxdd),
-        "num_trades": int(num_trades),
-        "trades": trades,
-        "equity_curve": eq.tolist(),
-    }
-
+    return equity_curve, trade_count, gross_profit, gross_loss
 
 # =========================
-# Optimization (Optuna)
+# Strategy params
 # =========================
 
-def ensure_dirs():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+@dataclass
+class StrategyParams:
+    atr_period: int = 47
+    sl_multiplier: float = 5.805
+    tp_multiplier: float = 4.082
+    trail_multiplier: float = 7.76
 
-def load_files() -> Dict[str, pd.DataFrame]:
-    files = list(DATA_DIR.glob("*.parquet")) + list(DATA_DIR.glob("*.csv"))
-    files.sort()
-    data: Dict[str, pd.DataFrame] = {}
-    for fp in files:
+    base_period: int = 14
+    min_period: int = 3
+    max_period: int = 34
+
+    initial_capital: float = 100000.0
+    position_size_pct: float = 0.1
+    commission_pct: float = 0.0006
+
+    def to_hash(self) -> str:
+        params_str = json.dumps(self.__dict__, sort_keys=True)
+        return hashlib.md5(params_str.encode()).hexdigest()
+
+# =========================
+# Optimizer
+# =========================
+
+class BayesianAdaptHalfRSIOptimizer:
+    """
+    Bayesian optimization for adapt_half_RSI_hh.
+
+    Objective (like half_RSI; equal weight per file):
+      score = (1 + avg_return_overall) * (pct_positive_return ** alpha)
+
+    Optional penalties:
+      score -= 0.25 * sum(abs(maxdd_fraction))  and trade-count penalty as described in docstring.
+    """
+
+    def __init__(self, data_dir: str = "./data", results_dir: str = "./results"):
+        self.data_dir = Path(data_dir)
+        self.results_dir = Path(results_dir)
+        self.results_dir.mkdir(exist_ok=True, parents=True)
+        self.study = None
+
+    def load_data_chunk(self, file_path: Path, sample_size: Optional[int] = None) -> pd.DataFrame:
+        if isinstance(file_path, str):
+            file_path = Path(file_path)
+
         try:
-            df = pd.read_parquet(fp) if fp.suffix.lower() == ".parquet" else pd.read_csv(fp)
-            data[fp.stem.upper()] = df
+            if file_path.suffix.lower() == ".parquet":
+                df = pd.read_parquet(file_path)
+            elif file_path.suffix.lower() == ".csv":
+                df = pd.read_csv(file_path)
+            else:
+                return pd.DataFrame()
         except Exception as e:
-            print(f"Failed to load {fp.name}: {e}")
-    return data
+            logger.error(f"Error loading {file_path}: {e}")
+            return pd.DataFrame()
 
+        df.columns = [c.lower() for c in df.columns]
+        for col in ["open", "high", "low", "close"]:
+            if col not in df.columns:
+                df[col] = np.nan
+        if "volume" not in df.columns:
+            df["volume"] = np.nan
 
-def run_optuna_optimization(
-    n_trials: int = 200,
-    n_files: int = 200,
-    fill_mode: str = "next_open",
-    study_name: Optional[str] = None,
-    seed: int = 42,
-    use_penalties: bool = True,
-    alpha: float = 0.5,  # robustness exponent
-) -> Tuple[Dict[str, Any], pd.DataFrame]:
-    ensure_dirs()
-    data = load_files()
-    if not data:
-        raise SystemExit(f"No .csv/.parquet found in {DATA_DIR}. Put files there and re-run.")
+        if sample_size and sample_size > 0 and sample_size < len(df):
+            df = df.tail(sample_size)
 
-    tickers_all = sorted(list(data.keys()))
+        return df.reset_index(drop=True)
 
-    try:
-        import optuna
-        from optuna.samplers import TPESampler
-        from optuna.pruners import MedianPruner
-    except Exception as e:
-        raise SystemExit("Optuna not installed. pip install optuna") from e
+    def find_data_files(self) -> List[Path]:
+        files = list(self.data_dir.rglob("*.parquet")) + list(self.data_dir.rglob("*.csv"))
+        files.sort()
+        logger.info(f"Found {len(files)} data files in {self.data_dir}")
+        return files
 
-    if study_name is None:
-        study_name = f"half_rsi_ret_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    def calculate_indicators_pine(self, df: pd.DataFrame, params: StrategyParams) -> pd.DataFrame:
+        out = df.copy()
 
-    storage_path = OUT_DIR / f"{study_name}.db"
-    storage_url = f"sqlite:///{storage_path}"
+        o = out["open"].values.astype(np.float64)
+        h = out["high"].values.astype(np.float64)
+        l = out["low"].values.astype(np.float64)
+        c = out["close"].values.astype(np.float64)
 
-    sampler = TPESampler(seed=seed, n_startup_trials=30, multivariate=True)
-    pruner = MedianPruner(n_startup_trials=20, n_warmup_steps=10)
+        ha_o, ha_h, ha_l, ha_c = calculate_heikin_ashi_numba(o, h, l, c)
+        out["ha_open"] = ha_o
+        out["ha_high"] = ha_h
+        out["ha_low"] = ha_l
+        out["ha_close"] = ha_c
 
-    study = optuna.create_study(
-        study_name=study_name,
-        storage=storage_url,
-        sampler=sampler,
-        pruner=pruner,
-        direction="maximize",
-        load_if_exists=True,
-    )
+        base_rsi = rsi_numba(ha_c, int(params.base_period))
+        out["base_rsi"] = base_rsi
 
-    rng = random.Random(seed)
+        scaled = (100.0 - base_rsi) / 100.0
+        adapt = np.round(scaled * (params.max_period - params.min_period) + params.min_period).astype(np.float64)
 
-    def choose_tickers_for_trial() -> List[str]:
-        if n_files is None or n_files <= 0 or n_files >= len(tickers_all):
-            return tickers_all
-        return rng.sample(tickers_all, k=n_files)
+        for i in range(len(adapt)):
+            if np.isnan(adapt[i]):
+                continue
+            if adapt[i] < params.min_period:
+                adapt[i] = params.min_period
+            elif adapt[i] > params.max_period:
+                adapt[i] = params.max_period
 
-    def opt_fn(trial):
-        # --------- OPTIMIZED PARAMETERS ----------
-        slowW = trial.suggest_int("slow_window", 14, 80)
-        shft  = trial.suggest_int("shift", 0, 6)
-        smth  = trial.suggest_int("smooth_len", 3, 30)
+        out["adaptive_period"] = adapt
 
-        atrP  = trial.suggest_int("atrPeriod", 5, 60)
-        slM   = trial.suggest_float("slMultiplier", 0.5, 8.0)
-        tpM   = trial.suggest_float("tpMultiplier", 0.5, 10.0)
-        trM   = trial.suggest_float("trailMultiplier", 0.5, 10.0)
+        fast_p = np.round(adapt / 2.0).astype(np.float64)
+        for i in range(len(fast_p)):
+            if np.isnan(fast_p[i]):
+                continue
+            if fast_p[i] < 2:
+                fast_p[i] = 2
+        out["fast_period"] = fast_p
+        out["slow_period"] = adapt
 
-        tickers = choose_tickers_for_trial()
-        if not tickers:
-            return -1e9
+        MIN_RSI = 2
+        MAX_RSI = 34
+        all_rsi = calculate_all_rsi_numba(ha_c, MIN_RSI, MAX_RSI)
 
+        fast_rsi = np.full(len(out), np.nan)
+        slow_rsi = np.full(len(out), np.nan)
+
+        for i in range(len(out)):
+            fp = fast_p[i]
+            sp = adapt[i]
+            if np.isnan(fp) or np.isnan(sp):
+                continue
+            fpi = int(fp)
+            spi = int(sp)
+            if MIN_RSI <= fpi <= MAX_RSI:
+                fast_rsi[i] = all_rsi[i, fpi - MIN_RSI]
+            if MIN_RSI <= spi <= MAX_RSI:
+                slow_rsi[i] = all_rsi[i, spi - MIN_RSI]
+
+        out["fast_rsi"] = fast_rsi
+        out["slow_rsi"] = slow_rsi
+
+        tr_real = true_range_real_numba(h, l, c)
+        atr_real = rma_numba(tr_real, int(params.atr_period))
+        out["atr_real"] = atr_real
+
+        return out
+
+    def backtest_single(self, df: pd.DataFrame, params: StrategyParams, fill_mode: str = "same_close") -> Dict[str, Any]:
+        try:
+            dfi = self.calculate_indicators_pine(df, params)
+            min_bars = int(max(params.max_period, params.atr_period, params.base_period) + 5)
+
+            buy_signal, sell_signal, exit_reason, stop_level = build_signals_and_exits_with_reason_numba(
+                dfi["fast_rsi"].values.astype(np.float64),
+                dfi["slow_rsi"].values.astype(np.float64),
+                dfi["ha_close"].values.astype(np.float64),
+                dfi["ha_high"].values.astype(np.float64),
+                dfi["ha_low"].values.astype(np.float64),
+                dfi["atr_real"].values.astype(np.float64),
+                float(params.sl_multiplier),
+                float(params.tp_multiplier),
+                float(params.trail_multiplier),
+                int(min_bars),
+            )
+
+            if fill_mode == "same_close":
+                mode_code = 0
+            elif fill_mode == "next_open":
+                mode_code = 1
+            else:
+                mode_code = 2
+
+            equity_curve, n_trades, gp, gl = run_simulation_with_fill_modes_pf_numba(
+                dfi["open"].values.astype(np.float64),
+                dfi["close"].values.astype(np.float64),
+                buy_signal,
+                sell_signal,
+                exit_reason,
+                stop_level,
+                float(params.initial_capital),
+                float(params.position_size_pct),
+                float(params.commission_pct),
+                int(mode_code),
+            )
+
+            final_equity = float(equity_curve[-1])
+            total_return = (final_equity / float(params.initial_capital)) - 1.0
+            total_ret_pct = total_return * 100.0
+
+            # Sharpe (reporting only)
+            if len(equity_curve) > 2:
+                rets = np.diff(equity_curve) / np.maximum(equity_curve[:-1], 1e-12)
+                std = np.std(rets)
+                sharpe = float((np.mean(rets) / std) * np.sqrt(252.0)) if std > 0 else 0.0
+            else:
+                sharpe = 0.0
+
+            # Max drawdown (negative %)
+            cum_max = np.maximum.accumulate(equity_curve)
+            dd = (equity_curve - cum_max) / np.maximum(cum_max, 1e-12)
+            max_dd_pct = float(np.min(dd) * 100.0)
+
+            gp = float(gp)
+            gl = float(gl)
+            pf = gp / gl if gl > 0 else (10.0 if gp > 0 else 0.0)
+
+            return {
+                "total_return": float(total_return),             # decimal
+                "total_return_pct": float(total_ret_pct),        # percent
+                "sharpe_ratio": float(sharpe),
+                "max_drawdown_pct": float(max_dd_pct),
+                "n_trades": int(n_trades),
+                "final_equity": float(final_equity),
+                "gross_profit": float(gp),
+                "gross_loss": float(gl),
+                "profit_factor": float(pf),                      # reference only
+            }
+        except Exception as e:
+            logger.error(f"backtest_single error: {e}")
+            return {
+                "total_return": -1.0,
+                "total_return_pct": -100.0,
+                "sharpe_ratio": 0.0,
+                "max_drawdown_pct": -100.0,
+                "n_trades": 0,
+                "final_equity": float(params.initial_capital),
+                "gross_profit": 0.0,
+                "gross_loss": 0.0,
+                "profit_factor": 0.0,
+            }
+
+    def run_backtest_hybrid_score(
+        self,
+        files: List[Path],
+        sample_size: int,
+        fill_mode: str,
+        alpha: float,
+        use_penalties: bool,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Equal-weight per-file aggregation (no domination):
+          avg_return_overall = mean(total_return per file)
+          pct_positive_return = fraction(total_return > 0)
+          score = (1 + avg_return_overall) * (pct_positive_return ** alpha)
+        """
+        params = StrategyParams(**kwargs)
+
+        used = 0
         sum_ret = 0.0
         pos_cnt = 0
-        agg_trades = 0
-        agg_dd = 0.0
 
-        for tk in tickers:
-            params = HalfRSIParams(
-                channelLength=107,
-                channelMulti=4.85,
+        total_trades = 0
+        sum_abs_maxdd = 0.0  # in fraction units, e.g. 0.18
+        per_file: List[Dict[str, Any]] = []
 
-                slow_window=int(slowW),
-                shift=int(shft),
-                smooth_len=int(smth),
+        for fp in files:
+            df = self.load_data_chunk(fp, sample_size)
+            if len(df) <= 100:
+                continue
 
-                atrPeriod=int(atrP),
-                slMultiplier=float(slM),
-                tpMultiplier=float(tpM),
-                trailMultiplier=float(trM),
+            r = self.backtest_single(df, params, fill_mode=fill_mode)
+            r["file"] = fp.name
+            per_file.append(r)
 
-                initial_capital=INITIAL_CAPITAL,
-                position_size_pct=POSITION_SIZE_PCT,
-                commission_pct=COMMISSION_PCT,
-                fill_mode=fill_mode,
-            )
-            m = backtest_half_rsi_hr(data[tk], params)
-            r = float(m.get("total_return", 0.0))
-            sum_ret += r
-            if r > 0.0:
+            tr = float(r.get("total_return", 0.0))
+            sum_ret += tr
+            if tr > 0.0:
                 pos_cnt += 1
+            used += 1
 
-            agg_trades += int(m.get("num_trades", 0))
-            agg_dd += abs(float(m.get("maxdd", 0.0)))
+            total_trades += int(r.get("n_trades", 0))
+            mdd_pct = float(r.get("max_drawdown_pct", 0.0))
+            sum_abs_maxdd += abs(mdd_pct) / 100.0
 
-        avg_return_overall = sum_ret / float(len(tickers))
-        pct_positive_return = pos_cnt / float(len(tickers))
+        if used <= 0:
+            return {
+                "score": 0.0,
+                "avg_return_overall": 0.0,
+                "pct_positive_return": 0.0,
+                "positive_files": 0,
+                "n_files_used": 0,
+                "total_trades": 0,
+                "sum_abs_maxdd": 0.0,
+                "penalty": 0.0,
+                "per_file": per_file,
+            }
 
-        # Score: (1 + avg_return) * (pct_pos ** alpha)
+        avg_return_overall = sum_ret / float(used)
+        pct_positive_return = pos_cnt / float(used)
+
         base = 1.0 + avg_return_overall
-        base = max(base, 1e-6)  # safety
+        base = max(base, 1e-6)
         score = base * (pct_positive_return ** float(alpha))
 
         penalty = 0.0
         if use_penalties:
-            if agg_trades < 3:
+            if total_trades < 3:
                 penalty += 3.0
-            elif agg_trades < 10:
+            elif total_trades < 10:
                 penalty += 1.0
-            score = score - (agg_dd * 0.25) - penalty
+            score = score - (sum_abs_maxdd * 0.25) - penalty
 
-        trial.set_user_attr("avg_return_overall", float(avg_return_overall))
-        trial.set_user_attr("pct_positive_return", float(pct_positive_return))
-        trial.set_user_attr("positive_tickers", int(pos_cnt))
-        trial.set_user_attr("n_files_used", int(len(tickers)))
+        return {
+            "score": float(score),
+            "avg_return_overall": float(avg_return_overall),
+            "pct_positive_return": float(pct_positive_return),
+            "positive_files": int(pos_cnt),
+            "n_files_used": int(used),
+            "total_trades": int(total_trades),
+            "sum_abs_maxdd": float(sum_abs_maxdd),
+            "penalty": float(penalty),
+            "per_file": per_file,
+        }
+
+    def objective(
+        self,
+        trial: optuna.Trial,
+        all_files: List[Path],
+        sample_size: int,
+        n_files: int,
+        fill_mode: str,
+        alpha: float,
+        use_penalties: bool,
+        seed: int,
+    ) -> float:
+        params = DEFAULT_PARAMS.copy()
+
+        # Optimize Pine inputs (reasonable bounds)
+        params["atr_period"] = trial.suggest_int("atr_period", 10, 80)
+        params["sl_multiplier"] = trial.suggest_float("sl_multiplier", 0.5, 12.0)
+        params["tp_multiplier"] = trial.suggest_float("tp_multiplier", 0.5, 12.0)
+        params["trail_multiplier"] = trial.suggest_float("trail_multiplier", 0.5, 20.0)
+
+        params["base_period"] = trial.suggest_int("base_period", 2, 34)
+        params["min_period"] = trial.suggest_int("min_period", 2, 20)
+        params["max_period"] = trial.suggest_int("max_period", 10, 34)
+
+        if params["min_period"] >= params["max_period"]:
+            return 0.0
+
+        if len(all_files) <= 0:
+            return 0.0
+
+        # random subsample per trial (like your half_RSI)
+        if n_files is None or n_files <= 0 or n_files >= len(all_files):
+            trial_files = all_files
+        else:
+            rng = random.Random(int(seed) + int(trial.number) * 1009)
+            trial_files = rng.sample(all_files, k=int(n_files))
+
+        metrics = self.run_backtest_hybrid_score(
+            files=trial_files,
+            sample_size=sample_size,
+            fill_mode=fill_mode,
+            alpha=alpha,
+            use_penalties=use_penalties,
+            **params,
+        )
+
+        if int(metrics.get("total_trades", 0)) == 0 or int(metrics.get("n_files_used", 0)) == 0:
+            return 0.0
+
+        score = float(metrics.get("score", 0.0))
+
+        trial.set_user_attr("avg_return_overall", float(metrics.get("avg_return_overall", 0.0)))
+        trial.set_user_attr("pct_positive_return", float(metrics.get("pct_positive_return", 0.0)))
+        trial.set_user_attr("positive_files", int(metrics.get("positive_files", 0)))
+        trial.set_user_attr("n_files_used", int(metrics.get("n_files_used", 0)))
         trial.set_user_attr("alpha", float(alpha))
+        trial.set_user_attr("fill_mode", str(fill_mode))
 
-        trial.set_user_attr("total_trades", int(agg_trades))
-        trial.set_user_attr("sum_abs_maxdd", float(agg_dd))
-        trial.set_user_attr("penalty", float(penalty))
+        trial.set_user_attr("total_trades", int(metrics.get("total_trades", 0)))
+        trial.set_user_attr("sum_abs_maxdd", float(metrics.get("sum_abs_maxdd", 0.0)))
+        trial.set_user_attr("penalty", float(metrics.get("penalty", 0.0)))
 
         return float(score)
 
-    study.optimize(opt_fn, n_trials=n_trials, n_jobs=1, show_progress_bar=True, gc_after_trial=True)
+    def optimize_bayesian(
+        self,
+        n_trials: int = 100,
+        n_files: int = 5,
+        sample_size: int = 5000,
+        n_jobs: int = -1,
+        fill_mode: str = "same_close",
+        alpha: float = 0.5,
+        seed: int = 42,
+        use_penalties: bool = True,
+    ) -> Dict[str, Any]:
+        files = self.find_data_files()
+        if len(files) == 0:
+            logger.error("No data files found in data directory")
+            return {}
 
-    best_params = dict(study.best_params)
-    best_params["best_score"] = float(study.best_value)
-    best_params["fill_mode"] = fill_mode
-    best_params["timestamp"] = time.time()
-    best_params["score_is_(1+avg_return)*pct_pos^alpha"] = True
-    best_params["use_penalties"] = bool(use_penalties)
-    best_params["alpha"] = float(alpha)
+        study_name = f"adapt_half_rsi_hybrid_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        storage_url = f"sqlite:///{self.results_dir}/{study_name}.db"
 
-    with open(OUT_DIR / "best_params_half_rsi.json", "w") as f:
-        json.dump(best_params, f, indent=2)
-
-    # Run best params across all files + save per-ticker outputs
-    rows = []
-    for tk in tickers_all:
-        params = HalfRSIParams(
-            channelLength=107,
-            channelMulti=4.85,
-
-            slow_window=int(best_params.get("slow_window", 32)),
-            shift=int(best_params.get("shift", 2)),
-            smooth_len=int(best_params.get("smooth_len", 12)),
-
-            atrPeriod=int(best_params["atrPeriod"]),
-            slMultiplier=float(best_params["slMultiplier"]),
-            tpMultiplier=float(best_params["tpMultiplier"]),
-            trailMultiplier=float(best_params["trailMultiplier"]),
-
-            initial_capital=INITIAL_CAPITAL,
-            position_size_pct=POSITION_SIZE_PCT,
-            commission_pct=COMMISSION_PCT,
-            fill_mode=fill_mode,
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage_url,
+            sampler=TPESampler(seed=int(seed), n_startup_trials=20, multivariate=True),
+            pruner=MedianPruner(n_startup_trials=10, n_warmup_steps=5),
+            direction="maximize",
+            load_if_exists=True,
         )
-        m = backtest_half_rsi_hr(data[tk], params)
-        r = float(m.get("total_return", 0.0))
-        rows.append({
-            "ticker": tk,
-            "final_equity": m["final_equity"],
-            "total_return": r,
-            "positive_return": 1 if r > 0.0 else 0,
-            "sharpe": m["sharpe"],
-            "maxdd": m["maxdd"],
-            "num_trades": m["num_trades"],
-        })
+        self.study = study
 
-        pd.DataFrame(m["trades"]).to_csv(OUT_DIR / f"{tk}_trades_best.csv", index=False)
+        logger.info(
+            f"Starting optimization (HYBRID score) with {n_trials} trials | fill={fill_mode} | alpha={alpha} | "
+            f"files_per_trial={n_files} | penalties={use_penalties}"
+        )
 
-        if HAS_PLT:
-            plt.figure(figsize=(10, 4))
-            plt.plot(m["equity_curve"])
-            plt.title(
-                f"{tk} Equity (Best) slowW={params.slow_window} shift={params.shift} sm={params.smooth_len} "
-                f"atr={params.atrPeriod} sl={params.slMultiplier:.3f} tp={params.tpMultiplier:.3f} trail={params.trailMultiplier:.3f}"
+        def objective_with_args(tr):
+            return self.objective(
+                trial=tr,
+                all_files=files,
+                sample_size=sample_size,
+                n_files=n_files,
+                fill_mode=fill_mode,
+                alpha=alpha,
+                use_penalties=use_penalties,
+                seed=seed,
             )
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(OUT_DIR / f"equity_{tk}_best.png")
-            plt.close()
 
-    summary_df = pd.DataFrame(rows).sort_values("total_return", ascending=False)
-    summary_df.to_csv(OUT_DIR / "optimization_summary_half_rsi.csv", index=False)
+        study.optimize(
+            objective_with_args,
+            n_trials=int(n_trials),
+            n_jobs=(n_jobs if n_jobs > 0 else os.cpu_count()),
+            show_progress_bar=True,
+            gc_after_trial=True,
+        )
 
-    trials_df = study.trials_dataframe()
-    trials_df.to_csv(OUT_DIR / "optuna_trials_half_rsi.csv", index=False)
+        if not study.trials or all(t.state != TrialState.COMPLETE for t in study.trials):
+            logger.error("No successful trials completed.")
+            return {}
 
-    # Overall (ALL FILES) metrics for best params
-    avg_return_all = float(summary_df["total_return"].mean()) if len(summary_df) else 0.0
-    pct_pos_all = float(summary_df["positive_return"].mean()) if len(summary_df) else 0.0
-    score_all = max(1.0 + avg_return_all, 1e-6) * (pct_pos_all ** float(alpha))
+        return self.save_optimization_results(
+            study=study,
+            all_files=files,
+            sample_size=sample_size,
+            fill_mode=fill_mode,
+            alpha=alpha,
+            use_penalties=use_penalties,
+        )
 
-    print("\n=== BEST PARAMS ===")
-    for k, v in best_params.items():
-        if k not in ("timestamp",):
-            print(f"{k}: {v}")
+    def save_optimization_results(
+        self,
+        study: optuna.Study,
+        all_files: List[Path],
+        sample_size: int,
+        fill_mode: str,
+        alpha: float,
+        use_penalties: bool,
+    ) -> Dict[str, Any]:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    print("\n=== OVERALL (ALL FILES) METRICS (BEST PARAMS) ===")
-    print(f"Avg Return:        {avg_return_all:.6f}")
-    print(f"Pct Positive Ret:  {pct_pos_all:.4f}  ({int(summary_df['positive_return'].sum())}/{len(summary_df)})")
-    print(f"Alpha:             {alpha:.3f}")
-    print(f"Score (overall):   {score_all:.6f}")
+        best_params = study.best_params.copy()
+        best_params["best_score"] = float(study.best_value)
+        best_params["fill_mode"] = str(fill_mode)
+        best_params["alpha"] = float(alpha)
+        best_params["use_penalties"] = bool(use_penalties)
 
-    print("\nSaved outputs to:", str(OUT_DIR))
-    print(summary_df.to_string(index=False))
-    return best_params, summary_df
+        best_file = self.results_dir / f"best_params_score_{timestamp}.json"
+        with open(best_file, "w") as f:
+            json.dump(best_params, f, indent=2)
 
+        trials_df = study.trials_dataframe().sort_values("value", ascending=False)
+        csv_file = self.results_dir / f"trials_score_{timestamp}.csv"
+        trials_df.to_csv(csv_file, index=False)
+
+        stats = {
+            "best_value_score": float(study.best_value),
+            "best_params": study.best_params,
+            "n_trials": len(study.trials),
+            "completed_trials": len([t for t in study.trials if t.state == TrialState.COMPLETE]),
+            "pruned_trials": len([t for t in study.trials if t.state == TrialState.PRUNED]),
+            "failed_trials": len([t for t in study.trials if t.state == TrialState.FAIL]),
+        }
+        stats_file = self.results_dir / f"study_stats_score_{timestamp}.json"
+        with open(stats_file, "w") as f:
+            json.dump(stats, f, indent=2)
+
+        # Evaluate best on ALL files (and save per-file CSV)
+        eval_params = DEFAULT_PARAMS.copy()
+        eval_params.update(study.best_params)
+        params_obj = StrategyParams(**eval_params)
+
+        rows = []
+        used = 0
+        sum_ret = 0.0
+        pos_cnt = 0
+        total_trades = 0
+        sum_abs_maxdd = 0.0
+
+        # reference-only pooled PF (NOT optimized, just printed as info)
+        total_gp = 0.0
+        total_gl = 0.0
+
+        for fp in all_files:
+            df = self.load_data_chunk(fp, sample_size)
+            if len(df) <= 100:
+                continue
+            r = self.backtest_single(df, params_obj, fill_mode=fill_mode)
+            r["file"] = fp.name
+            rows.append(r)
+
+            tr = float(r.get("total_return", 0.0))
+            sum_ret += tr
+            if tr > 0.0:
+                pos_cnt += 1
+            used += 1
+
+            total_trades += int(r.get("n_trades", 0))
+            mdd_pct = float(r.get("max_drawdown_pct", 0.0))
+            sum_abs_maxdd += abs(mdd_pct) / 100.0
+
+            total_gp += float(r.get("gross_profit", 0.0))
+            total_gl += float(r.get("gross_loss", 0.0))
+
+        per_file_df = pd.DataFrame(rows)
+        if not per_file_df.empty:
+            per_file_df["positive_return"] = (per_file_df["total_return"] > 0.0).astype(int)
+            per_file_df = per_file_df.sort_values(
+                ["total_return", "positive_return", "n_trades"],
+                ascending=[False, False, False],
+            )
+
+        per_file_csv = self.results_dir / f"per_file_results_score_{timestamp}.csv"
+        per_file_df.to_csv(per_file_csv, index=False)
+
+        if used > 0:
+            avg_return_all = sum_ret / float(used)
+            pct_pos_all = pos_cnt / float(used)
+            base = max(1.0 + avg_return_all, 1e-6)
+            score_all = base * (pct_pos_all ** float(alpha))
+
+            penalty = 0.0
+            if use_penalties:
+                if total_trades < 3:
+                    penalty += 3.0
+                elif total_trades < 10:
+                    penalty += 1.0
+                score_all = score_all - (sum_abs_maxdd * 0.25) - penalty
+        else:
+            avg_return_all = 0.0
+            pct_pos_all = 0.0
+            score_all = 0.0
+            penalty = 0.0
+
+        pooled_pf_ref = (total_gp / total_gl) if total_gl > 0 else (10.0 if total_gp > 0 else 0.0)
+
+        print("\n" + "=" * 90)
+        print("BAYESIAN OPTIMIZATION RESULTS (Objective = (1+avg_return) * pct_pos^alpha)")
+        print("=" * 90)
+        print(f"Best SCORE (study.best_value): {study.best_value:.6f}")
+        print(f"Fill mode: {fill_mode}")
+        print(f"Alpha: {alpha}")
+        print(f"Use penalties: {use_penalties}")
+        print(f"Completed Trials: {stats['completed_trials']} | Pruned: {stats['pruned_trials']} | Failed: {stats['failed_trials']}")
+        print("\nBest Parameters Found:")
+        for k, v in study.best_params.items():
+            print(f"  {k}: {v}")
+
+        print("\n" + "-" * 90)
+        print("OVERALL (ALL FILES) METRICS (BEST PARAMS)")
+        print("-" * 90)
+        print(f"Files used:       {used}")
+        print(f"Avg Return:       {avg_return_all:.6f}  ({avg_return_all*100:.2f}%)")
+        print(f"Pct Positive Ret: {pct_pos_all:.4f}  ({pos_cnt}/{used})")
+        print(f"Alpha:            {alpha:.3f}")
+        print(f"Sum abs MaxDD:    {sum_abs_maxdd:.4f}")
+        print(f"Total Trades:     {total_trades}")
+        if use_penalties:
+            print(f"Penalty term:     {penalty:.3f}")
+        print(f"SCORE (overall):  {score_all:.6f}")
+
+        print("\nReference only (NOT optimized; shown for context):")
+        print(f"Pooled PF:        {pooled_pf_ref:.6f}")
+        print(f"Gross Profit:     {total_gp:,.2f}")
+        print(f"Gross Loss:       {total_gl:,.2f}")
+
+        print("\n" + "-" * 90)
+        print("PER-FILE RESULTS (BEST PARAMS)")
+        print("-" * 90)
+        if per_file_df.empty:
+            print("(No per-file results: not enough data / all files too short.)")
+        else:
+            show_cols = [
+                "file",
+                "total_return_pct",
+                "positive_return",
+                "n_trades",
+                "max_drawdown_pct",
+                "profit_factor",
+                "final_equity",
+            ]
+            show_cols = [c for c in show_cols if c in per_file_df.columns]
+            print(per_file_df[show_cols].to_string(index=False))
+
+        print("\nSaved:")
+        print(f"  Best params: {best_file}")
+        print(f"  Trials CSV:  {csv_file}")
+        print(f"  Per-file:    {per_file_csv}")
+        print(f"  Stats:       {stats_file}")
+        print("=" * 90)
+
+        return {
+            "best_params": best_params,
+            "trials_df": trials_df,
+            "per_file_df": per_file_df,
+            "stats": stats,
+            "study": study,
+            "paths": {
+                "best_params": str(best_file),
+                "trials_csv": str(csv_file),
+                "per_file_csv": str(per_file_csv),
+                "stats_json": str(stats_file),
+            },
+        }
+
+    def validate_best_params(
+        self,
+        best_params: Dict[str, Any],
+        validation_files: Optional[List[Path]] = None,
+        sample_size: int = 10000,
+        fill_mode: str = "same_close",
+        alpha: float = 0.5,
+        use_penalties: bool = True,
+    ) -> Dict[str, Any]:
+        if validation_files is None:
+            files = self.find_data_files()
+            validation_files = files[-5:] if len(files) > 5 else files
+
+        bp = dict(best_params)
+        for k in ["best_score", "fill_mode", "alpha", "use_penalties"]:
+            bp.pop(k, None)
+
+        params = StrategyParams(**bp)
+
+        metrics = self.run_backtest_hybrid_score(
+            files=validation_files,
+            sample_size=sample_size,
+            fill_mode=fill_mode,
+            alpha=alpha,
+            use_penalties=use_penalties,
+            **params.__dict__,
+        )
+
+        print("\nValidation (hybrid objective):")
+        print(f"  Score:              {metrics['score']:.6f}")
+        print(f"  Avg return:         {metrics['avg_return_overall']:.6f} ({metrics['avg_return_overall']*100:.2f}%)")
+        print(f"  Pct positive return:{metrics['pct_positive_return']:.4f} ({metrics['positive_files']}/{metrics['n_files_used']})")
+        print(f"  Total trades:       {metrics['total_trades']}")
+        print(f"  Sum abs maxdd:      {metrics['sum_abs_maxdd']:.4f}")
+        if use_penalties:
+            print(f"  Penalty:            {metrics['penalty']:.3f}")
+
+        df_out = pd.DataFrame(metrics.get("per_file", []))
+        if not df_out.empty:
+            df_out["positive_return"] = (df_out["total_return"] > 0.0).astype(int)
+            df_out = df_out.sort_values(["total_return", "n_trades"], ascending=[False, False])
+            show_cols = ["file", "total_return_pct", "positive_return", "n_trades", "max_drawdown_pct"]
+            show_cols = [c for c in show_cols if c in df_out.columns]
+            print("\nPer-file:")
+            print(df_out[show_cols].to_string(index=False))
+
+        return metrics
 
 # =========================
 # CLI
@@ -793,20 +1125,121 @@ def run_optuna_optimization(
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--trials", type=int, default=200, help="Optuna trials")
-    ap.add_argument("--files", type=int, default=200, help="Number of files to use per trial (subsample); if >= total -> use all")
-    ap.add_argument("--fill", choices=["next_open", "same_close"], default="same_close", help="Execution model")
-    ap.add_argument("--seed", type=int, default=42, help="RNG seed for file subsampling")
-    ap.add_argument("--no-penalties", action="store_true", help="Disable trade/DD penalties")
-    ap.add_argument("--alpha", type=float, default=0.5, help="Exponent for pct_positive_return term (default 0.5)")
-    args = ap.parse_args()
+    def main():
+        parser = argparse.ArgumentParser(
+            description="Bayesian Optimization for adapt_half_RSI_hh (HYBRID score like half_RSI; 3 fill modes)"
+        )
+        parser.add_argument("--mode", choices=["optimize", "validate", "test"], default="optimize",
+                            help="Mode: optimize, validate, test")
+        parser.add_argument("--trials", type=int, default=100, help="Number of optimization trials")
+        parser.add_argument("--sample", type=int, default=5000, help="Sample size per file")
+        parser.add_argument("--files", type=int, default=3,
+                            help="Number of files used per trial (random subsample); if >= total -> use all")
+        parser.add_argument("--workers", type=int, default=-1, help="Number of parallel workers (-1 for auto)")
+        parser.add_argument("--seed", type=int, default=42, help="RNG seed for file subsampling")
+        parser.add_argument("--alpha", type=float, default=0.5, help="Exponent for pct_positive_return term")
+        parser.add_argument("--no-penalties", action="store_true", help="Disable trade/DD penalties")
+        parser.add_argument("--params-file", type=str, help="JSON file with parameters to validate/test")
+        parser.add_argument("--test-file", type=str, help="Specific file to test")
+        parser.add_argument("--fill", choices=["same_close", "next_open", "intrabar"], default="same_close",
+                            help="Execution fill model (intrabar uses conservative stop fills)")
+        parser.add_argument("--data-dir", type=str, default="./data", help="Data directory")
+        parser.add_argument("--results-dir", type=str, default="./results", help="Results directory")
 
-    run_optuna_optimization(
-        n_trials=args.trials,
-        n_files=args.files,
-        fill_mode=args.fill,
-        seed=args.seed,
-        use_penalties=(not args.no_penalties),
-        alpha=args.alpha,
-    )
+        args = parser.parse_args()
+
+        optimizer = BayesianAdaptHalfRSIOptimizer(data_dir=args.data_dir, results_dir=args.results_dir)
+
+        use_penalties = (not args.no_penalties)
+
+        if args.mode == "optimize":
+            print("=" * 80)
+            print("BAYESIAN OPTIMIZATION MODE (Objective = (1+avg_return) * pct_pos^alpha)")
+            print("=" * 80)
+            print(f"Trials: {args.trials}")
+            print(f"Sample size: {args.sample}")
+            print(f"Files per trial: {args.files}")
+            print(f"Fill mode: {args.fill}")
+            print(f"Alpha: {args.alpha}")
+            print(f"Penalties: {use_penalties}")
+            print(f"Workers: {'Auto' if args.workers == -1 else args.workers}")
+            print("=" * 80)
+
+            optimizer.optimize_bayesian(
+                n_trials=args.trials,
+                n_files=args.files,
+                sample_size=args.sample,
+                n_jobs=args.workers,
+                fill_mode=args.fill,
+                alpha=args.alpha,
+                seed=args.seed,
+                use_penalties=use_penalties,
+            )
+
+        elif args.mode == "validate":
+            if not args.params_file:
+                print("Error: --params-file required for validate mode")
+                return
+
+            with open(args.params_file, "r") as f:
+                params_data = json.load(f)
+
+            # accept either {"best_params": {...}} or raw params dict
+            if "best_params" in params_data:
+                params = params_data["best_params"]
+            else:
+                params = params_data
+
+            optimizer.validate_best_params(
+                best_params=params,
+                sample_size=args.sample,
+                fill_mode=args.fill,
+                alpha=args.alpha,
+                use_penalties=use_penalties,
+            )
+
+        elif args.mode == "test":
+            # pick file
+            if args.test_file:
+                test_fp = Path(args.test_file)
+            else:
+                files = optimizer.find_data_files()
+                if not files:
+                    print("No data files found.")
+                    return
+                test_fp = files[0]
+
+            # pick params
+            if args.params_file:
+                with open(args.params_file, "r") as f:
+                    params_data = json.load(f)
+                if "best_params" in params_data:
+                    params_data = params_data["best_params"]
+                for k in ["best_score", "fill_mode", "alpha", "use_penalties"]:
+                    params_data.pop(k, None)
+                params = StrategyParams(**params_data)
+            else:
+                params = StrategyParams(**DEFAULT_PARAMS)
+
+            df = optimizer.load_data_chunk(test_fp, sample_size=args.sample)
+            if len(df) <= 100:
+                print(f"Not enough data in {test_fp} ({len(df)} rows).")
+                return
+
+            r = optimizer.backtest_single(df, params, fill_mode=args.fill)
+
+            print("\n" + "=" * 80)
+            print("SINGLE FILE TEST")
+            print("=" * 80)
+            print(f"File: {test_fp.name}")
+            print(f"Fill mode: {args.fill}")
+            print("-" * 80)
+            print(f"Return:        {r['total_return_pct']:.2f}%")
+            print(f"Trades:        {r['n_trades']}")
+            print(f"Max DD:        {r['max_drawdown_pct']:.2f}%")
+            print(f"Sharpe:        {r['sharpe_ratio']:.3f}")
+            print(f"Final Equity:  {r['final_equity']:,.2f}")
+            print(f"(Reference) PF:{r['profit_factor']:.6f}")
+            print("=" * 80)
+
+    main()
