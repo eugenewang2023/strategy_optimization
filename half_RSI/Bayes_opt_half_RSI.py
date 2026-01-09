@@ -280,7 +280,7 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
     riskHigh  = ha_h
     riskLow   = ha_l
 
-    # ATR from REAL OHLC (chart-independent)
+    # ATR exit (chart-independent)
     atr_exit = atr_wilder(real_h, real_l, real_c, int(p.atrPeriod))
     _atr_chan = atr_wilder(real_h, real_l, real_c, int(p.channelLength))  # parity only
 
