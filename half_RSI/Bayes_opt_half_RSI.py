@@ -3,9 +3,9 @@
 bayes_opt_half_RSI.py
 
 Goal: Match TradingView Pine strategy:
-"half_RSI_hr (HA signals + Real risk)"
+"half_RSI_hr (HA signals + Real risk)"  (your pasted Pine)
 
-This version matches the Pine logic you included, with SHIFT REMOVED.
+This version matches the Pine logic you included:
 
 DATA SOURCING (chart-type independent):
 - REAL OHLC is the input data.
@@ -15,8 +15,8 @@ SIGNALS (Heikin Ashi):
 - sigClose = haClose
 - sigHL2   = (haHigh + haLow)/2
 - fast_window = round(slow_window/2)
-- fast_rsi = rsi(sigClose, fast_window)          (NO SHIFT)
-- slow_rsi = 100 - rsi(sigClose, slow_window)    (NO SHIFT)
+- fast_rsi = rsi(sigClose, fast_window)
+- slow_rsi = 100 - rsi(sigClose, slow_window)
 - hot = fast_rsi - slow_rsi
 - hot_sm = sma(hot, smooth_len)
 - cross_up = crossover(hot_sm, 0)
@@ -55,7 +55,7 @@ OBJECTIVE:
   alpha default 0.5 and configurable via --alpha
 
 Penalties (optional):
-- light penalties for too few trades and for drawdown
+- light penalties for too few trades and for drawdown (same structure as your script)
 """
 
 import os, json, math, time, random
@@ -196,6 +196,20 @@ def rsi_tv(price: np.ndarray, length: int) -> np.ndarray:
     return out
 
 
+def shift_series(x: np.ndarray, shift: int) -> np.ndarray:
+    """
+    Pine: x[shift] means past value.
+    shift=0 -> x
+    shift>0 -> x shifted right, out[i] = x[i-shift]
+    """
+    n = len(x)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if shift <= 0:
+        return x.astype(np.float64, copy=True)
+    out[shift:] = x[:-shift]
+    return out
+
+
 # =========================
 # Heikin Ashi from REAL OHLC
 # =========================
@@ -290,7 +304,7 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
     sigClose = ha_c
     sigHL2 = (ha_h + ha_l) / 2.0
 
-    # RISK series are REAL
+    # RISK series are REAL (per your Pine: riskClose=realClose, riskHigh=realHigh, riskLow=realLow)
     riskClose = real_c
     riskHigh  = real_h
     riskLow   = real_l
@@ -306,12 +320,16 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
     midChannel_lowerTF = sma(sigHL2, lowerTF_Length)
     above_lowerTF = sigClose > midChannel_lowerTF
 
-    # RSI signals on HA close, NO SHIFT
+    # RSI signals on HA close, with shift (Pine: fast_rsi = rsi(sigClose, fast_window)[shift])
     slow_len = max(2, int(p.slow_window))
     fast_window = max(1, int(round(float(slow_len) / 2.0)))
 
-    fast_rsi = rsi_tv(sigClose, fast_window)
-    slow_rsi = 100.0 - rsi_tv(sigClose, slow_len)
+    fast_rsi_raw = rsi_tv(sigClose, fast_window)
+    slow_rsi_raw = rsi_tv(sigClose, slow_len)
+
+    sh = max(0, int(p.shift))
+    fast_rsi = shift_series(fast_rsi_raw, sh)
+    slow_rsi = 100.0 - shift_series(slow_rsi_raw, sh)
 
     hot = fast_rsi - slow_rsi
     sm = max(1, int(p.smooth_len))
@@ -384,9 +402,10 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
                 trades.append({
                     "signal_idx": int(i),
                     "side": "LONG",
-                    "signal_price": float(riskClose[i]),
+                    "signal_price": float(riskClose[i]),  # Pine uses riskClose (REAL) for level placement
                     "slow_window": int(slow_len),
                     "fast_window": int(fast_window),
+                    "shift": int(sh),
                     "smooth_len": int(sm),
                 })
 
@@ -607,6 +626,7 @@ def run_optuna_optimization(
     def opt_fn(trial):
         # --------- OPTIMIZED PARAMETERS ----------
         slowW = trial.suggest_int("slow_window", 14, 80)
+        shft  = trial.suggest_int("shift", 0, 6)
         smth  = trial.suggest_int("smooth_len", 3, 30)
 
         atrP  = trial.suggest_int("atrPeriod", 5, 60)
@@ -629,6 +649,7 @@ def run_optuna_optimization(
                 channelMulti=4.85,
 
                 slow_window=int(slowW),
+                shift=int(shft),
                 smooth_len=int(smth),
 
                 atrPeriod=int(atrP),
@@ -699,6 +720,7 @@ def run_optuna_optimization(
             channelMulti=4.85,
 
             slow_window=int(best_params.get("slow_window", 32)),
+            shift=int(best_params.get("shift", 2)),
             smooth_len=int(best_params.get("smooth_len", 12)),
 
             atrPeriod=int(best_params["atrPeriod"]),
@@ -729,7 +751,7 @@ def run_optuna_optimization(
             plt.figure(figsize=(10, 4))
             plt.plot(m["equity_curve"])
             plt.title(
-                f"{tk} Equity (Best) slowW={params.slow_window} sm={params.smooth_len} "
+                f"{tk} Equity (Best) slowW={params.slow_window} shift={params.shift} sm={params.smooth_len} "
                 f"atr={params.atrPeriod} sl={params.slMultiplier:.3f} tp={params.tpMultiplier:.3f} trail={params.trailMultiplier:.3f}"
             )
             plt.grid(True)
