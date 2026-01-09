@@ -3,30 +3,59 @@
 bayes_opt_half_RSI.py
 
 Goal: Match TradingView Pine strategy:
-"half_RSI_hh (HA signals + HA risk)"  (your pasted Pine)
+"half_RSI_hr (HA signals + Real risk)"
 
-UPDATE:
-- Optimizes SIGNAL params: slow_window, shift, smooth_len
-  (fast_window is always derived as round(slow_window/2) like Pine)
-- Optimizes RISK params: atrPeriod, slMultiplier, tpMultiplier, trailMultiplier
+This version matches the Pine logic you included, with SHIFT REMOVED.
 
-OBJECTIVE (this version):
+DATA SOURCING (chart-type independent):
+- REAL OHLC is the input data.
+- Heikin Ashi is computed from REAL OHLC.
+
+SIGNALS (Heikin Ashi):
+- sigClose = haClose
+- sigHL2   = (haHigh + haLow)/2
+- fast_window = round(slow_window/2)
+- fast_rsi = rsi(sigClose, fast_window)          (NO SHIFT)
+- slow_rsi = 100 - rsi(sigClose, slow_window)    (NO SHIFT)
+- hot = fast_rsi - slow_rsi
+- hot_sm = sma(hot, smooth_len)
+- cross_up = crossover(hot_sm, 0)
+- longCondition = cross_up and (uptrend or above_lowerTF)
+  where:
+    midChannel = sma(sigHL2, channelLength)
+    uptrend = sigClose > midChannel
+    lowerTF_Length = max(1, channelLength//2)
+    midChannel_lowerTF = sma(sigHL2, lowerTF_Length)
+    above_lowerTF = sigClose > midChannel_lowerTF
+
+RISK / EXITS (REAL OHLC + realATR):
+- riskClose = realClose
+- riskHigh  = realHigh
+- riskLow   = realLow
+- atr = realATR(atrPeriod) == ta.atr(atrPeriod) sourced from REAL OHLC
+- On entry (signal bar):
+    trail_stop_level = riskClose - atr*slMultiplier
+    trail_offset = max(atr*trailMultiplier, atr*0.5)
+    take_profit_low = riskClose + atr*tpMultiplier
+    take_profit_high = take_profit_low + trail_offset
+- While in position:
+    if not tp_touched and riskHigh > take_profit_high: tp_touched = True
+    if tp_touched:
+        tp_crossdown = riskClose < take_profit_low
+        take_profit_low = max(take_profit_low, riskClose - trail_offset)
+    longExit = (riskLow < trail_stop_level) or tp_crossdown
+    new_stop = riskHigh - atr*slMultiplier
+    trail_stop_level = max(trail_stop_level, new_stop)
+
+OBJECTIVE:
 - Optimize BOTH:
-    1) avg_return_overall: average of per-ticker total_return across tickers
+    1) avg_return_overall: mean of per-ticker total_return
     2) pct_positive_return: fraction of tickers with total_return > 0
-
-- Final score (multiplicative, scale-stable):
-    score = (1 + avg_return_overall) * (pct_positive_return ** alpha)
-
-  Notes:
-  - avg_return_overall is arithmetic mean of per-ticker returns (not equity-weighted).
-  - If avg_return_overall < -1 (shouldn't happen), we floor (1+avg_return) at a small epsilon.
-  - alpha controls how strongly you reward robustness. Default alpha=0.5, configurable via --alpha.
+- score = (1 + avg_return_overall) * (pct_positive_return ** alpha)
+  alpha default 0.5 and configurable via --alpha
 
 Penalties (optional):
-- same as before: light penalties for too few trades and for drawdown.
-
-Everything else stays aligned to the Pine logic described in earlier versions.
+- light penalties for too few trades and for drawdown
 """
 
 import os, json, math, time, random
@@ -80,7 +109,7 @@ def sma(x: np.ndarray, length: int) -> np.ndarray:
 def rma_wilder(x: np.ndarray, length: int) -> np.ndarray:
     """
     TradingView ta.rma(): Wilder smoothing.
-    Seed = SMA(length) at index length-1 (first full non-na window).
+    Seed = SMA(length) at first full non-na window.
     alpha = 1/length.
     """
     n = len(x)
@@ -89,13 +118,14 @@ def rma_wilder(x: np.ndarray, length: int) -> np.ndarray:
         return out
 
     if np.isnan(x[:length]).any():
+        start = None
         for i in range(length - 1, n):
             w = x[i - length + 1:i + 1]
             if not np.isnan(w).any():
                 out[i] = float(np.mean(w))
                 start = i + 1
                 break
-        else:
+        if start is None:
             return out
     else:
         out[length - 1] = float(np.mean(x[:length]))
@@ -166,20 +196,6 @@ def rsi_tv(price: np.ndarray, length: int) -> np.ndarray:
     return out
 
 
-def shift_series(x: np.ndarray, shift: int) -> np.ndarray:
-    """
-    Pine: x[shift] means past value.
-    shift=0 -> x
-    shift>0 -> x shifted right, out[i] = x[i-shift]
-    """
-    n = len(x)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if shift <= 0:
-        return x.astype(np.float64, copy=True)
-    out[shift:] = x[:-shift]
-    return out
-
-
 # =========================
 # Heikin Ashi from REAL OHLC
 # =========================
@@ -221,22 +237,21 @@ def crossunder(cur_x: float, prev_x: float, cur_y: float, prev_y: float) -> bool
 
 
 # =========================
-# Backtest: half_RSI_hh
+# Backtest: half_RSI_hr (HA signals + Real risk)
 # =========================
 
 @dataclass
 class HalfRSIParams:
     channelLength: int = 107
-    channelMulti: float = 4.85  # parity only; not used directly in this port
+    channelMulti: float = 4.85  # not used for entries/exits in this port; kept for parity
 
-    atrPeriod: int = 47
-    slMultiplier: float = 5.805
-    tpMultiplier: float = 4.182
-    trailMultiplier: float = 7.76
+    atrPeriod: int = 29
+    slMultiplier: float = 5.16
+    tpMultiplier: float = 4.94
+    trailMultiplier: float = 2.78
 
-    slow_window: int = 18
-    shift: int = 0
-    smooth_len: int = 21
+    slow_window: int = 32
+    smooth_len: int = 12
 
     initial_capital: float = INITIAL_CAPITAL
     position_size_pct: float = POSITION_SIZE_PCT
@@ -245,7 +260,7 @@ class HalfRSIParams:
     fill_mode: str = "next_open"  # "next_open" or "same_close"
 
 
-def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
+def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
     df = df.copy().reset_index(drop=True)
     df.columns = [c.lower() for c in df.columns]
 
@@ -270,42 +285,37 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
             "total_return": 0.0,
         }
 
-    # HA from REAL
+    # HA from REAL (signals)
     ha_o, ha_h, ha_l, ha_c = heikin_ashi_from_real(real_o, real_h, real_l, real_c)
     sigClose = ha_c
     sigHL2 = (ha_h + ha_l) / 2.0
 
-    # Risk series are HA (per Pine assignments)
-    riskClose = sigClose
-    riskHigh  = ha_h
-    riskLow   = ha_l
+    # RISK series are REAL
+    riskClose = real_c
+    riskHigh  = real_h
+    riskLow   = real_l
 
-    # ATR exit (chart-independent)
+    # realATR(atrPeriod) == ATR on REAL OHLC (Wilder)
     atr_exit = atr_wilder(real_h, real_l, real_c, int(p.atrPeriod))
-    _atr_chan = atr_wilder(real_h, real_l, real_c, int(p.channelLength))  # parity only
 
-    # RSI signals on HA close, with shift
-    slow_len = max(2, int(p.slow_window))
-    fast_window = max(1, int(round(float(slow_len) / 2.0)))
-
-    fast_rsi_raw = rsi_tv(sigClose, fast_window)
-    slow_rsi_raw = rsi_tv(sigClose, slow_len)
-
-    sh = max(0, int(p.shift))
-    fast_rsi = shift_series(fast_rsi_raw, sh)
-    slow_rsi = 100.0 - shift_series(slow_rsi_raw, sh)
-
-    hot = fast_rsi - slow_rsi
-    sm = max(1, int(p.smooth_len))
-    hot_sm = sma(hot, sm)
-
-    # Trend filters
+    # Trend filters (signals)
     midChannel = sma(sigHL2, int(p.channelLength))
     uptrend = sigClose > midChannel
 
     lowerTF_Length = max(1, int(p.channelLength // 2))
     midChannel_lowerTF = sma(sigHL2, lowerTF_Length)
     above_lowerTF = sigClose > midChannel_lowerTF
+
+    # RSI signals on HA close, NO SHIFT
+    slow_len = max(2, int(p.slow_window))
+    fast_window = max(1, int(round(float(slow_len) / 2.0)))
+
+    fast_rsi = rsi_tv(sigClose, fast_window)
+    slow_rsi = 100.0 - rsi_tv(sigClose, slow_len)
+
+    hot = fast_rsi - slow_rsi
+    sm = max(1, int(p.smooth_len))
+    hot_sm = sma(hot, sm)
 
     # State
     in_pos = False
@@ -317,7 +327,7 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
     equity_curve = np.zeros(n, dtype=np.float64)
     trades: List[Dict[str, Any]] = []
 
-    # Pine-like vars
+    # Pine-like vars (persist while in position)
     tp_touched = False
     tp_crossdown = False
     trail_offset = np.nan
@@ -331,7 +341,7 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
         # Handle pending entry fill (next_open)
         if p.fill_mode == "next_open":
             if pending_entry and entry_fill_idx == i:
-                fill_price = real_o[i]
+                fill_price = real_o[i]  # market filled on next bar open
                 pos_value = cash * float(p.position_size_pct)
                 qty = pos_value / fill_price if fill_price > 0 else 0.0
                 commission = pos_value * float(p.commission_pct)
@@ -345,24 +355,26 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
                     "qty": float(qty),
                 })
 
-        # Signal: crossover(hot_sm, 0)
-        if i > 0 and not np.isnan(hot_sm[i]) and not np.isnan(prev_hot_sm):
+        # Signal: cross_up = ta.crossover(hot_sm, 0)
+        if i > 0 and (not np.isnan(hot_sm[i])) and (not np.isnan(prev_hot_sm)):
             cross_up = crossover(hot_sm[i], prev_hot_sm, 0.0, 0.0)
         else:
             cross_up = False
 
+        # longCondition = cross_up and (uptrend or above_lowerTF)
         if cross_up and (not np.isnan(uptrend[i])) and (not np.isnan(above_lowerTF[i])):
             longCondition = bool(uptrend[i] or above_lowerTF[i])
         else:
             longCondition = False
 
-        # ENTRY
+        # ENTRY (levels set using REAL close + REAL atr)
         if longCondition and (not in_pos) and (not pending_entry):
             tp_touched = False
             tp_crossdown = False
 
             atr_i = atr_exit[i]
-            if not np.isnan(atr_i) and not np.isnan(riskClose[i]):
+            if (not np.isnan(atr_i)) and (not np.isnan(riskClose[i])):
+                # Initial stop / offsets use REAL
                 trail_stop_level = riskClose[i] - (atr_i * float(p.slMultiplier))
                 min_trail_offset = atr_i * 0.5
                 trail_offset = max(atr_i * float(p.trailMultiplier), min_trail_offset)
@@ -375,12 +387,11 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
                     "signal_price": float(riskClose[i]),
                     "slow_window": int(slow_len),
                     "fast_window": int(fast_window),
-                    "shift": int(sh),
                     "smooth_len": int(sm),
                 })
 
                 if p.fill_mode == "same_close":
-                    fill_price = riskClose[i]
+                    fill_price = riskClose[i]  # same-bar close fill model
                     pos_value = cash * float(p.position_size_pct)
                     qty = pos_value / fill_price if fill_price > 0 else 0.0
                     commission = pos_value * float(p.commission_pct)
@@ -399,28 +410,33 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
                     else:
                         trades[-1].update({"ignored": True})
 
-        # POSITION MANAGEMENT / EXITS
+        # POSITION MANAGEMENT / EXITS (ALL REAL)
         if in_pos:
+            # if not tp_touched and riskHigh > take_profit_high => tp_touched := true
             if (not tp_touched) and (not np.isnan(take_profit_high)) and (not np.isnan(riskHigh[i])) and (riskHigh[i] > take_profit_high):
                 tp_touched = True
 
-            if tp_touched and (not np.isnan(take_profit_low)) and (not np.isnan(riskClose[i])):
+            # if tp_touched:
+            #   tp_crossdown := riskClose < take_profit_low
+            #   take_profit_low := max(take_profit_low, riskClose - trail_offset)
+            if tp_touched and (not np.isnan(take_profit_low)) and (not np.isnan(riskClose[i])) and (not np.isnan(trail_offset)):
                 tp_crossdown = bool(riskClose[i] < take_profit_low)
-                if not np.isnan(trail_offset):
-                    new_low = riskClose[i] - trail_offset
-                    take_profit_low = max(take_profit_low, new_low)
+                new_low = riskClose[i] - trail_offset
+                take_profit_low = max(take_profit_low, new_low)
 
+            # longExit = (riskLow < trail_stop_level) or tp_crossdown
             if (not np.isnan(riskLow[i])) and (not np.isnan(trail_stop_level)) and (riskLow[i] < trail_stop_level):
                 longExit = True
-                exit_reason = "SL_breach(HA_low < trail_stop_level)"
+                exit_reason = "SL_breach(realLow < trail_stop_level)"
             elif tp_crossdown:
                 longExit = True
-                exit_reason = "TP_crossdown(riskClose < take_profit_low)"
+                exit_reason = "TP_crossdown(realClose < take_profit_low)"
             else:
                 longExit = False
                 exit_reason = None
 
             if longExit:
+                # strategy.close fills next open in backtest; keep your fill_mode
                 if p.fill_mode == "next_open":
                     if i + 1 < n:
                         fill_price = real_o[i + 1]
@@ -455,11 +471,13 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
                 take_profit_high = np.nan
                 take_profit_low = np.nan
             else:
+                # Update trailing stop level (only moves up): new_stop = riskHigh - atr*slMult
                 atr_i = atr_exit[i]
                 if (not np.isnan(atr_i)) and (not np.isnan(riskHigh[i])) and (not np.isnan(trail_stop_level)):
                     new_stop = riskHigh[i] - (atr_i * float(p.slMultiplier))
                     trail_stop_level = max(trail_stop_level, new_stop)
         else:
+            # when flat, reset (safety)
             tp_touched = False
             tp_crossdown = False
             trail_offset = np.nan
@@ -589,13 +607,12 @@ def run_optuna_optimization(
     def opt_fn(trial):
         # --------- OPTIMIZED PARAMETERS ----------
         slowW = trial.suggest_int("slow_window", 14, 80)
-        shft  = trial.suggest_int("shift", 0, 6)
         smth  = trial.suggest_int("smooth_len", 3, 30)
 
         atrP  = trial.suggest_int("atrPeriod", 5, 60)
-        slM   = trial.suggest_float("slMultiplier", 0.5, 6.0)
-        tpM   = trial.suggest_float("tpMultiplier", 0.5, 8.0)
-        trM   = trial.suggest_float("trailMultiplier", 0.5, 8.0)
+        slM   = trial.suggest_float("slMultiplier", 0.5, 8.0)
+        tpM   = trial.suggest_float("tpMultiplier", 0.5, 10.0)
+        trM   = trial.suggest_float("trailMultiplier", 0.5, 10.0)
 
         tickers = choose_tickers_for_trial()
         if not tickers:
@@ -612,7 +629,6 @@ def run_optuna_optimization(
                 channelMulti=4.85,
 
                 slow_window=int(slowW),
-                shift=int(shft),
                 smooth_len=int(smth),
 
                 atrPeriod=int(atrP),
@@ -625,7 +641,7 @@ def run_optuna_optimization(
                 commission_pct=COMMISSION_PCT,
                 fill_mode=fill_mode,
             )
-            m = backtest_half_rsi_hh(data[tk], params)
+            m = backtest_half_rsi_hr(data[tk], params)
             r = float(m.get("total_return", 0.0))
             sum_ret += r
             if r > 0.0:
@@ -683,7 +699,6 @@ def run_optuna_optimization(
             channelMulti=4.85,
 
             slow_window=int(best_params.get("slow_window", 32)),
-            shift=int(best_params.get("shift", 2)),
             smooth_len=int(best_params.get("smooth_len", 12)),
 
             atrPeriod=int(best_params["atrPeriod"]),
@@ -696,7 +711,7 @@ def run_optuna_optimization(
             commission_pct=COMMISSION_PCT,
             fill_mode=fill_mode,
         )
-        m = backtest_half_rsi_hh(data[tk], params)
+        m = backtest_half_rsi_hr(data[tk], params)
         r = float(m.get("total_return", 0.0))
         rows.append({
             "ticker": tk,
@@ -714,7 +729,7 @@ def run_optuna_optimization(
             plt.figure(figsize=(10, 4))
             plt.plot(m["equity_curve"])
             plt.title(
-                f"{tk} Equity (Best) slowW={params.slow_window} shift={params.shift} sm={params.smooth_len} "
+                f"{tk} Equity (Best) slowW={params.slow_window} sm={params.smooth_len} "
                 f"atr={params.atrPeriod} sl={params.slMultiplier:.3f} tp={params.tpMultiplier:.3f} trail={params.trailMultiplier:.3f}"
             )
             plt.grid(True)
