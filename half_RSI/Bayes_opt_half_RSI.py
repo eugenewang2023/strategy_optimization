@@ -11,11 +11,20 @@ UPDATE:
 - Optimizes RISK params: atrPeriod, slMultiplier, tpMultiplier, trailMultiplier
 
 OBJECTIVE (this version):
-- Compute BOTH:
-    1) Gross PF = total_gross_profit / total_gross_loss
-    2) Avg  PF  = avg_win / avg_loss
-- Optimize geometric mean:
-    score = sqrt( clamp(gross_pf) * clamp(avg_pf) )
+- Optimize BOTH:
+    1) avg_return_overall: average of per-ticker total_return across tickers
+    2) pct_positive_return: fraction of tickers with total_return > 0
+
+- Final score (multiplicative, scale-stable):
+    score = (1 + avg_return_overall) * (pct_positive_return ** alpha)
+
+  Notes:
+  - avg_return_overall is arithmetic mean of per-ticker returns (not equity-weighted).
+  - If avg_return_overall < -1 (shouldn't happen), we floor (1+avg_return) at a small epsilon.
+  - alpha controls how strongly you reward robustness. Default alpha=0.5, configurable via --alpha.
+
+Penalties (optional):
+- same as before: light penalties for too few trades and for drawdown.
 
 Everything else stays aligned to the Pine logic described in earlier versions.
 """
@@ -217,20 +226,17 @@ def crossunder(cur_x: float, prev_x: float, cur_y: float, prev_y: float) -> bool
 
 @dataclass
 class HalfRSIParams:
-    # Pine defaults (kept fixed here; you can optimize later if wanted)
     channelLength: int = 107
-    channelMulti: float = 4.85  # (present for parity; not used directly in this python port)
+    channelMulti: float = 4.85  # parity only; not used directly in this port
 
-    # RISK (optimized)
-    atrPeriod: int = 56
-    slMultiplier: float = 0.5
-    tpMultiplier: float = 4.0
-    trailMultiplier: float = 2.0
+    atrPeriod: int = 47
+    slMultiplier: float = 5.805
+    tpMultiplier: float = 4.182
+    trailMultiplier: float = 7.76
 
-    # SIGNAL (optimized)
-    slow_window: int = 45
-    shift: int = 6
-    smooth_len: int = 26
+    slow_window: int = 18
+    shift: int = 0
+    smooth_len: int = 21
 
     initial_capital: float = INITIAL_CAPITAL
     position_size_pct: float = POSITION_SIZE_PCT
@@ -261,20 +267,7 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
             "maxdd": 0.0,
             "num_trades": 0,
             "final_equity": p.initial_capital,
-
-            # gross
-            "gross_profit": 0.0,
-            "gross_loss": 0.0,
-            "gross_pf": 0.0,
-
-            # avg
-            "sum_win": 0.0,
-            "sum_loss": 0.0,
-            "n_win": 0,
-            "n_loss": 0,
-            "avg_profit": 0.0,
-            "avg_loss": 0.0,
-            "avg_pf": 0.0,
+            "total_return": 0.0,
         }
 
     # HA from REAL
@@ -282,14 +275,14 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
     sigClose = ha_c
     sigHL2 = (ha_h + ha_l) / 2.0
 
-    # Risk series are HA (per your Pine assignments)
+    # Risk series are HA (per Pine assignments)
     riskClose = sigClose
     riskHigh  = ha_h
     riskLow   = ha_l
 
-    # ATRs from REAL OHLC (chart-independent)
+    # ATR from REAL OHLC (chart-independent)
     atr_exit = atr_wilder(real_h, real_l, real_c, int(p.atrPeriod))
-    _atr_chan = atr_wilder(real_h, real_l, real_c, int(p.channelLength))  # kept for parity; not used in this port
+    _atr_chan = atr_wilder(real_h, real_l, real_c, int(p.channelLength))  # parity only
 
     # RSI signals on HA close, with shift
     slow_len = max(2, int(p.slow_window))
@@ -507,62 +500,20 @@ def backtest_half_rsi_hh(df: pd.DataFrame, p: HalfRSIParams) -> Dict[str, Any]:
         dd = (eq - peak) / np.maximum(peak, 1e-12)
         maxdd = float(np.min(dd))
 
+    final_equity = float(eq[-1])
+    total_return = float(final_equity / float(p.initial_capital) - 1.0)
+
     completed = [t for t in trades if ("exit_price" in t and "fill_price" in t and not t.get("ignored", False))]
     num_trades = len(completed)
 
-    gross_profit = 0.0
-    gross_loss = 0.0
-    sum_win = 0.0
-    sum_loss = 0.0
-    n_win = 0
-    n_loss = 0
-
-    for t in completed:
-        if "qty" not in t:
-            continue
-        q = float(t["qty"])
-        entry = float(t["fill_price"])
-        exitp = float(t["exit_price"])
-        entry_comm = float(t.get("commission_entry", 0.0))
-        exit_comm  = float(t.get("commission_exit", 0.0))
-        pnl = (exitp - entry) * q - entry_comm - exit_comm
-
-        if pnl > 0:
-            gross_profit += pnl
-            sum_win += pnl
-            n_win += 1
-        elif pnl < 0:
-            gross_loss += -pnl
-            sum_loss += -pnl
-            n_loss += 1
-
-    gross_pf = (gross_profit / gross_loss) if gross_loss > 0 else (10.0 if gross_profit > 0 else 0.0)
-    avg_profit = (sum_win / n_win) if n_win > 0 else 0.0
-    avg_loss   = (sum_loss / n_loss) if n_loss > 0 else 0.0
-    avg_pf = (avg_profit / avg_loss) if avg_loss > 0 else (10.0 if avg_profit > 0 else 0.0)
-
     return {
-        "final_equity": float(eq[-1]),
-        "total_return": float(eq[-1] / p.initial_capital - 1.0),
+        "final_equity": final_equity,
+        "total_return": total_return,
         "sharpe": float(sharpe),
         "maxdd": float(maxdd),
         "num_trades": int(num_trades),
         "trades": trades,
         "equity_curve": eq.tolist(),
-
-        # gross
-        "gross_profit": float(gross_profit),
-        "gross_loss": float(gross_loss),
-        "gross_pf": float(gross_pf),
-
-        # avg
-        "sum_win": float(sum_win),
-        "sum_loss": float(sum_loss),
-        "n_win": int(n_win),
-        "n_loss": int(n_loss),
-        "avg_profit": float(avg_profit),
-        "avg_loss": float(avg_loss),
-        "avg_pf": float(avg_pf),
     }
 
 
@@ -587,14 +538,6 @@ def load_files() -> Dict[str, pd.DataFrame]:
     return data
 
 
-def clamp_pf(x: float, cap: float) -> float:
-    if not np.isfinite(x):
-        return 0.0
-    if x < 0:
-        return 0.0
-    return float(min(x, cap))
-
-
 def run_optuna_optimization(
     n_trials: int = 200,
     n_files: int = 200,
@@ -602,7 +545,7 @@ def run_optuna_optimization(
     study_name: Optional[str] = None,
     seed: int = 42,
     use_penalties: bool = True,
-    pf_cap: float = 10.0,
+    alpha: float = 0.5,  # robustness exponent
 ) -> Tuple[Dict[str, Any], pd.DataFrame]:
     ensure_dirs()
     data = load_files()
@@ -619,7 +562,7 @@ def run_optuna_optimization(
         raise SystemExit("Optuna not installed. pip install optuna") from e
 
     if study_name is None:
-        study_name = f"half_rsi_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        study_name = f"half_rsi_ret_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     storage_path = OUT_DIR / f"{study_name}.db"
     storage_url = f"sqlite:///{storage_path}"
@@ -655,14 +598,11 @@ def run_optuna_optimization(
         trM   = trial.suggest_float("trailMultiplier", 0.5, 8.0)
 
         tickers = choose_tickers_for_trial()
+        if not tickers:
+            return -1e9
 
-        total_gp = 0.0
-        total_gl = 0.0
-        total_sum_win = 0.0
-        total_sum_loss = 0.0
-        total_n_win = 0
-        total_n_loss = 0
-
+        sum_ret = 0.0
+        pos_cnt = 0
         agg_trades = 0
         agg_dd = 0.0
 
@@ -686,64 +626,39 @@ def run_optuna_optimization(
                 fill_mode=fill_mode,
             )
             m = backtest_half_rsi_hh(data[tk], params)
-
-            total_gp += float(m.get("gross_profit", 0.0))
-            total_gl += float(m.get("gross_loss", 0.0))
-
-            total_sum_win  += float(m.get("sum_win", 0.0))
-            total_sum_loss += float(m.get("sum_loss", 0.0))
-            total_n_win    += int(m.get("n_win", 0))
-            total_n_loss   += int(m.get("n_loss", 0))
+            r = float(m.get("total_return", 0.0))
+            sum_ret += r
+            if r > 0.0:
+                pos_cnt += 1
 
             agg_trades += int(m.get("num_trades", 0))
             agg_dd += abs(float(m.get("maxdd", 0.0)))
 
-        # Gross PF overall
-        if total_gl > 0:
-            gross_pf_overall = total_gp / total_gl
-        else:
-            gross_pf_overall = 10.0 if total_gp > 0 else 0.0
+        avg_return_overall = sum_ret / float(len(tickers))
+        pct_positive_return = pos_cnt / float(len(tickers))
 
-        # Avg PF overall
-        avg_profit_overall = (total_sum_win / total_n_win) if total_n_win > 0 else 0.0
-        avg_loss_overall   = (total_sum_loss / total_n_loss) if total_n_loss > 0 else 0.0
-        if avg_loss_overall > 0:
-            avg_pf_overall = avg_profit_overall / avg_loss_overall
-        else:
-            avg_pf_overall = 10.0 if avg_profit_overall > 0 else 0.0
+        # Score: (1 + avg_return) * (pct_pos ** alpha)
+        base = 1.0 + avg_return_overall
+        base = max(base, 1e-6)  # safety
+        score = base * (pct_positive_return ** float(alpha))
 
-        # Clamp for stability, then geometric mean
-        gpf = clamp_pf(float(gross_pf_overall), float(pf_cap))
-        apf = clamp_pf(float(avg_pf_overall), float(pf_cap))
-        geom_pf = math.sqrt(gpf * apf)
-
-        score = geom_pf
         penalty = 0.0
         if use_penalties:
             if agg_trades < 3:
                 penalty += 3.0
             elif agg_trades < 10:
                 penalty += 1.0
-            score = geom_pf - (agg_dd * 0.25) - penalty
+            score = score - (agg_dd * 0.25) - penalty
 
-        trial.set_user_attr("gross_pf_overall", float(gross_pf_overall))
-        trial.set_user_attr("avg_pf_overall", float(avg_pf_overall))
-        trial.set_user_attr("geom_pf_overall", float(geom_pf))
-
-        trial.set_user_attr("total_gross_profit", float(total_gp))
-        trial.set_user_attr("total_gross_loss", float(total_gl))
-        trial.set_user_attr("avg_profit_overall", float(avg_profit_overall))
-        trial.set_user_attr("avg_loss_overall", float(avg_loss_overall))
-
-        trial.set_user_attr("total_sum_win", float(total_sum_win))
-        trial.set_user_attr("total_sum_loss", float(total_sum_loss))
-        trial.set_user_attr("total_n_win", int(total_n_win))
-        trial.set_user_attr("total_n_loss", int(total_n_loss))
+        trial.set_user_attr("avg_return_overall", float(avg_return_overall))
+        trial.set_user_attr("pct_positive_return", float(pct_positive_return))
+        trial.set_user_attr("positive_tickers", int(pos_cnt))
+        trial.set_user_attr("n_files_used", int(len(tickers)))
+        trial.set_user_attr("alpha", float(alpha))
 
         trial.set_user_attr("total_trades", int(agg_trades))
         trial.set_user_attr("sum_abs_maxdd", float(agg_dd))
         trial.set_user_attr("penalty", float(penalty))
-        trial.set_user_attr("n_files_used", int(len(tickers)))
 
         return float(score)
 
@@ -753,9 +668,9 @@ def run_optuna_optimization(
     best_params["best_score"] = float(study.best_value)
     best_params["fill_mode"] = fill_mode
     best_params["timestamp"] = time.time()
-    best_params["score_is_geom_pf_overall"] = True
-    best_params["pf_cap"] = float(pf_cap)
+    best_params["score_is_(1+avg_return)*pct_pos^alpha"] = True
     best_params["use_penalties"] = bool(use_penalties)
+    best_params["alpha"] = float(alpha)
 
     with open(OUT_DIR / "best_params_half_rsi.json", "w") as f:
         json.dump(best_params, f, indent=2)
@@ -782,29 +697,15 @@ def run_optuna_optimization(
             fill_mode=fill_mode,
         )
         m = backtest_half_rsi_hh(data[tk], params)
-
-        # Per-file clamped geom PF too (useful for sorting)
-        gpf = clamp_pf(float(m.get("gross_pf", 0.0)), float(pf_cap))
-        apf = clamp_pf(float(m.get("avg_pf", 0.0)), float(pf_cap))
-        geom_pf = math.sqrt(gpf * apf)
-
+        r = float(m.get("total_return", 0.0))
         rows.append({
             "ticker": tk,
             "final_equity": m["final_equity"],
-            "total_return": m["total_return"],
+            "total_return": r,
+            "positive_return": 1 if r > 0.0 else 0,
             "sharpe": m["sharpe"],
             "maxdd": m["maxdd"],
             "num_trades": m["num_trades"],
-
-            "gross_profit": m["gross_profit"],
-            "gross_loss": m["gross_loss"],
-            "gross_pf": m["gross_pf"],
-
-            "avg_profit": m["avg_profit"],
-            "avg_loss": m["avg_loss"],
-            "avg_pf": m["avg_pf"],
-
-            "geom_pf": geom_pf,
         })
 
         pd.DataFrame(m["trades"]).to_csv(OUT_DIR / f"{tk}_trades_best.csv", index=False)
@@ -821,59 +722,16 @@ def run_optuna_optimization(
             plt.savefig(OUT_DIR / f"equity_{tk}_best.png")
             plt.close()
 
-    summary_df = pd.DataFrame(rows).sort_values("geom_pf", ascending=False)
+    summary_df = pd.DataFrame(rows).sort_values("total_return", ascending=False)
     summary_df.to_csv(OUT_DIR / "optimization_summary_half_rsi.csv", index=False)
 
     trials_df = study.trials_dataframe()
     trials_df.to_csv(OUT_DIR / "optuna_trials_half_rsi.csv", index=False)
 
-    # Overall (ALL FILES) metrics for best params (computed from totals)
-    total_gp = 0.0
-    total_gl = 0.0
-    total_sum_win = 0.0
-    total_sum_loss = 0.0
-    total_n_win = 0
-    total_n_loss = 0
-    total_trades = 0
-
-    for tk in tickers_all:
-        params = HalfRSIParams(
-            channelLength=107,
-            channelMulti=4.85,
-
-            slow_window=int(best_params.get("slow_window", 32)),
-            shift=int(best_params.get("shift", 2)),
-            smooth_len=int(best_params.get("smooth_len", 12)),
-
-            atrPeriod=int(best_params["atrPeriod"]),
-            slMultiplier=float(best_params["slMultiplier"]),
-            tpMultiplier=float(best_params["tpMultiplier"]),
-            trailMultiplier=float(best_params["trailMultiplier"]),
-
-            initial_capital=INITIAL_CAPITAL,
-            position_size_pct=POSITION_SIZE_PCT,
-            commission_pct=COMMISSION_PCT,
-            fill_mode=fill_mode,
-        )
-        m = backtest_half_rsi_hh(data[tk], params)
-
-        total_gp += float(m.get("gross_profit", 0.0))
-        total_gl += float(m.get("gross_loss", 0.0))
-        total_sum_win  += float(m.get("sum_win", 0.0))
-        total_sum_loss += float(m.get("sum_loss", 0.0))
-        total_n_win    += int(m.get("n_win", 0))
-        total_n_loss   += int(m.get("n_loss", 0))
-        total_trades   += int(m.get("num_trades", 0))
-
-    gross_pf_all = (total_gp / total_gl) if total_gl > 0 else (10.0 if total_gp > 0 else 0.0)
-
-    avg_profit_all = (total_sum_win / total_n_win) if total_n_win > 0 else 0.0
-    avg_loss_all   = (total_sum_loss / total_n_loss) if total_n_loss > 0 else 0.0
-    avg_pf_all = (avg_profit_all / avg_loss_all) if avg_loss_all > 0 else (10.0 if avg_profit_all > 0 else 0.0)
-
-    gpf_all = clamp_pf(float(gross_pf_all), float(pf_cap))
-    apf_all = clamp_pf(float(avg_pf_all), float(pf_cap))
-    geom_pf_all = math.sqrt(gpf_all * apf_all)
+    # Overall (ALL FILES) metrics for best params
+    avg_return_all = float(summary_df["total_return"].mean()) if len(summary_df) else 0.0
+    pct_pos_all = float(summary_df["positive_return"].mean()) if len(summary_df) else 0.0
+    score_all = max(1.0 + avg_return_all, 1e-6) * (pct_pos_all ** float(alpha))
 
     print("\n=== BEST PARAMS ===")
     for k, v in best_params.items():
@@ -881,14 +739,10 @@ def run_optuna_optimization(
             print(f"{k}: {v}")
 
     print("\n=== OVERALL (ALL FILES) METRICS (BEST PARAMS) ===")
-    print(f"Gross Profit: {total_gp:,.2f}")
-    print(f"Gross Loss:   {total_gl:,.2f}")
-    print(f"Gross PF:     {gross_pf_all:.4f} (clamped {gpf_all:.4f})")
-    print(f"Avg Profit:   {avg_profit_all:,.4f}  (n_win={total_n_win})")
-    print(f"Avg Loss:     {avg_loss_all:,.4f}  (n_loss={total_n_loss})")
-    print(f"Avg PF:       {avg_pf_all:.4f} (clamped {apf_all:.4f})")
-    print(f"Geom PF:      {geom_pf_all:.4f}  [score basis]")
-    print(f"Total Trades: {total_trades}")
+    print(f"Avg Return:        {avg_return_all:.6f}")
+    print(f"Pct Positive Ret:  {pct_pos_all:.4f}  ({int(summary_df['positive_return'].sum())}/{len(summary_df)})")
+    print(f"Alpha:             {alpha:.3f}")
+    print(f"Score (overall):   {score_all:.6f}")
 
     print("\nSaved outputs to:", str(OUT_DIR))
     print(summary_df.to_string(index=False))
@@ -907,8 +761,8 @@ if __name__ == "__main__":
     ap.add_argument("--files", type=int, default=200, help="Number of files to use per trial (subsample); if >= total -> use all")
     ap.add_argument("--fill", choices=["next_open", "same_close"], default="same_close", help="Execution model")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed for file subsampling")
-    ap.add_argument("--no-penalties", action="store_true", help="Disable trade/DD penalties (score = geom_pf only)")
-    ap.add_argument("--pf-cap", type=float, default=10.0, help="Cap each PF before geometric mean (default 10.0)")
+    ap.add_argument("--no-penalties", action="store_true", help="Disable trade/DD penalties")
+    ap.add_argument("--alpha", type=float, default=0.5, help="Exponent for pct_positive_return term (default 0.5)")
     args = ap.parse_args()
 
     run_optuna_optimization(
@@ -917,5 +771,5 @@ if __name__ == "__main__":
         fill_mode=args.fill,
         seed=args.seed,
         use_penalties=(not args.no_penalties),
-        pf_cap=args.pf_cap,
+        alpha=args.alpha,
     )
