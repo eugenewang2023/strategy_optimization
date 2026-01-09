@@ -2,11 +2,10 @@
 """
 Bayes_opt_adapt_half_RSI.py  (Pine-match + 3 fill modes)  **HYBRID OBJECTIVE (like half_RSI)**
 
-Matches Pine strategy: adapt_half_RSI_hh (HA signals + HA risk)
-
-DATA (chart-type independent):
-- REAL OHLC comes from your file columns open/high/low/close.
-- Heikin Ashi is computed from REAL OHLC.
+UPDATED PER REQUEST: **Use realRisk**
+- SIGNALS use Heikin Ashi (HA) computed from REAL OHLC (chart-type independent)
+- RISK / EXITS use REAL prices (riskClose/riskHigh/riskLow = REAL close/high/low)
+- ATR is REAL ATR(atrPeriod) (Wilder/RMA of REAL TR)
 
 SIGNALS (HA):
 - baseRSI = RSI(haClose, basePeriod)
@@ -18,8 +17,10 @@ SIGNALS (HA):
 - longCondition = crossover(fast_rsi, slow_rsi)
 - NO trend filter, NO shorts
 
-EXITS / RISK (Pine logic):
-- riskClose/riskHigh/riskLow are HA series
+EXITS / RISK (REAL price logic):
+- riskClose = REAL close
+- riskHigh  = REAL high
+- riskLow   = REAL low
 - atr = REAL ATR(atrPeriod) (Wilder/RMA of REAL TR)
 Entry initializes:
     trail_stop_level = riskClose - atr*slMultiplier
@@ -92,14 +93,14 @@ logger = logging.getLogger(__name__)
 # =========================
 
 DEFAULT_PARAMS = {
-    "atr_period": 57,
-    "sl_multiplier": 0.741,
-    "tp_multiplier": 2.357,
-    "trail_multiplier": 16.08,
+    "atr_period": 58,
+    "sl_multiplier": 0.9193,
+    "tp_multiplier": 9.3842,
+    "trail_multiplier": 6.705,
 
-    "base_period": 27,
+    "base_period": 19,
     "min_period": 20,
-    "max_period": 21,
+    "max_period": 32,
 
     # backtest settings
     "initial_capital": 100000.0,
@@ -230,9 +231,9 @@ def true_range_real_numba(high_arr: np.ndarray, low_arr: np.ndarray, close_arr: 
 def build_signals_and_exits_with_reason_numba(
     fast_rsi: np.ndarray,
     slow_rsi: np.ndarray,
-    risk_close: np.ndarray,   # HA close
-    risk_high: np.ndarray,    # HA high
-    risk_low: np.ndarray,     # HA low
+    risk_close: np.ndarray,   # REAL close  (UPDATED: realRisk)
+    risk_high: np.ndarray,    # REAL high
+    risk_low: np.ndarray,     # REAL low
     atr_real: np.ndarray,     # REAL ATR (Wilder)
     sl_mult: float,
     tp_mult: float,
@@ -489,6 +490,8 @@ class BayesianAdaptHalfRSIOptimizer:
 
     Optional penalties:
       score -= 0.25 * sum(abs(maxdd_fraction))  and trade-count penalty as described in docstring.
+
+    UPDATED: realRisk (exits use REAL close/high/low).
     """
 
     def __init__(self, data_dir: str = "./data", results_dir: str = "./results"):
@@ -538,6 +541,7 @@ class BayesianAdaptHalfRSIOptimizer:
         l = out["low"].values.astype(np.float64)
         c = out["close"].values.astype(np.float64)
 
+        # HA for signals
         ha_o, ha_h, ha_l, ha_c = calculate_heikin_ashi_numba(o, h, l, c)
         out["ha_open"] = ha_o
         out["ha_high"] = ha_h
@@ -591,6 +595,7 @@ class BayesianAdaptHalfRSIOptimizer:
         out["fast_rsi"] = fast_rsi
         out["slow_rsi"] = slow_rsi
 
+        # REAL ATR (Wilder/RMA of REAL TR)
         tr_real = true_range_real_numba(h, l, c)
         atr_real = rma_numba(tr_real, int(params.atr_period))
         out["atr_real"] = atr_real
@@ -602,12 +607,13 @@ class BayesianAdaptHalfRSIOptimizer:
             dfi = self.calculate_indicators_pine(df, params)
             min_bars = int(max(params.max_period, params.atr_period, params.base_period) + 5)
 
+            # UPDATED: realRisk -> pass REAL close/high/low for risk series
             buy_signal, sell_signal, exit_reason, stop_level = build_signals_and_exits_with_reason_numba(
                 dfi["fast_rsi"].values.astype(np.float64),
                 dfi["slow_rsi"].values.astype(np.float64),
-                dfi["ha_close"].values.astype(np.float64),
-                dfi["ha_high"].values.astype(np.float64),
-                dfi["ha_low"].values.astype(np.float64),
+                dfi["close"].values.astype(np.float64),   # risk_close (REAL)
+                dfi["high"].values.astype(np.float64),    # risk_high  (REAL)
+                dfi["low"].values.astype(np.float64),     # risk_low   (REAL)
                 dfi["atr_real"].values.astype(np.float64),
                 float(params.sl_multiplier),
                 float(params.tp_multiplier),
@@ -1003,6 +1009,7 @@ class BayesianAdaptHalfRSIOptimizer:
 
         print("\n" + "=" * 90)
         print("BAYESIAN OPTIMIZATION RESULTS (Objective = (1+avg_return) * pct_pos^alpha)")
+        print("REAL-RISK VERSION: exits use REAL close/high/low (signals still HA)")
         print("=" * 90)
         print(f"Best SCORE (study.best_value): {study.best_value:.6f}")
         print(f"Fill mode: {fill_mode}")
@@ -1099,13 +1106,13 @@ class BayesianAdaptHalfRSIOptimizer:
         )
 
         print("\nValidation (hybrid objective):")
-        print(f"  Score:              {metrics['score']:.6f}")
-        print(f"  Avg return:         {metrics['avg_return_overall']:.6f} ({metrics['avg_return_overall']*100:.2f}%)")
-        print(f"  Pct positive return:{metrics['pct_positive_return']:.4f} ({metrics['positive_files']}/{metrics['n_files_used']})")
-        print(f"  Total trades:       {metrics['total_trades']}")
-        print(f"  Sum abs maxdd:      {metrics['sum_abs_maxdd']:.4f}")
+        print(f"  Score:               {metrics['score']:.6f}")
+        print(f"  Avg return:          {metrics['avg_return_overall']:.6f} ({metrics['avg_return_overall']*100:.2f}%)")
+        print(f"  Pct positive return: {metrics['pct_positive_return']:.4f} ({metrics['positive_files']}/{metrics['n_files_used']})")
+        print(f"  Total trades:        {metrics['total_trades']}")
+        print(f"  Sum abs maxdd:       {metrics['sum_abs_maxdd']:.4f}")
         if use_penalties:
-            print(f"  Penalty:            {metrics['penalty']:.3f}")
+            print(f"  Penalty:             {metrics['penalty']:.3f}")
 
         df_out = pd.DataFrame(metrics.get("per_file", []))
         if not df_out.empty:
@@ -1127,7 +1134,7 @@ if __name__ == "__main__":
 
     def main():
         parser = argparse.ArgumentParser(
-            description="Bayesian Optimization for adapt_half_RSI_hh (HYBRID score like half_RSI; 3 fill modes)"
+            description="Bayesian Optimization for adapt_half_RSI_hh (HYBRID score like half_RSI; 3 fill modes) [REAL-RISK exits]"
         )
         parser.add_argument("--mode", choices=["optimize", "validate", "test"], default="optimize",
                             help="Mode: optimize, validate, test")
@@ -1155,6 +1162,7 @@ if __name__ == "__main__":
         if args.mode == "optimize":
             print("=" * 80)
             print("BAYESIAN OPTIMIZATION MODE (Objective = (1+avg_return) * pct_pos^alpha)")
+            print("REAL-RISK VERSION: exits use REAL close/high/low (signals still HA)")
             print("=" * 80)
             print(f"Trials: {args.trials}")
             print(f"Sample size: {args.sample}")
@@ -1230,6 +1238,7 @@ if __name__ == "__main__":
 
             print("\n" + "=" * 80)
             print("SINGLE FILE TEST")
+            print("REAL-RISK VERSION: exits use REAL close/high/low (signals still HA)")
             print("=" * 80)
             print(f"File: {test_fp.name}")
             print(f"Fill mode: {args.fill}")
