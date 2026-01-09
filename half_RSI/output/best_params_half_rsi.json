@@ -1,0 +1,15 @@
+{
+  "slow_window": 75,
+  "shift": 2,
+  "smooth_len": 30,
+  "atrPeriod": 26,
+  "slMultiplier": 0.5146769984453902,
+  "tpMultiplier": 6.244341523914629,
+  "trailMultiplier": 0.5290691122611004,
+  "best_score": 9.997084304376111,
+  "fill_mode": "same_close",
+  "timestamp": 1767931794.5042589,
+  "score_is_avg_pf_overall_optionA": true,
+  "pf_cap": 10.0,
+  "use_penalties": true
+}
