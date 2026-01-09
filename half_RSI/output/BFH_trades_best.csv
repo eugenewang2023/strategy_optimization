@@ -1,4 +1,0 @@
-signal_idx,side,signal_price,slow_window,fast_window,shift,smooth_len,fill_idx,fill_price,commission_entry,qty,exit_idx,exit_price,commission_exit,reason
-119,LONG,60.35875,75,38,2,30,119,60.35875,5.999999999999999,165.67606188000912,119,60.35875,5.999999999999999,SL_breach(HA_low < trail_stop_level)
-203,LONG,62.572500000000005,75,38,2,30,203,62.572500000000005,5.99928,159.79543729274042,204,62.86874999999999,6.027683638978783,SL_breach(HA_low < trail_stop_level)
-209,LONG,64.0575,75,38,2,30,209,64.0575,6.0013987460795395,156.14613813317564,210,63.6075,5.959239288783581,SL_breach(HA_low < trail_stop_level)

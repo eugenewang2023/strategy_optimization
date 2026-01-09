@@ -1,2 +1,0 @@
-signal_idx,side,signal_price,slow_window,fast_window,shift,smooth_len,fill_idx,fill_price,commission_entry,qty,exit_idx,exit_price,commission_exit,reason
-125,LONG,202.635,80,40,0,30,125,202.635,5.999999999999999,49.34981617193476,126,206.75625,6.122029757939151,SL_breach(HA_low < trail_stop_level)
