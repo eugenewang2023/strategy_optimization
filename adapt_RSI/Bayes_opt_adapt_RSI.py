@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
 """
-Bayes_opt_adapt_RSI.py  (modified)
+Bayes_opt_adapt_RSI.py  (half_RSI-style optimizer + --fill like bayes_opt_half_RSI.py)
 
-Changes requested:
-1) Optimize OVERALL profit_factor (pooled GrossProfit / pooled GrossLoss) instead of Sharpe.
-2) Print results for EACH file (and save a per-file summary CSV) after optimization.
+GOAL
+- Keep your adapt_RSI indicator/backtest logic (HA indicators, your channel + adaptive RSI pipeline),
+  but optimize the SAME WAY as bayes_opt_half_RSI.py:
 
-Notes (matches the Dynamic_SR "Option A" idea):
-- Overall PF is computed by pooling realized trade PnL across the selected files:
-    PF_overall = (sum GrossProfit) / (sum GrossLoss)
-  where GrossProfit/GrossLoss are based on realized trade PnL NET of commissions.
-- If GrossLoss == 0:
-    PF = pf_cap if GrossProfit > 0 else 0
-- You can cap PF to avoid infinite PF dominating.
+OBJECTIVE (robust across files)
+- For each trial, evaluate on a (seeded) random subset of files (or all files if --files >= total)
+- Compute per-file total_return (fraction, not %): total_return = final_equity/initial_capital - 1
+- avg_return_overall = mean(total_return across files)
+- pct_positive_return = fraction of files with total_return > 0
+- score = (1 + avg_return_overall) * (pct_positive_return ** alpha)
+  alpha configurable via --alpha (default 0.5)
 
-Execution model:
-- Signals are generated on bar i (based on HA logic inside your indicator pipeline)
-- Fills can be:
-    --fill same_close : enter/exit at REAL close[i]
-    --fill next_open  : enter/exit at REAL open[i+1]
-- Equity is marked to REAL close.
+OPTIONAL PENALTIES (same spirit as bayes_opt_half_RSI.py)
+- Penalize too-few total trades across the subset
+- Penalize sum(abs(maxdd)) across the subset
 
-Files:
-- Reads .parquet and .csv from ./data (recursively).
-- Outputs to ./results
+EXECUTION / FILL MODEL (same as bayes_opt_half_RSI.py)
+- Signals on bar i (HA logic)
+- --fill same_close : fill at REAL close[i]
+- --fill next_open  : fill at REAL open[i+1]
+- Mark-to-market equity at REAL close
 
-CLI examples:
-  python Bayes_opt_adapt_RSI.py --mode optimize --trials 200 --files 5 --sample 5000 --fill same_close
-  python Bayes_opt_adapt_RSI.py --mode validate --params-file results/best_params_....json --sample 10000 --fill next_open
+FILES / OUTPUTS
+- Reads .parquet and .csv from ./data (recursively)
+- Writes to ./results:
+    - best_params_score_YYYYMMDD_HHMMSS.json
+    - trials_score_YYYYMMDD_HHMMSS.csv
+    - per_file_results_best_YYYYMMDD_HHMMSS.csv
+    - study_stats_YYYYMMDD_HHMMSS.json
+
+CLI EXAMPLES
+  python Bayes_opt_adapt_RSI.py --mode optimize --trials 200 --files 5 --sample 5000 --fill same_close --alpha 0.5
+  python Bayes_opt_adapt_RSI.py --mode validate --params-file results/best_params_score_....json --sample 10000 --fill next_open
+  python Bayes_opt_adapt_RSI.py --mode test --test-file data/SPY.csv --params-file results/best_params_score_....json --fill same_close
 """
 
 import os
@@ -35,6 +43,7 @@ import json
 import hashlib
 import logging
 import warnings
+import random
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -58,25 +67,47 @@ logger = logging.getLogger(__name__)
 # =========================
 
 DEFAULT_PARAMS = {
-    "sl_multiplier": 3.1,
-    "tp_multiplier": 3.97,
-    "trail_multiplier": 1.9,
-    "channel_multi": 2.63,
-    "channel_length": 46,
-    "atr_period": 20,
-    "base_period": 20,
-    "min_period": 15,
-    "max_period": 23,
-    "fast_period": 10,
-    "slow_period": 48,
-    "steepness": 2,
+    "sl_multiplier": 2.069,
+    "tp_multiplier": 4.182,
+    "trail_multiplier": 2.544,
+    "channel_multi": 3.816,
+    "channel_length": 48,
+    "atr_period": 21,
+    "base_period": 15,
+    "min_period": 5,
+    "max_period": 20,
+    "fast_period": 4,
+    "slow_period": 50,
+    "steepness": 7,
     "fast_steepness": 10,
-    "slow_steepness": 3,
+    "slow_steepness": 1,
+    "median_length": 10,
     "sigmoid_margin": 0.0,
-    "median_length": 13,
     "trim_percent": 0.2,
     "use_replacement": True,
 }
+
+
+def normalize_fill_mode(s: str) -> str:
+    """
+    Normalize CLI fill input to internal canonical strings.
+    Matches bayes_opt_half_RSI.py options: same_close / next_open.
+    """
+    if s is None:
+        return "same_close"
+    s = str(s).strip().lower()
+    aliases = {
+        "same_close": "same_close",
+        "sameclose": "same_close",
+        "close": "same_close",
+        "next_open": "next_open",
+        "nextopen": "next_open",
+        "open": "next_open",
+    }
+    if s not in aliases:
+        raise ValueError(f"Unknown fill mode: {s}. Use same_close or next_open.")
+    return aliases[s]
+
 
 # =========================
 # Numba indicators (yours)
@@ -232,7 +263,7 @@ def ha_true_range_numba(ha_high: np.ndarray, ha_low: np.ndarray, ha_close: np.nd
 
 
 # =========================
-# NEW: simulations that also return gross profit/loss
+# Simulation (fill models + GP/GL for reporting)
 # =========================
 
 @jit(nopython=True, cache=True)
@@ -245,8 +276,8 @@ def run_simulation_real_same_close_pf_numba(
     comm_pct
 ):
     """
-    Fill at REAL close[i].
-    Tracks realized trade PnL net of commissions to compute GrossProfit/GrossLoss.
+    Fill at REAL close[i]. Mark-to-market at close.
+    Tracks realized trade PnL net of commissions => gross_profit / gross_loss.
     """
     n = len(close_arr)
     equity_curve = np.zeros(n)
@@ -295,7 +326,7 @@ def run_simulation_real_same_close_pf_numba(
 
         equity_curve[i] = cash + (qty * price if qty > 0 else 0.0)
 
-    # If still open, close at last close (common backtest convention)
+    # Close open at last close
     if qty > 0.0:
         price = close_arr[-1]
         if not np.isnan(price) and price > 0:
@@ -325,8 +356,8 @@ def run_simulation_real_next_open_pf_numba(
     comm_pct
 ):
     """
-    Fill at REAL open[i+1], signals on i. Mark to REAL close.
-    Tracks realized trade PnL net of commissions to compute GrossProfit/GrossLoss.
+    Signals on i, fill at REAL open[i+1]. Mark-to-market at REAL close[i].
+    Tracks realized trade PnL net of commissions => gross_profit / gross_loss.
     """
     n = len(close_arr)
     equity_curve = np.zeros(n)
@@ -381,7 +412,7 @@ def run_simulation_real_next_open_pf_numba(
     last_mark = close_arr[-1]
     equity_curve[-1] = cash + (qty * last_mark if qty > 0 and not np.isnan(last_mark) else 0.0)
 
-    # If still open, close at last close
+    # Close open at last close
     if qty > 0.0 and not np.isnan(last_mark) and last_mark > 0:
         exit_value = qty * last_mark
         exit_comm = exit_value * comm_pct
@@ -420,8 +451,8 @@ class StrategyParams:
     fast_steepness: float = 8
     slow_steepness: float = 5
 
+    median_length: int = 10
     sigmoid_margin: float = 0.0
-    median_length: int = 13
     trim_percent: float = 0.2
     use_replacement: bool = True
 
@@ -436,13 +467,15 @@ class StrategyParams:
 
 class BayesianRSIATROptimizer:
     """
-    Bayesian optimization for RSI ATR strategy.
+    Optimizer for your Adaptive RSI + ATR strategy
 
-    MODIFIED:
-    - Objective is PF_overall (pooled GP/GL) over the selected files.
-    - Prints per-file results after optimization.
-    - Supports .parquet and .csv.
-    - Supports --fill same_close|next_open.
+    MODS vs PF version:
+    - Objective matches bayes_opt_half_RSI.py:
+        score = (1 + avg_return_overall) * (pct_positive_return ** alpha)
+      with optional penalties for low trades and drawdown.
+    - --fill matches bayes_opt_half_RSI.py:
+        same_close or next_open
+    - Per-file reporting and CSV output after optimization.
     """
 
     def __init__(self, data_dir: str = "./data", results_dir: str = "./results"):
@@ -473,7 +506,6 @@ class BayesianRSIATROptimizer:
             if col not in df.columns:
                 df[col] = np.nan
 
-        # volume optional
         if "volume" not in df.columns:
             df["volume"] = np.nan
 
@@ -575,6 +607,7 @@ class BayesianRSIATROptimizer:
         adaptive_period = np.clip(adaptive_period, params.min_period, params.max_period).astype(np.int32)
         df["adaptive_period"] = adaptive_period
 
+        # Precompute RSI table (3..34)
         min_switch = 3
         max_switch = 34
         all_rsi = calculate_all_rsi_numba(df["ha_close"].values, min_switch, max_switch)
@@ -588,10 +621,11 @@ class BayesianRSIATROptimizer:
                 adaptive_rsi[i] = np.nan
         df["adaptive_rsi"] = adaptive_rsi
 
+        # Smooth adaptive RSI
         df["fast_rsi"] = ema_numba(df["adaptive_rsi"].values, params.fast_period)
         df["slow_rsi"] = ema_numba(df["adaptive_rsi"].values, params.slow_period)
 
-        # sigmoid plots (not used for entries)
+        # Sigmoid plots (kept for parity / not used for entries)
         def sigmoid_np(x01, steep, margin=0.0):
             raw = 1.0 / (1.0 + np.exp(-steep * (x01 - 0.5)))
             return (margin + (1.0 - 2.0 * margin) * raw)
@@ -715,8 +749,11 @@ class BayesianRSIATROptimizer:
 
     def backtest_single(self, df: pd.DataFrame, params: StrategyParams, fill_mode: str = "same_close") -> Dict[str, Any]:
         """
-        Returns per-file metrics including gross_profit/gross_loss/profit_factor (NEW).
+        Per-file backtest.
+        Returns total_return (fraction), plus extra metrics for reporting.
         """
+        fill_mode = normalize_fill_mode(fill_mode)
+
         try:
             df = self.calculate_indicators_fast(df, params)
 
@@ -760,9 +797,10 @@ class BayesianRSIATROptimizer:
                 )
 
             final_equity = float(equity_curve[-1])
-            total_ret_pct = ((final_equity - params.initial_capital) / params.initial_capital) * 100.0
+            total_return = (final_equity / params.initial_capital) - 1.0
+            total_ret_pct = total_return * 100.0
 
-            # Sharpe (still computed for reporting)
+            # Sharpe (reporting only)
             if len(equity_curve) > 2:
                 returns = np.diff(equity_curve) / np.maximum(equity_curve[:-1], 1e-12)
                 std = np.std(returns)
@@ -777,13 +815,11 @@ class BayesianRSIATROptimizer:
 
             gp = float(gp)
             gl = float(gl)
-            if gl > 0:
-                pf = gp / gl
-            else:
-                pf = 10.0 if gp > 0 else 0.0
+            pf = (gp / gl) if gl > 0 else (10.0 if gp > 0 else 0.0)
 
             return {
-                "total_return_pct": float(total_ret_pct),
+                "total_return": float(total_return),          # fraction
+                "total_return_pct": float(total_ret_pct),     # %
                 "sharpe_ratio": float(sharpe),
                 "max_drawdown_pct": float(max_dd_pct),
                 "n_trades": int(n_trades),
@@ -796,6 +832,7 @@ class BayesianRSIATROptimizer:
         except Exception as e:
             logger.error(f"backtest_single error: {e}")
             return {
+                "total_return": -1.0,
                 "total_return_pct": -100.0,
                 "sharpe_ratio": 0.0,
                 "max_drawdown_pct": -100.0,
@@ -806,7 +843,7 @@ class BayesianRSIATROptimizer:
                 "profit_factor": 0.0,
             }
 
-    def run_backtest(
+    def run_backtest_subset(
         self,
         files: List[Path],
         sample_size: int,
@@ -814,15 +851,19 @@ class BayesianRSIATROptimizer:
         **kwargs
     ) -> Dict[str, Any]:
         """
-        Runs backtest across multiple files.
-        Aggregation is now "pooled PF" (sum GP / sum GL) (NEW).
+        Run backtest across provided files and aggregate metrics used by the half_RSI-style score.
         """
+        fill_mode = normalize_fill_mode(fill_mode)
         params = StrategyParams(**kwargs)
+
+        per_file: List[Dict[str, Any]] = []
+        total_trades = 0
+        sum_abs_maxdd_frac = 0.0
+        sum_ret = 0.0
+        pos_cnt = 0
 
         total_gp = 0.0
         total_gl = 0.0
-        total_trades = 0
-        per_file: List[Dict[str, Any]] = []
 
         for fp in files:
             df = self.load_data_chunk(fp, sample_size)
@@ -832,37 +873,63 @@ class BayesianRSIATROptimizer:
             res["file"] = fp.name
             per_file.append(res)
 
+            r = float(res.get("total_return", 0.0))
+            sum_ret += r
+            if r > 0.0:
+                pos_cnt += 1
+
+            total_trades += int(res.get("n_trades", 0))
+            maxdd_pct = float(res.get("max_drawdown_pct", 0.0))
+            sum_abs_maxdd_frac += abs(maxdd_pct) / 100.0
+
             total_gp += float(res.get("gross_profit", 0.0))
             total_gl += float(res.get("gross_loss", 0.0))
-            total_trades += int(res.get("n_trades", 0))
 
-        if total_gl > 0:
-            pf_overall = total_gp / total_gl
-        else:
-            pf_overall = 10.0 if total_gp > 0 else 0.0
+        n_used = len(per_file)
+        if n_used <= 0:
+            return {
+                "n_files_used": 0,
+                "avg_return_overall": 0.0,
+                "pct_positive_return": 0.0,
+                "positive_files": 0,
+                "total_trades": 0,
+                "sum_abs_maxdd": 0.0,
+                "per_file": per_file,
+                "total_gross_profit": 0.0,
+                "total_gross_loss": 0.0,
+            }
+
+        avg_return_overall = sum_ret / float(n_used)
+        pct_positive_return = pos_cnt / float(n_used)
 
         return {
-            "pf_overall": float(pf_overall),
+            "n_files_used": int(n_used),
+            "avg_return_overall": float(avg_return_overall),
+            "pct_positive_return": float(pct_positive_return),
+            "positive_files": int(pos_cnt),
+            "total_trades": int(total_trades),
+            "sum_abs_maxdd": float(sum_abs_maxdd_frac),
+            "per_file": per_file,
             "total_gross_profit": float(total_gp),
             "total_gross_loss": float(total_gl),
-            "total_trades": int(total_trades),
-            "n_files_used": int(len(per_file)),
-            "per_file": per_file,
         }
 
     def objective(
         self,
         trial: optuna.Trial,
-        files: List[Path],
+        all_files: List[Path],
         sample_size: int,
         n_files: int,
         fill_mode: str,
-        pf_cap: float,
+        alpha: float,
+        use_penalties: bool,
+        seed: int,
     ) -> float:
-        # Start from defaults
+        fill_mode = normalize_fill_mode(fill_mode)
+
         params = DEFAULT_PARAMS.copy()
 
-        # Parameter ranges (your existing approach)
+        # ---- parameter ranges (your existing approach) ----
         param_ranges = {
             "sl_multiplier": (2.0, 4.5),
             "tp_multiplier": (3.0, 6.0),
@@ -887,14 +954,13 @@ class BayesianRSIATROptimizer:
             else:
                 params[name] = trial.suggest_float(name, low, high)
 
-        # hard constraints
+        # ---- hard constraints (keep your sanity filters) ----
         if params["fast_period"] >= params["slow_period"] or params["fast_steepness"] <= params["slow_steepness"]:
-            return 0.0  # bad PF
-
+            return -1e9
         if params["min_period"] >= params["base_period"] or params["max_period"] <= params["base_period"]:
-            return 0.0
+            return -1e9
 
-        # Force a known-ish working init for trial 0
+        # Force a known-ish init for trial 0 (optional)
         if trial.number == 0:
             params.update({
                 "trail_multiplier": 2.0,
@@ -905,77 +971,109 @@ class BayesianRSIATROptimizer:
                 "slow_period": 30,
             })
 
-        # pick files for this trial (first n_files)
-        n_files = min(max(1, int(n_files)), len(files))
-        trial_files = files[:n_files]
+        # ---- choose subset of files (half_RSI style: seeded random sample each trial) ----
+        rng = random.Random(int(seed) + int(trial.number) * 9973)
+        if n_files is None or n_files <= 0 or n_files >= len(all_files):
+            trial_files = all_files
+        else:
+            trial_files = rng.sample(all_files, k=int(n_files))
 
-        metrics = self.run_backtest(
+        metrics = self.run_backtest_subset(
             files=trial_files,
             sample_size=sample_size,
             fill_mode=fill_mode,
             **params
         )
 
-        total_trades = int(metrics.get("total_trades", 0))
-        if total_trades == 0:
-            return 0.0
+        n_used = int(metrics.get("n_files_used", 0))
+        if n_used <= 0:
+            return -1e9
 
-        pf = float(metrics.get("pf_overall", 0.0))
-        pf = float(min(pf, float(pf_cap)))
+        avg_ret = float(metrics.get("avg_return_overall", 0.0))
+        pct_pos = float(metrics.get("pct_positive_return", 0.0))
 
-        # attrs for inspection
-        trial.set_user_attr("pf_overall", float(pf))
-        trial.set_user_attr("total_gross_profit", float(metrics.get("total_gross_profit", 0.0)))
-        trial.set_user_attr("total_gross_loss", float(metrics.get("total_gross_loss", 0.0)))
-        trial.set_user_attr("total_trades", int(total_trades))
-        trial.set_user_attr("n_files_used", int(metrics.get("n_files_used", 0)))
+        base = 1.0 + avg_ret
+        base = max(base, 1e-6)
+        score = base * (pct_pos ** float(alpha))
+
+        penalty = 0.0
+        if use_penalties:
+            total_trades = int(metrics.get("total_trades", 0))
+            sum_abs_maxdd = float(metrics.get("sum_abs_maxdd", 0.0))
+
+            if total_trades < 3:
+                penalty += 3.0
+            elif total_trades < 10:
+                penalty += 1.0
+
+            score = score - (sum_abs_maxdd * 0.25) - penalty
+
+        # ---- attrs for inspection (like half_RSI) ----
+        trial.set_user_attr("avg_return_overall", float(avg_ret))
+        trial.set_user_attr("pct_positive_return", float(pct_pos))
+        trial.set_user_attr("positive_files", int(metrics.get("positive_files", 0)))
+        trial.set_user_attr("n_files_used", int(n_used))
+        trial.set_user_attr("alpha", float(alpha))
         trial.set_user_attr("fill_mode", str(fill_mode))
 
-        return float(pf)
+        trial.set_user_attr("total_trades", int(metrics.get("total_trades", 0)))
+        trial.set_user_attr("sum_abs_maxdd", float(metrics.get("sum_abs_maxdd", 0.0)))
+        trial.set_user_attr("penalty", float(penalty))
+
+        return float(score)
 
     def optimize_bayesian(
         self,
         n_trials: int = 100,
         n_files: int = 5,
         sample_size: int = 5000,
-        n_jobs: int = -1,
+        n_jobs: int = 1,  # half_RSI uses 1 job; keep deterministic sampling
         fill_mode: str = "same_close",
-        pf_cap: float = 10.0,
+        alpha: float = 0.5,
+        use_penalties: bool = True,
+        seed: int = 42,
     ) -> Dict[str, Any]:
+        fill_mode = normalize_fill_mode(fill_mode)
+
         files = self.find_data_files()
         if len(files) == 0:
             logger.error("No data files found in data directory")
             return {}
 
-        study_name = f"rsi_atr_pf_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        study_name = f"adapt_rsi_score_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         storage_url = f"sqlite:///{self.results_dir}/{study_name}.db"
 
         study = optuna.create_study(
             study_name=study_name,
             storage=storage_url,
-            sampler=TPESampler(seed=42, n_startup_trials=20, multivariate=True),
-            pruner=MedianPruner(n_startup_trials=10, n_warmup_steps=5),
+            sampler=TPESampler(seed=seed, n_startup_trials=30, multivariate=True),
+            pruner=MedianPruner(n_startup_trials=20, n_warmup_steps=10),
             direction="maximize",
             load_if_exists=True,
         )
         self.study = study
 
-        logger.info(f"Starting optimization (PF objective) with {n_trials} trials")
+        logger.info(
+            f"Starting optimization (half_RSI score) trials={n_trials} files_per_trial={n_files} "
+            f"sample={sample_size} fill={fill_mode} alpha={alpha} penalties={use_penalties} seed={seed}"
+        )
 
         def objective_with_args(trial):
             return self.objective(
                 trial=trial,
-                files=files,
+                all_files=files,
                 sample_size=sample_size,
                 n_files=n_files,
                 fill_mode=fill_mode,
-                pf_cap=pf_cap,
+                alpha=alpha,
+                use_penalties=use_penalties,
+                seed=seed,
             )
 
         study.optimize(
             objective_with_args,
             n_trials=n_trials,
-            n_jobs=n_jobs if n_jobs > 0 else os.cpu_count(),
+            n_jobs=int(n_jobs) if int(n_jobs) > 0 else 1,
             show_progress_bar=True,
             gc_after_trial=True,
         )
@@ -984,14 +1082,15 @@ class BayesianRSIATROptimizer:
             logger.error("No successful trials completed.")
             return {}
 
-        results = self.save_optimization_results(
+        return self.save_optimization_results(
             study=study,
             all_files=files,
             sample_size=sample_size,
             fill_mode=fill_mode,
-            pf_cap=pf_cap,
+            alpha=alpha,
+            use_penalties=use_penalties,
+            seed=seed,
         )
-        return results
 
     def save_optimization_results(
         self,
@@ -999,46 +1098,54 @@ class BayesianRSIATROptimizer:
         all_files: List[Path],
         sample_size: int,
         fill_mode: str,
-        pf_cap: float,
+        alpha: float,
+        use_penalties: bool,
+        seed: int,
     ) -> Dict[str, Any]:
+        fill_mode = normalize_fill_mode(fill_mode)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         best_params = study.best_params.copy()
-        best_params["score_pf"] = float(study.best_value)
+        best_params["best_score"] = float(study.best_value)
         best_params["fill_mode"] = fill_mode
-        best_params["pf_cap"] = float(pf_cap)
+        best_params["alpha"] = float(alpha)
+        best_params["use_penalties"] = bool(use_penalties)
+        best_params["seed"] = int(seed)
+        best_params["score_is_(1+avg_return)*pct_pos^alpha"] = True
 
-        best_file = self.results_dir / f"best_params_pf_{timestamp}.json"
+        best_file = self.results_dir / f"best_params_score_{timestamp}.json"
         with open(best_file, "w") as f:
             json.dump(best_params, f, indent=2)
 
         trials_df = study.trials_dataframe()
         trials_df = trials_df.sort_values("value", ascending=False)
-        csv_file = self.results_dir / f"trials_pf_{timestamp}.csv"
+        csv_file = self.results_dir / f"trials_score_{timestamp}.csv"
         trials_df.to_csv(csv_file, index=False)
 
         stats = {
-            "best_value_pf": float(study.best_value),
+            "best_value_score": float(study.best_value),
             "best_params": study.best_params,
             "n_trials": len(study.trials),
             "completed_trials": len([t for t in study.trials if t.state == TrialState.COMPLETE]),
             "pruned_trials": len([t for t in study.trials if t.state == TrialState.PRUNED]),
             "failed_trials": len([t for t in study.trials if t.state == TrialState.FAIL]),
         }
-        stats_file = self.results_dir / f"study_stats_pf_{timestamp}.json"
+        stats_file = self.results_dir / f"study_stats_{timestamp}.json"
         with open(stats_file, "w") as f:
             json.dump(stats, f, indent=2)
 
-        # ---- Evaluate BEST on EACH FILE and print results (REQUEST #2) ----
+        # ---- Evaluate BEST on EACH FILE and print results ----
         eval_params = DEFAULT_PARAMS.copy()
         eval_params.update(study.best_params)
-
         params_obj = StrategyParams(**eval_params)
 
         rows = []
+        sum_ret = 0.0
+        pos_cnt = 0
+        total_trades = 0
+        sum_abs_maxdd = 0.0
         total_gp = 0.0
         total_gl = 0.0
-        total_trades = 0
 
         for fp in all_files:
             df = self.load_data_chunk(fp, sample_size)
@@ -1048,41 +1155,61 @@ class BayesianRSIATROptimizer:
             r["file"] = fp.name
             rows.append(r)
 
+            rr = float(r.get("total_return", 0.0))
+            sum_ret += rr
+            if rr > 0.0:
+                pos_cnt += 1
+
+            total_trades += int(r.get("n_trades", 0))
+            sum_abs_maxdd += abs(float(r.get("max_drawdown_pct", 0.0))) / 100.0
             total_gp += float(r.get("gross_profit", 0.0))
             total_gl += float(r.get("gross_loss", 0.0))
-            total_trades += int(r.get("n_trades", 0))
-
-        if total_gl > 0:
-            pf_all = total_gp / total_gl
-        else:
-            pf_all = pf_cap if total_gp > 0 else 0.0
-        pf_all = float(min(pf_all, float(pf_cap)))
 
         per_file_df = pd.DataFrame(rows)
         if not per_file_df.empty:
-            per_file_df = per_file_df.sort_values(["profit_factor", "n_trades"], ascending=[False, False])
+            per_file_df["positive_return"] = (per_file_df["total_return"] > 0).astype(int)
+            per_file_df = per_file_df.sort_values(["total_return", "n_trades"], ascending=[False, False])
 
-        per_file_csv = self.results_dir / f"per_file_results_pf_{timestamp}.csv"
+        per_file_csv = self.results_dir / f"per_file_results_best_{timestamp}.csv"
         per_file_df.to_csv(per_file_csv, index=False)
 
+        n_used = len(per_file_df)
+        avg_return_all = (sum_ret / float(n_used)) if n_used > 0 else 0.0
+        pct_pos_all = (pos_cnt / float(n_used)) if n_used > 0 else 0.0
+        score_all = max(1.0 + avg_return_all, 1e-6) * (pct_pos_all ** float(alpha))
+
         print("\n" + "=" * 90)
-        print("BAYESIAN OPTIMIZATION RESULTS (Objective = OVERALL PROFIT FACTOR)")
+        print("BAYESIAN OPTIMIZATION RESULTS (Objective = half_RSI-style robustness score)")
         print("=" * 90)
-        print(f"Best PF Score (capped): {study.best_value:.6f}")
+        print(f"Best Score: {study.best_value:.6f}")
         print(f"Fill mode: {fill_mode}")
-        print(f"PF cap: {pf_cap}")
+        print(f"Alpha: {alpha}")
+        print(f"Use penalties: {use_penalties}")
+        print(f"Seed: {seed}")
         print(f"Completed Trials: {stats['completed_trials']} | Pruned: {stats['pruned_trials']} | Failed: {stats['failed_trials']}")
+
         print("\nBest Parameters Found:")
         for k, v in study.best_params.items():
             print(f"  {k}: {v}")
 
         print("\n" + "-" * 90)
-        print("OVERALL (ALL FILES) POOLED PROFIT FACTOR")
+        print("OVERALL (ALL FILES) METRICS (BEST PARAMS)")
         print("-" * 90)
-        print(f"Gross Profit: {total_gp:,.2f}")
-        print(f"Gross Loss:   {total_gl:,.2f}")
-        print(f"PF Overall:   {pf_all:.6f}")
-        print(f"Total Trades: {total_trades}")
+        print(f"Files used:        {n_used}")
+        print(f"Avg Return:        {avg_return_all:.6f}  ({avg_return_all*100:.2f}%)")
+        print(f"Pct Positive Ret:  {pct_pos_all:.4f}  ({pos_cnt}/{n_used})")
+        print(f"Score (overall):   {score_all:.6f}")
+        print(f"Total Trades:      {total_trades}")
+        print(f"Sum abs maxDD:     {sum_abs_maxdd:.4f}  (fraction units)")
+
+        # Keep PF pooled info for context (reporting only)
+        if total_gl > 0:
+            pf_pooled = total_gp / total_gl
+        else:
+            pf_pooled = 10.0 if total_gp > 0 else 0.0
+        print(f"Pooled GP:         {total_gp:,.2f}")
+        print(f"Pooled GL:         {total_gl:,.2f}")
+        print(f"Pooled PF:         {pf_pooled:.6f}")
 
         print("\n" + "-" * 90)
         print("PER-FILE RESULTS (BEST PARAMS)")
@@ -1090,17 +1217,18 @@ class BayesianRSIATROptimizer:
         if per_file_df.empty:
             print("(No per-file results: not enough data / all files too short.)")
         else:
-            # print a readable subset of columns
             show_cols = [
                 "file",
+                "total_return",
+                "total_return_pct",
+                "positive_return",
+                "n_trades",
+                "max_drawdown_pct",
                 "profit_factor",
                 "gross_profit",
                 "gross_loss",
-                "n_trades",
-                "total_return_pct",
-                "max_drawdown_pct",
-                "sharpe_ratio",
                 "final_equity",
+                "sharpe_ratio",
             ]
             show_cols = [c for c in show_cols if c in per_file_df.columns]
             print(per_file_df[show_cols].to_string(index=False))
@@ -1132,8 +1260,10 @@ class BayesianRSIATROptimizer:
         validation_files: Optional[List[Path]] = None,
         sample_size: int = 10000,
         fill_mode: str = "same_close",
-        pf_cap: float = 10.0,
+        alpha: float = 0.5,
     ) -> Dict[str, Any]:
+        fill_mode = normalize_fill_mode(fill_mode)
+
         if validation_files is None:
             files = self.find_data_files()
             validation_files = files[-5:] if len(files) > 5 else files
@@ -1141,9 +1271,13 @@ class BayesianRSIATROptimizer:
         params = StrategyParams(**best_params)
 
         rows = []
+        sum_ret = 0.0
+        pos_cnt = 0
+        total_trades = 0
+        sum_abs_maxdd = 0.0
+
         total_gp = 0.0
         total_gl = 0.0
-        total_trades = 0
 
         print(f"\nValidating on {len(validation_files)} files (fill={fill_mode}) ...")
         for fp in validation_files:
@@ -1154,35 +1288,55 @@ class BayesianRSIATROptimizer:
             r["file"] = fp.name
             rows.append(r)
 
+            rr = float(r.get("total_return", 0.0))
+            sum_ret += rr
+            if rr > 0.0:
+                pos_cnt += 1
+
+            total_trades += int(r.get("n_trades", 0))
+            sum_abs_maxdd += abs(float(r.get("max_drawdown_pct", 0.0))) / 100.0
+
             total_gp += float(r.get("gross_profit", 0.0))
             total_gl += float(r.get("gross_loss", 0.0))
-            total_trades += int(r.get("n_trades", 0))
+
+        n_used = len(rows)
+        avg_return = (sum_ret / float(n_used)) if n_used > 0 else 0.0
+        pct_pos = (pos_cnt / float(n_used)) if n_used > 0 else 0.0
+        score = max(1.0 + avg_return, 1e-6) * (pct_pos ** float(alpha))
+
+        df_out = pd.DataFrame(rows)
+        if not df_out.empty:
+            df_out["positive_return"] = (df_out["total_return"] > 0).astype(int)
+            df_out = df_out.sort_values(["total_return", "n_trades"], ascending=[False, False])
 
         if total_gl > 0:
-            pf = total_gp / total_gl
+            pf_pooled = total_gp / total_gl
         else:
-            pf = pf_cap if total_gp > 0 else 0.0
-        pf = float(min(pf, float(pf_cap)))
+            pf_pooled = 10.0 if total_gp > 0 else 0.0
 
-        df_out = pd.DataFrame(rows).sort_values(["profit_factor", "n_trades"], ascending=[False, False]) if rows else pd.DataFrame()
-
-        print("\nValidation pooled PF:")
-        print(f"  Gross Profit: {total_gp:,.2f}")
-        print(f"  Gross Loss:   {total_gl:,.2f}")
-        print(f"  PF Overall:   {pf:.6f}")
-        print(f"  Total Trades: {total_trades}")
+        print("\nValidation (pooled across validation files):")
+        print(f"  Files used:        {n_used}")
+        print(f"  Avg Return:        {avg_return:.6f}  ({avg_return*100:.2f}%)")
+        print(f"  Pct Positive Ret:  {pct_pos:.4f}  ({pos_cnt}/{n_used})")
+        print(f"  Alpha:             {alpha:.3f}")
+        print(f"  Score:             {score:.6f}")
+        print(f"  Total Trades:      {total_trades}")
+        print(f"  Sum abs maxDD:     {sum_abs_maxdd:.4f}")
+        print(f"  Pooled PF:         {pf_pooled:.6f}")
 
         if not df_out.empty:
-            show_cols = ["file", "profit_factor", "gross_profit", "gross_loss", "n_trades", "total_return_pct", "max_drawdown_pct"]
+            show_cols = ["file", "total_return", "total_return_pct", "positive_return", "n_trades", "max_drawdown_pct", "profit_factor"]
             show_cols = [c for c in show_cols if c in df_out.columns]
             print("\nPer-file:")
             print(df_out[show_cols].to_string(index=False))
 
         return {
-            "pooled_pf": pf,
-            "total_gross_profit": total_gp,
-            "total_gross_loss": total_gl,
-            "total_trades": total_trades,
+            "score": float(score),
+            "avg_return_overall": float(avg_return),
+            "pct_positive_return": float(pct_pos),
+            "total_trades": int(total_trades),
+            "sum_abs_maxdd": float(sum_abs_maxdd),
+            "pooled_pf": float(pf_pooled),
             "per_file": df_out,
         }
 
@@ -1195,36 +1349,47 @@ if __name__ == "__main__":
     import argparse
 
     def main():
-        parser = argparse.ArgumentParser(description="Bayesian Optimization for RSI ATR Strategy (PF objective)")
+        parser = argparse.ArgumentParser(description="Bayesian Optimization for Adaptive RSI ATR Strategy (half_RSI-style score)")
         parser.add_argument("--mode", choices=["optimize", "validate", "test"], default="optimize",
                             help="Mode: optimize, validate, test")
-        parser.add_argument("--trials", type=int, default=100, help="Number of optimization trials")
-        parser.add_argument("--sample", type=int, default=5000, help="Sample size per file")
-        parser.add_argument("--files", type=int, default=3, help="Number of files to use per trial (first N files)")
-        parser.add_argument("--workers", type=int, default=-1, help="Number of parallel workers (-1 for auto)")
+        parser.add_argument("--trials", type=int, default=200, help="Number of optimization trials")
+        parser.add_argument("--sample", type=int, default=5000, help="Sample size (tail) per file")
+        parser.add_argument("--files", type=int, default=5,
+                            help="Number of files to use per trial (random subsample). If >= total -> use all.")
+        parser.add_argument("--workers", type=int, default=1,
+                            help="Parallel workers. Recommended 1 for deterministic sampling (half_RSI style).")
+        parser.add_argument("--seed", type=int, default=42, help="RNG seed for per-trial file subsampling")
+        parser.add_argument("--alpha", type=float, default=0.5,
+                            help="Exponent for pct_positive_return term (default 0.5)")
+        parser.add_argument("--no-penalties", action="store_true",
+                            help="Disable trade/DD penalties (default: penalties enabled)")
         parser.add_argument("--params-file", type=str, help="JSON file with parameters to validate/test")
-        parser.add_argument("--test-file", type=str, help="Specific file to test")
-        parser.add_argument("--fill", choices=["same_close", "next_open"], default="same_close",
-                            help="Execution fill model")
-        parser.add_argument("--pf-cap", type=float, default=10.0,
-                            help="Cap PF to avoid infinite PF dominating (default 10.0)")
+        parser.add_argument("--test-file", type=str, help="Specific file to test (path)")
+
+        # --fill EXACTLY like bayes_opt_half_RSI.py
+        parser.add_argument("--fill", choices=["next_open", "same_close"], default="same_close",
+                            help="Execution model: same_close or next_open")
+
         parser.add_argument("--data-dir", type=str, default="./data", help="Data directory")
         parser.add_argument("--results-dir", type=str, default="./results", help="Results directory")
 
         args = parser.parse_args()
+        args.fill = normalize_fill_mode(args.fill)
 
         optimizer = BayesianRSIATROptimizer(data_dir=args.data_dir, results_dir=args.results_dir)
 
         if args.mode == "optimize":
             print("=" * 80)
-            print("BAYESIAN OPTIMIZATION MODE (Objective = OVERALL PROFIT FACTOR)")
+            print("BAYESIAN OPTIMIZATION MODE (Objective = (1+avg_return)*pct_pos^alpha)")
             print("=" * 80)
             print(f"Trials: {args.trials}")
             print(f"Sample size: {args.sample}")
             print(f"Files per trial: {args.files}")
             print(f"Fill mode: {args.fill}")
-            print(f"PF cap: {args.pf_cap}")
-            print(f"Workers: {'Auto' if args.workers == -1 else args.workers}")
+            print(f"Alpha: {args.alpha}")
+            print(f"Penalties: {not args.no_penalties}")
+            print(f"Seed: {args.seed}")
+            print(f"Workers: {args.workers}")
             print("=" * 80)
 
             optimizer.optimize_bayesian(
@@ -1233,7 +1398,9 @@ if __name__ == "__main__":
                 sample_size=args.sample,
                 n_jobs=args.workers,
                 fill_mode=args.fill,
-                pf_cap=args.pf_cap,
+                alpha=args.alpha,
+                use_penalties=(not args.no_penalties),
+                seed=args.seed,
             )
 
         elif args.mode == "validate":
@@ -1244,22 +1411,21 @@ if __name__ == "__main__":
             with open(args.params_file, "r") as f:
                 params_data = json.load(f)
 
-            # allow either full dict or wrapper dict
+            # allow wrapper dict or raw best params
             if "best_params" in params_data:
                 params = params_data["best_params"]
             else:
                 params = params_data
 
             # remove non-StrategyParams keys if present
-            for k in ["score_pf", "fill_mode", "pf_cap"]:
-                if k in params:
-                    del params[k]
+            for k in ["best_score", "fill_mode", "alpha", "use_penalties", "seed", "score_is_(1+avg_return)*pct_pos^alpha"]:
+                params.pop(k, None)
 
             optimizer.validate_best_params(
                 best_params=params,
                 sample_size=args.sample,
                 fill_mode=args.fill,
-                pf_cap=args.pf_cap,
+                alpha=args.alpha,
             )
 
         elif args.mode == "test":
@@ -1279,11 +1445,10 @@ if __name__ == "__main__":
                     params_data = json.load(f)
                 if "best_params" in params_data:
                     params_data = params_data["best_params"]
-                for k in ["score_pf", "fill_mode", "pf_cap"]:
+                for k in ["best_score", "fill_mode", "alpha", "use_penalties", "seed", "score_is_(1+avg_return)*pct_pos^alpha"]:
                     params_data.pop(k, None)
                 params = StrategyParams(**params_data)
             else:
-                # use defaults
                 base = DEFAULT_PARAMS.copy()
                 params = StrategyParams(**base)
 
@@ -1300,14 +1465,14 @@ if __name__ == "__main__":
             print(f"File: {test_fp.name}")
             print(f"Fill mode: {args.fill}")
             print("-" * 80)
-            print(f"Profit Factor: {r['profit_factor']:.6f}")
-            print(f"Gross Profit:  {r['gross_profit']:,.2f}")
-            print(f"Gross Loss:    {r['gross_loss']:,.2f}")
-            print(f"Trades:        {r['n_trades']}")
-            print(f"Return:        {r['total_return_pct']:.2f}%")
-            print(f"Max DD:        {r['max_drawdown_pct']:.2f}%")
-            print(f"Sharpe:        {r['sharpe_ratio']:.3f}")
-            print(f"Final Equity:  {r['final_equity']:,.2f}")
+            print(f"Total Return:   {r['total_return']:.6f}  ({r['total_return_pct']:.2f}%)")
+            print(f"Trades:         {r['n_trades']}")
+            print(f"Max DD:         {r['max_drawdown_pct']:.2f}%")
+            print(f"Sharpe:         {r['sharpe_ratio']:.3f}")
+            print(f"Final Equity:   {r['final_equity']:,.2f}")
+            print(f"Profit Factor:  {r['profit_factor']:.6f}")
+            print(f"Gross Profit:   {r['gross_profit']:,.2f}")
+            print(f"Gross Loss:     {r['gross_loss']:,.2f}")
             print("=" * 80)
 
     main()
