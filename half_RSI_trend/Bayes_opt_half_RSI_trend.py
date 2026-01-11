@@ -1,68 +1,42 @@
 #!/usr/bin/env python3
 """
 bayes_opt_half_RSI_trend.py
-(NO SHIFT + Future Trend Filter (futureLen + futureMulti) + PF objective + SIGMOID trade-weight)
+(NO SHIFT + SINGLE Trend Channel set + PF objective + per-ticker SIGMOID weights)
 
 Matches TradingView Pine strategy (bar-based backtest model):
 "half_RSI_hr (HA signals + Real risk + minimal future trend filter)"
 
-DATA (chart-type independent):
-- REAL OHLC is the input data.
-- Heikin Ashi is computed from REAL OHLC.
+What this version matches from the Pine you pasted (the merged-channel version):
+- Signals use Heikin Ashi derived from REAL OHLC:
+    sigClose = haClose
+    sigHL2   = (haHigh + haLow)/2
+- RSI/HOT logic (Pine-style):
+    fast_window = round(slow_window/2)
+    fast_rsi = rsi(sigClose, fast_window) (shift fixed to 0)
+    slow_rsi = 100 - rsi(sigClose, slow_window)   <-- inverted like Pine
+    hot = fast_rsi - slow_rsi
+    hot_sm = sma(hot, smooth_len)
+    cross_up = crossover(hot_sm, 0)
+- Trend decision uses ONE set of channel inputs ONLY:
+    channelLength, channelMulti (channelMulti computed for parity; not required for trend decision)
+    midChannel = sma(sigHL2, channelLength)
+    uptrend    = sigClose > midChannel
+    above_lowerTF uses lowerTF_Length = max(1, channelLength//2), midChannel_lowerTF = sma(sigHL2, lowerTF_Length)
+- Minimal "future trend filter" is merged into same channel midline:
+    futureOK = sigClose > midChannel
+  (i.e., no futureLen/futureMulti)
 
-SIGNALS (Heikin Ashi):
-- sigClose = haClose
-- sigHL2   = (haHigh + haLow)/2
-- fast_window = round(slow_window/2)
-- fast_rsi = rsi(sigClose, fast_window)          (NO SHIFT; fixed at 0)
-- slow_rsi = 100 - rsi(sigClose, slow_window)    (NO SHIFT)
-- hot = fast_rsi - slow_rsi
-- hot_sm = sma(hot, smooth_len)
-- cross_up = crossover(hot_sm, 0)
+Risk control (SL/TP/Trailing) matches Pine logic:
+- Risk series use REAL OHLC
+- ATR is Wilder RMA ATR on REAL OHLC
+- TP touched by REAL high, TP crossdown by REAL close vs take_profit_low
+- Stop breach by REAL low vs trail_stop_level
+- Trailing stop only ratchets upward
 
-Trend filter (existing):
-- uptrend = sigClose > sma(sigHL2, channelLength)
-- above_lowerTF = sigClose > sma(sigHL2, max(1, channelLength//2))
-
-Future trend filter (uses futureLen + futureMulti):
-- midFuture = sma(sigHL2, futureLen)
-- atrFuture = ATR_Wilder(REAL OHLC, futureLen)
-- threshold = midFuture + atrFuture * futureMulti
-- futureOK  = sigClose > threshold
-- longCondition = cross_up and (uptrend or above_lowerTF) and futureOK
-
-RISK / EXITS (REAL OHLC + realATR):
-- riskClose = realClose
-- riskHigh  = realHigh
-- riskLow   = realLow
-- atr = ta.atr(atrPeriod) on REAL OHLC (Wilder RMA TR)
-- On entry (signal bar):
-    trail_stop_level = riskClose - atr*slMultiplier
-    trail_offset = max(atr*trailMultiplier, atr*0.5)
-    take_profit_low = riskClose + atr*tpMultiplier
-    take_profit_high = take_profit_low + trail_offset
-- While in position:
-    if not tp_touched and riskHigh > take_profit_high: tp_touched = True
-    if tp_touched:
-        tp_crossdown = riskClose < take_profit_low
-        take_profit_low = max(take_profit_low, riskClose - trail_offset)
-    exit if (riskLow < trail_stop_level) or tp_crossdown
-    new_stop = riskHigh - atr*slMultiplier
-    trail_stop_level = max(trail_stop_level, new_stop)
-
-OBJECTIVE (PF + robustness + sigmoid trade-weight):
-- per-ticker PF computed from realized trade PnL NET commissions, capped by --pf-cap
-- avg_pf_overall = mean(PF_ticker over tickers used)
-- pct_positive_return = fraction of tickers with total_return > 0
-- core = avg_pf_overall * (pct_positive_return ** alpha)
-
-- avg_trades_per_ticker = total_completed_trades / n_tickers_used
-- trade_weight = sigmoid( beta * (avg_trades_per_ticker - center) )
-  where sigmoid(z)=1/(1+exp(-z))
-- score = core * trade_weight
-
-CLI example:
-  python bayes_opt_half_RSI_trend.py --trials 400 --beta 1.0 --center 3 --pf-cap 30
+Other features unchanged:
+- PF objective + per-ticker sigmoid weights + optional penalty
+- COST FLOOR for gross loss on losing trades
+- fill_mode: "same_close" or "next_open"
 """
 
 import json, math, time, random
@@ -240,50 +214,62 @@ def crossover(cur_x: float, prev_x: float, cur_y: float, prev_y: float) -> bool:
 
 
 # =========================
-# PF from realized trades (net commissions), with cap
+# PF from realized trades (net commissions) + COST FLOOR
 # =========================
 
-def profit_factor_from_trades(trades: List[Dict[str, Any]], pf_cap: float) -> Tuple[float, float, float]:
+def profit_factor_from_trades(
+    trades: List[Dict[str, Any]],
+    cost: float,
+    total_capital: float,
+) -> Tuple[float, float, float]:
     """
     Uses realized trade PnL NET commissions.
     pnl = qty*(exit - entry) - commission_entry - commission_exit
-    Returns (pf_capped, gross_profit, gross_loss_abs) where gp/gl are net of commissions.
+
+    Minimum gross loss floor for each non-winning trade:
+      loss_floor = cost * total_capital
+      if pnl <= 0 => gross_loss += max(-pnl, loss_floor)
+
+    Returns (pf, gross_profit, gross_loss_abs) where gp/gl are net of commissions + loss floor.
     """
     gp = 0.0
     gl = 0.0
+    loss_floor = float(cost) * float(total_capital)
+
     for t in trades:
         if t.get("ignored", False):
             continue
         if ("fill_price" not in t) or ("exit_price" not in t) or ("qty" not in t):
             continue
+
         qty = float(t.get("qty", 0.0))
         entry = float(t.get("fill_price", np.nan))
         exitp = float(t.get("exit_price", np.nan))
         if qty <= 0 or np.isnan(entry) or np.isnan(exitp):
             continue
+
         c_in = float(t.get("commission_entry", 0.0))
         c_out = float(t.get("commission_exit", 0.0))
         pnl = qty * (exitp - entry) - c_in - c_out
+
         if pnl > 0:
             gp += pnl
-        elif pnl < 0:
-            gl += -pnl
+        else:
+            gl += max(-pnl, loss_floor)
 
     if gl == 0.0:
-        pf = pf_cap if gp > 0.0 else 0.0
+        pf = float("inf") if gp > 0.0 else 0.0
     else:
         pf = gp / gl
 
-    pf = min(float(pf), float(pf_cap)) if pf_cap and pf_cap > 0 else float(pf)
     return float(pf), float(gp), float(gl)
 
 
 # =========================
-# Sigmoid trade-weight
+# Sigmoid
 # =========================
 
 def sigmoid(z: float) -> float:
-    # numerically stable-ish clamp
     if z > 60.0:
         return 1.0
     if z < -60.0:
@@ -297,28 +283,26 @@ def sigmoid(z: float) -> float:
 
 @dataclass
 class HalfRSIParams:
-    channelLength: int = 107
-    channelMulti: float = 4.85  # parity only (not used in entry)
+    # SINGLE channel set used for ALL trend decisions (including "futureOK")
+    channelLength: int = 12
+    channelMulti: float = 3.36  # parity only; channel bounds not required for trend decision
 
-    futureLen: int = 48
-    futureMulti: float = 3.816  # USED in future filter threshold
+    atrPeriod: int = 57
+    slMultiplier: float = 7.95
+    tpMultiplier: float = 0.7923
+    trailMultiplier: float = 1.457
 
-    atrPeriod: int = 29
-    slMultiplier: float = 5.16
-    tpMultiplier: float = 4.94
-    trailMultiplier: float = 2.78
-
-    slow_window: int = 32
-    smooth_len: int = 12
+    slow_window: int = 16
+    smooth_len: int = 3
 
     initial_capital: float = INITIAL_CAPITAL
     position_size_pct: float = POSITION_SIZE_PCT
     commission_pct: float = COMMISSION_PCT
 
-    fill_mode: str = "next_open"  # "next_open" or "same_close"
+    fill_mode: str = "same_close"
 
 
-def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, pf_cap: float) -> Dict[str, Any]:
+def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, cost: float) -> Dict[str, Any]:
     df = df.copy().reset_index(drop=True)
     df.columns = [c.lower() for c in df.columns]
 
@@ -359,33 +343,37 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, pf_cap: float) -> D
     # ATR for exits on REAL
     atr_exit = atr_wilder(real_h, real_l, real_c, int(p.atrPeriod))
 
-    # Trend filters (signals)
-    midChannel = sma(sigHL2, int(p.channelLength))
+    # =========================
+    # Trend filters (signals) - SINGLE channel set
+    # =========================
+    chLen = max(1, int(p.channelLength))
+    midChannel = sma(sigHL2, chLen)
     uptrend = sigClose > midChannel
 
-    lowerTF_Length = max(1, int(p.channelLength // 2))
+    lowerTF_Length = max(1, int(chLen // 2))
     midChannel_lowerTF = sma(sigHL2, lowerTF_Length)
     above_lowerTF = sigClose > midChannel_lowerTF
 
-    # Future trend filter (signals) using futureMulti
-    fLen = max(1, int(p.futureLen))
-    midFuture = sma(sigHL2, fLen)
-    atrFuture = atr_wilder(real_h, real_l, real_c, fLen)
-    threshold = midFuture + (atrFuture * float(p.futureMulti))
-    futureOK = sigClose > threshold
+    # Minimal future trend filter merged into same midChannel:
+    # Pine merged version: futureOK = sigClose > midChannel
+    futureOK = sigClose > midChannel
 
-    # RSI signals on HA close (NO SHIFT)
+    # =========================
+    # RSI signals on HA close (SHIFT fixed to 0) - match Pine pasted
+    # =========================
     slow_len = max(2, int(p.slow_window))
     fast_window = max(1, int(round(float(slow_len) / 2.0)))
 
     fast_rsi = rsi_tv(sigClose, fast_window)
-    slow_rsi = 100.0 - rsi_tv(sigClose, slow_len)
+    slow_rsi = 100.0 - rsi_tv(sigClose, slow_len)  # inverted like Pine
 
     hot = fast_rsi - slow_rsi
     sm = max(1, int(p.smooth_len))
     hot_sm = sma(hot, sm)
 
+    # =========================
     # State
+    # =========================
     in_pos = False
     pending_entry = False
     entry_fill_idx = None
@@ -424,19 +412,21 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, pf_cap: float) -> D
                 "qty": float(qty),
             })
 
-        # cross_up = crossover(hot_sm, 0)
+        # cross_up = ta.crossover(hot_sm, 0)
         if i > 0 and (not np.isnan(hot_sm[i])) and (not np.isnan(prev_hot_sm)):
             cross_up = crossover(hot_sm[i], prev_hot_sm, 0.0, 0.0)
         else:
             cross_up = False
 
         # longCondition = cross_up and (uptrend or above_lowerTF) and futureOK
-        if cross_up:
-            ok_trend = (not np.isnan(uptrend[i])) and (not np.isnan(above_lowerTF[i])) and bool(uptrend[i] or above_lowerTF[i])
-            ok_future = (not np.isnan(futureOK[i])) and bool(futureOK[i])
-            longCondition = bool(ok_trend and ok_future)
-        else:
-            longCondition = False
+        ok_trend = False
+        ok_future = False
+        if not np.isnan(uptrend[i]) and not np.isnan(above_lowerTF[i]):
+            ok_trend = bool(uptrend[i] or above_lowerTF[i])
+        if not np.isnan(futureOK[i]):
+            ok_future = bool(futureOK[i])
+
+        longCondition = bool(cross_up and ok_trend and ok_future)
 
         # ENTRY (levels set using REAL close + REAL atr)
         if longCondition and (not in_pos) and (not pending_entry):
@@ -446,8 +436,10 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, pf_cap: float) -> D
             atr_i = atr_exit[i]
             if (not np.isnan(atr_i)) and (not np.isnan(riskClose[i])):
                 trail_stop_level = riskClose[i] - (atr_i * float(p.slMultiplier))
+
                 min_trail_offset = atr_i * 0.5
                 trail_offset = max(atr_i * float(p.trailMultiplier), min_trail_offset)
+
                 take_profit_low = riskClose[i] + (atr_i * float(p.tpMultiplier))
                 take_profit_high = take_profit_low + trail_offset
 
@@ -458,8 +450,8 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, pf_cap: float) -> D
                     "slow_window": int(slow_len),
                     "fast_window": int(fast_window),
                     "smooth_len": int(sm),
-                    "futureLen": int(fLen),
-                    "futureMulti": float(p.futureMulti),
+                    "channelLength": int(chLen),
+                    "channelMulti": float(p.channelMulti),
                 })
 
                 if p.fill_mode == "same_close":
@@ -548,7 +540,6 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, pf_cap: float) -> D
                     new_stop = riskHigh[i] - (atr_i * float(p.slMultiplier))
                     trail_stop_level = max(trail_stop_level, new_stop)
         else:
-            # when flat, reset (safety)
             tp_touched = False
             tp_crossdown = False
             trail_offset = np.nan
@@ -594,7 +585,7 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, pf_cap: float) -> D
     completed = [t for t in trades if ("exit_price" in t and "fill_price" in t and not t.get("ignored", False))]
     num_trades = len(completed)
 
-    pf, gp, gl = profit_factor_from_trades(trades, pf_cap=float(pf_cap))
+    pf, gp, gl = profit_factor_from_trades(trades, cost=float(cost), total_capital=float(p.initial_capital))
 
     return {
         "final_equity": final_equity,
@@ -634,14 +625,23 @@ def load_files() -> Dict[str, pd.DataFrame]:
 def run_optuna_optimization(
     n_trials: int = 200,
     n_files: int = 200,
-    fill_mode: str = "next_open",
+    fill_mode: str = "same_close",
     study_name: Optional[str] = None,
     seed: int = 42,
-    use_penalties: bool = False,
-    alpha: float = 0.5,
-    beta: float = 1.0,        # sigmoid steepness
-    center: float = 3.0,      # sigmoid center (trades/ticker at ~0.5 weight)
-    pf_cap: float = 30.0,
+    cost: float = 0.006,
+    penalty: bool = False,
+
+    # trade-weight (per-ticker)
+    min_trades: int = 4,
+    center: float = 10.0,
+    beta: float = 1.0,
+
+    # PF-weight (per-ticker)
+    pf_center: float = 10.0,
+    pf_beta: float = 1.0,
+
+    # pf_cap used ONLY in scoring
+    pf_cap: float = 100.0,
 ) -> Tuple[Dict[str, Any], pd.DataFrame]:
     ensure_dirs()
     data = load_files()
@@ -682,8 +682,25 @@ def run_optuna_optimization(
             return tickers_all
         return rng.sample(tickers_all, k=n_files)
 
+    pf_cap_score = float(pf_cap) if float(pf_cap) > 0 else 1.0
+    min_trades_i = max(0, int(min_trades))
+
+    def ticker_score(pf_raw: float, num_trades: int) -> float:
+        if int(num_trades) < min_trades_i:
+            return 0.0
+
+        pf_for_score = float(pf_raw)
+        if math.isfinite(pf_for_score):
+            pf_for_score = min(pf_for_score, pf_cap_score)
+        else:
+            pf_for_score = pf_cap_score
+
+        pf_norm = pf_for_score / pf_cap_score
+        pf_w = sigmoid(float(pf_beta) * (pf_for_score - float(pf_center)))
+        tr_w = sigmoid(float(beta) * (float(num_trades) - float(center)))
+        return float(pf_norm) * float(pf_w) * float(tr_w)
+
     def opt_fn(trial):
-        # optimized params
         slowW = trial.suggest_int("slow_window", 14, 80)
         smth  = trial.suggest_int("smooth_len", 3, 30)
 
@@ -692,80 +709,77 @@ def run_optuna_optimization(
         tpM   = trial.suggest_float("tpMultiplier", 0.5, 10.0)
         trM   = trial.suggest_float("trailMultiplier", 0.5, 10.0)
 
-        futL  = trial.suggest_int("futureLen", 5, 200)
-        futM  = trial.suggest_float("futureMulti", 0.0, 10.0)
+        # SINGLE channel set for trend decisions (optimize this if you want)
+        chLen = trial.suggest_int("channelLength", 10, 200)
+        chMul = trial.suggest_float("channelMulti", 0.5, 8.0)
 
         tickers = choose_tickers_for_trial()
         if not tickers:
             return -1e9
 
-        sum_pf = 0.0
-        pos_cnt = 0
-        agg_trades = 0
-        agg_dd = 0.0
+        sum_score = 0.0
+        sum_pf_raw = 0.0
+        sum_trades = 0
+        num_neg_dd = 0
 
         for tk in tickers:
             params = HalfRSIParams(
-                channelLength=107,
-                channelMulti=4.85,
-                futureLen=int(futL),
-                futureMulti=float(futM),
+                channelLength=int(chLen),
+                channelMulti=float(chMul),
+
                 slow_window=int(slowW),
                 smooth_len=int(smth),
+
                 atrPeriod=int(atrP),
                 slMultiplier=float(slM),
                 tpMultiplier=float(tpM),
                 trailMultiplier=float(trM),
+
                 initial_capital=INITIAL_CAPITAL,
                 position_size_pct=POSITION_SIZE_PCT,
                 commission_pct=COMMISSION_PCT,
                 fill_mode=fill_mode,
             )
-            m = backtest_half_rsi_hr(data[tk], params, pf_cap=float(pf_cap))
 
-            pf = float(m.get("profit_factor", 0.0))
-            r  = float(m.get("total_return", 0.0))
+            m = backtest_half_rsi_hr(data[tk], params, cost=float(cost))
 
-            sum_pf += pf
-            if r > 0.0:
-                pos_cnt += 1
+            pf_raw = float(m.get("profit_factor", 0.0))
+            nt = int(m.get("num_trades", 0))
+            dd = float(m.get("maxdd", 0.0))
 
-            agg_trades += int(m.get("num_trades", 0))
-            agg_dd += abs(float(m.get("maxdd", 0.0)))
+            sum_pf_raw += pf_raw if math.isfinite(pf_raw) else pf_cap_score
+            sum_trades += nt
+            if dd < 0.0:
+                num_neg_dd += 1
 
-        avg_pf_overall = sum_pf / float(len(tickers))
-        pct_positive_return = pos_cnt / float(len(tickers))
+            sum_score += ticker_score(pf_raw, nt)
 
-        core = max(avg_pf_overall, 0.0) * (pct_positive_return ** float(alpha))
+        score = sum_score / float(len(tickers))
 
-        avg_trades_per_ticker = agg_trades / float(len(tickers))
-        trade_weight = sigmoid(float(beta) * (float(avg_trades_per_ticker) - float(center)))
+        pen = 0.0
+        if penalty:
+            frac_neg_dd = float(num_neg_dd) / float(len(tickers))
+            pen += 0.25 * frac_neg_dd
+            if sum_trades < max(1, len(tickers)):
+                pen += 0.10
+            score = score - pen
 
-        score = core * trade_weight
+        avg_pf_raw = sum_pf_raw / float(len(tickers))
+        avg_trades = sum_trades / float(len(tickers))
 
-        penalty = 0.0
-        if use_penalties:
-            # very light nudges only
-            if agg_trades < 3:
-                penalty += 1.0
-            score = score - (agg_dd * 0.25) - penalty
+        trial.set_user_attr("avg_pf_raw", float(avg_pf_raw))
+        trial.set_user_attr("avg_trades_per_ticker", float(avg_trades))
+        trial.set_user_attr("num_neg_dd", int(num_neg_dd))
+        trial.set_user_attr("penalty_enabled", bool(penalty))
+        trial.set_user_attr("penalty_value", float(pen))
+        trial.set_user_attr("cost_floor", float(cost) * float(INITIAL_CAPITAL))
 
-        trial.set_user_attr("avg_pf_overall", float(avg_pf_overall))
-        trial.set_user_attr("pct_positive_return", float(pct_positive_return))
-        trial.set_user_attr("positive_tickers", int(pos_cnt))
-        trial.set_user_attr("n_files_used", int(len(tickers)))
-        trial.set_user_attr("alpha", float(alpha))
-
-        trial.set_user_attr("beta", float(beta))
+        trial.set_user_attr("pf_cap_score_only", float(pf_cap_score))
+        trial.set_user_attr("pf_center", float(pf_center))
+        trial.set_user_attr("pf_beta", float(pf_beta))
+        trial.set_user_attr("min_trades", int(min_trades_i))
         trial.set_user_attr("center", float(center))
-        trial.set_user_attr("pf_cap", float(pf_cap))
-
-        trial.set_user_attr("avg_trades_per_ticker", float(avg_trades_per_ticker))
-        trial.set_user_attr("trade_weight", float(trade_weight))
-
-        trial.set_user_attr("total_trades", int(agg_trades))
-        trial.set_user_attr("sum_abs_maxdd", float(agg_dd))
-        trial.set_user_attr("penalty", float(penalty))
+        trial.set_user_attr("beta", float(beta))
 
         return float(score)
 
@@ -775,72 +789,88 @@ def run_optuna_optimization(
     best_params["best_score"] = float(study.best_value)
     best_params["fill_mode"] = fill_mode
     best_params["timestamp"] = time.time()
-    best_params["score"] = "(avg_pf_overall * pct_pos^alpha) * sigmoid(beta*(avg_trades_per_ticker-center))"
-    best_params["use_penalties"] = bool(use_penalties)
-    best_params["alpha"] = float(alpha)
+    best_params["score"] = (
+        "mean_over_tickers( "
+        "  [trades<min_trades?0 : (min(PF,pf_cap)/pf_cap) * sigmoid(pf_beta*(min(PF,pf_cap)-pf_center)) * sigmoid(beta*(trades-center))] "
+        ")"
+    )
+    best_params["penalty"] = bool(penalty)
+    best_params["penalty_uses"] = "num_neg_dd (count of tickers with maxdd < 0), normalized"
+    best_params["cost"] = float(cost)
+
     best_params["beta"] = float(beta)
     best_params["center"] = float(center)
-    best_params["pf_cap"] = float(pf_cap)
+    best_params["min_trades"] = int(min_trades_i)
+
+    best_params["pf_cap_score_only"] = float(pf_cap_score)
+    best_params["pf_beta"] = float(pf_beta)
+    best_params["pf_center"] = float(pf_center)
 
     with open(OUT_DIR / "best_params_half_rsi_trend.json", "w") as f:
         json.dump(best_params, f, indent=2)
 
     # Run best params across ALL files + outputs
-    rows = []
+    rows: List[Dict[str, Any]] = []
 
     for tk in tickers_all:
         params = HalfRSIParams(
-            channelLength=107,
-            channelMulti=4.85,
-            futureLen=int(best_params.get("futureLen", 48)),
-            futureMulti=float(best_params.get("futureMulti", 3.816)),
+            channelLength=int(best_params.get("channelLength", 80)),
+            channelMulti=float(best_params.get("channelMulti", 4.85)),
+
             slow_window=int(best_params.get("slow_window", 32)),
             smooth_len=int(best_params.get("smooth_len", 12)),
+
             atrPeriod=int(best_params["atrPeriod"]),
             slMultiplier=float(best_params["slMultiplier"]),
             tpMultiplier=float(best_params["tpMultiplier"]),
             trailMultiplier=float(best_params["trailMultiplier"]),
+
             initial_capital=INITIAL_CAPITAL,
             position_size_pct=POSITION_SIZE_PCT,
             commission_pct=COMMISSION_PCT,
             fill_mode=fill_mode,
         )
 
-        m = backtest_half_rsi_hr(data[tk], params, pf_cap=float(pf_cap))
-        r = float(m.get("total_return", 0.0))
-        pf = float(m.get("profit_factor", 0.0))
+        m = backtest_half_rsi_hr(data[tk], params, cost=float(cost))
+
+        pf_raw = float(m.get("profit_factor", 0.0))  # NOT capped
         gp = float(m.get("gross_profit", 0.0))
         gl = float(m.get("gross_loss", 0.0))
         nt = int(m.get("num_trades", 0))
+        r = float(m.get("total_return", 0.0))
+
+        tscore = ticker_score(pf_raw, nt)
 
         rows.append({
             "ticker": tk,
-            "profit_factor": pf,
+            "profit_factor": pf_raw,
             "num_trades": nt,
+            "ticker_score": float(tscore),
             "total_return": r,
             "gross_profit": gp,
             "gross_loss": gl,
             "final_equity": m["final_equity"],
-            "positive_return": 1 if r > 0.0 else 0,
             "sharpe": m["sharpe"],
             "maxdd": m["maxdd"],
         })
 
-        # Save trade list per ticker, WITH PF columns repeated (as you requested)
         tdf = pd.DataFrame(m["trades"])
         if len(tdf):
-            tdf["profit_factor"] = pf
+            tdf["profit_factor"] = pf_raw
             tdf["gross_profit"] = gp
             tdf["gross_loss"] = gl
+            tdf["num_trades_ticker"] = nt
+            tdf["cost"] = float(cost)
+            tdf["loss_floor"] = float(cost) * float(INITIAL_CAPITAL)
         tdf.to_csv(OUT_DIR / f"{tk}_trades_best.csv", index=False)
 
         if HAS_PLT:
             plt.figure(figsize=(10, 4))
             plt.plot(m["equity_curve"])
             plt.title(
-                f"{tk} Equity (Best) PF={pf:.3f} trades={nt} "
+                f"{tk} Equity (Best) PF={pf_raw:.3f} trades={nt} "
                 f"slowW={params.slow_window} sm={params.smooth_len} "
-                f"futureLen={params.futureLen} futureMulti={params.futureMulti:.3f} "
+                f"chLen={params.channelLength} chMul={params.channelMulti:.3f} "
                 f"atr={params.atrPeriod} sl={params.slMultiplier:.3f} tp={params.tpMultiplier:.3f} trail={params.trailMultiplier:.3f}"
             )
             plt.grid(True)
@@ -848,20 +878,24 @@ def run_optuna_optimization(
             plt.savefig(OUT_DIR / f"equity_{tk}_best.png")
             plt.close()
 
-    summary_df = pd.DataFrame(rows).sort_values("profit_factor", ascending=False)
+    summary_df = pd.DataFrame(rows).sort_values(["ticker_score", "profit_factor"], ascending=False)
     summary_df.to_csv(OUT_DIR / "optimization_summary_half_rsi_trend.csv", index=False)
 
     trials_df = study.trials_dataframe()
     trials_df.to_csv(OUT_DIR / "optuna_trials_half_rsi_trend.csv", index=False)
 
-    # Overall metrics on ALL files
-    avg_pf_all = float(summary_df["profit_factor"].mean()) if len(summary_df) else 0.0
-    pct_pos_all = float(summary_df["positive_return"].mean()) if len(summary_df) else 0.0
+    avg_pf_all = float(summary_df["profit_factor"].replace([np.inf, -np.inf], np.nan).fillna(pf_cap_score).mean()) if len(summary_df) else 0.0
     avg_trades_all = float(summary_df["num_trades"].mean()) if len(summary_df) else 0.0
+    overall_mean_ticker_score = float(summary_df["ticker_score"].mean()) if len(summary_df) else 0.0
+    num_neg_dd_all = int((summary_df["maxdd"] < 0.0).sum()) if len(summary_df) else 0
 
-    core_all = max(avg_pf_all, 0.0) * (pct_pos_all ** float(alpha))
-    trade_weight_all = sigmoid(float(beta) * (float(avg_trades_all) - float(center)))
-    score_all = core_all * trade_weight_all
+    score_all = overall_mean_ticker_score
+    if penalty and len(summary_df):
+        frac_neg_dd = float(num_neg_dd_all) / float(len(summary_df))
+        pen = 0.25 * frac_neg_dd
+        if float(summary_df["num_trades"].sum()) < max(1.0, float(len(summary_df))):
+            pen += 0.10
+        score_all = score_all - pen
 
     print("\n=== BEST PARAMS ===")
     for k, v in best_params.items():
@@ -869,24 +903,47 @@ def run_optuna_optimization(
             print(f"{k}: {v}")
 
     print("\n=== OVERALL (ALL FILES) METRICS (BEST PARAMS) ===")
-    print(f"Avg Profit Factor:    {avg_pf_all:.6f}  (pf_cap={pf_cap})")
-    print(f"Pct Positive Return:  {pct_pos_all:.4f}  ({int(summary_df['positive_return'].sum())}/{len(summary_df)})")
-    print(f"Avg Trades / Ticker:  {avg_trades_all:.3f}")
-    print(f"alpha:                {alpha:.3f}")
-    print(f"beta:                 {beta:.3f}")
-    print(f"center:               {center:.3f}")
-    print(f"Trade Weight(sig):    {trade_weight_all:.6f}")
-    print(f"Core (PF*pct^a):      {core_all:.6f}")
-    print(f"Score (overall):      {score_all:.6f}")
+    print(f"Avg Profit Factor (raw):      {avg_pf_all:.6f}")
+    print(f"Avg Trades / Ticker:          {avg_trades_all:.3f}")
+    print(f"Mean Ticker Score:            {overall_mean_ticker_score:.6f}")
+    print(f"Penalty enabled:              {bool(penalty)}")
+    print(f"num_neg_dd (maxdd<0):          {num_neg_dd_all}/{len(summary_df)}")
+    print(f"cost:                         {float(cost):.6f}")
+    print(f"loss_floor (cost*capital):    {float(cost)*float(INITIAL_CAPITAL):.2f}")
+    print(f"Score (overall):              {score_all:.6f}")
 
     print("\n=== PER-TICKER METRICS (BEST PARAMS) ===")
-    headers = ["ticker", "profit_factor", "num_trades", "total_return", "gross_profit", "gross_loss"]
-    print("{:<10s} {:>14s} {:>10s} {:>13s} {:>14s} {:>14s}".format(*headers))
-    for _, row in summary_df[headers].iterrows():
-        print("{:<10s} {:>14.4f} {:>10d} {:>13.4f} {:>14.2f} {:>14.2f}".format(
+
+    summary_df = summary_df.copy()
+
+    def ticker_score_for_row(pf_raw: float, nt: int) -> float:
+        if nt < int(min_trades):
+            return 0.0
+        pf_for_score = min(float(pf_raw), pf_cap_score) if math.isfinite(float(pf_raw)) else pf_cap_score
+        pf_norm = pf_for_score / pf_cap_score
+        pf_w = sigmoid(float(pf_beta) * (pf_for_score - float(pf_center)))
+        tr_w = sigmoid(float(beta) * (float(nt) - float(center)))
+        return float(pf_norm) * float(pf_w) * float(tr_w)
+
+    summary_df["ticker_score"] = [
+        ticker_score_for_row(pf, int(nt))
+        for pf, nt in zip(summary_df["profit_factor"].values, summary_df["num_trades"].values)
+    ]
+
+    summary_df_print = summary_df.sort_values(
+        by=["profit_factor", "total_return", "num_trades", "ticker_score"],
+        ascending=[False, False, False, False],
+    )
+
+    headers = ["ticker", "profit_factor", "num_trades", "ticker_score", "total_return", "gross_profit", "gross_loss"]
+    print("{:<10s} {:>14s} {:>14s} {:>10s} {:>13s} {:>14s} {:>14s}".format(*headers))
+
+    for _, row in summary_df_print[headers].iterrows():
+        print("{:<10s} {:>14.4f} {:>14d} {:>10.6f} {:>13.4f} {:>14.2f} {:>14.2f}".format(
             str(row["ticker"]),
             float(row["profit_factor"]),
             int(row["num_trades"]),
+            float(row["ticker_score"]),
             float(row["total_return"]),
             float(row["gross_profit"]),
             float(row["gross_loss"]),
@@ -912,27 +969,17 @@ if __name__ == "__main__":
     ap.add_argument("--files", type=int, default=200, help="Number of files to use per trial (subsample); if >= total -> use all")
     ap.add_argument("--fill", choices=["next_open", "same_close"], default="same_close", help="Execution model")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed for file subsampling")
-    ap.add_argument("--no-penalties", action="store_true", help="Disable trade/DD penalties")
-    ap.add_argument("--alpha", type=float, default=0.5, help="Exponent on pct_positive_return (default 0.5)")
+    ap.add_argument("--cost", type=float, default=0.006, help="Minimum gross-loss floor per (non-winning) trade = cost * INITIAL_CAPITAL")
 
-    ap.add_argument(
-        "--beta",
-        type=float,
-        default=1.0,
-        help="Sigmoid steepness for trade-weight: weight=sigmoid(beta*(avg_trades_per_ticker-center)) (default 1.0)",
-    )
-    ap.add_argument(
-        "--center",
-        type=float,
-        default=3.0,
-        help="Sigmoid center (trades/ticker at ~0.5 weight). (default 3.0)",
-    )
-    ap.add_argument(
-        "--pf-cap",
-        type=float,
-        default=30.0,
-        help="Cap per-ticker profit factor used in optimization and outputs (default 30)",
-    )
+    ap.add_argument("--penalty", action="store_true", help="Enable penalty term (default OFF). Uses num_neg_dd (maxdd<0)")
+
+    ap.add_argument("--min-trades", type=int, default=4, help="Per-ticker hard gate: trades<min_trades => weight=0 (default 4)")
+    ap.add_argument("--beta", type=float, default=1.0, help="Trade sigmoid steepness: sigmoid(beta*(trades-center)) (default 1.0)")
+    ap.add_argument("--center", type=float, default=3.0, help="Trade sigmoid center trades at ~0.5 weight (default 3.0)")
+
+    ap.add_argument("--pf-cap", type=float, default=30.0, help="PF cap used ONLY inside scoring (default 30)")
+    ap.add_argument("--pf-center", type=float, default=10.0, help="PF sigmoid center (default 10)")
+    ap.add_argument("--pf-beta", type=float, default=2.0, help="PF sigmoid steepness (default 2.0)")
 
     args = ap.parse_args()
 
@@ -941,9 +988,14 @@ if __name__ == "__main__":
         n_files=args.files,
         fill_mode=args.fill,
         seed=args.seed,
-        use_penalties=(not args.no_penalties),
-        alpha=args.alpha,
-        beta=args.beta,
-        center=args.center,
-        pf_cap=args.pf_cap,
+        cost=float(args.cost),
+        penalty=bool(args.penalty),
+
+        min_trades=int(args.min_trades),
+        beta=float(args.beta),
+        center=float(args.center),
+
+        pf_cap=float(args.pf_cap),
+        pf_center=float(args.pf_center),
+        pf_beta=float(args.pf_beta),
     )
