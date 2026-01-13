@@ -1,833 +1,591 @@
 #!/usr/bin/env python3
 """
-bayes_opt_dynamic_SR.py
+Optuna_opt_dynamic_SR.py  (PARQUET-ONLY)
 
-Goal: Match TradingView Pine strategy:
-"Dynamic_SR_a (HA signals, Real risk)"
+Features:
+- Parquet only (*.parquet)
+- Hard constraints:
+    1) tpMultiplier >= 1.0
+    2) slMultiplier > tpMultiplier
+- Robustness check in objective:
+    target = average score across fills: ["same_close", "next_open"]
+- --loss_floor (default 0.001) used in PF scoring:
+    effective_gl = max(gross_loss, loss_floor * gross_profit)  (if gross_profit>0)
 
-Rules (match Pine):
-- REAL OHLC is the input data (stable regardless of chart type)
-- Heikin Ashi is computed from REAL OHLC for SIGNALS (sigClose = haClose)
-- Risk management levels use REAL OHLC + REAL ATR (ta.atr = Wilder RMA of TR)
-- Trend/SR logic uses:
-    support_resistance updated using REAL high/low + REAL ATR
-    crossover/crossunder checks use sigClose vs support_resistance
-- Long-only (short side commented in Pine)
+Penalty (NON-BINARY / soft):
+- Keep --penalty, but don't zero-out negative-return tickers.
+- Instead multiply ticker score by:
+      ret_mult = sigmoid(penalty_ret_k * (total_return - penalty_ret_center))
+  Defaults:
+      penalty_ret_center = 0.0
+      penalty_ret_k      = 10.0
+  so slightly negative returns get down-weighted, not killed.
 
-Important Pine-specific details reproduced:
-- `support_resistance` initialization repeats until ATR is non-na (no fallback)
-- ta.crossover/ta.crossunder semantics are replicated with correct series indexing:
-  in Pine, y[i] is the value at the start of bar i (carried from bar i-1 updates).
-  We therefore use a “last / last_last” scheme for SR/TP/SL levels.
-- Exits in Pine check ta.crossunder(sigClose, take_profit_low / trail_stop_level)
-  (note: Pine uses sigClose here, not riskClose)
-
-Optimization:
-- Uses Optuna
-- Optimizes: atrPeriod, slMultiplier, tpMultiplier, trailMultiplier
-- Objective (Option A): maximize OVERALL Profit Factor across selected files:
-    PF_overall = (sum GrossProfit) / (sum GrossLoss)
-
-CLI:
-  --trials N         Optuna trials
-  --files N          Number of files to use per trial (subsample); if N >= total -> use all
-  --fill MODE        next_open or same_close
-  --seed SEED        RNG seed for file subsampling
-  --no-penalties     Disable trade/DD penalties (score = PF_overall only)
-  --pf-cap X         Cap PF_overall at X (default 10) to avoid infinite PF dominating
+Dependencies:
+  pip install optuna pandas numpy pyarrow
 """
 
-import os, json, math, time, random
-from dataclasses import dataclass
-from datetime import datetime
+import math
+import random
+import argparse
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import pandas as pd
 
-# Optional plotting for equity curves
-try:
-    import matplotlib.pyplot as plt
-    HAS_PLT = True
-except Exception:
-    HAS_PLT = False
-
-# ----------------- USER CONFIG -----------------
-DATA_DIR = Path("data")
-OUT_DIR  = Path("output")
-
-INITIAL_CAPITAL = 100000.0
-POSITION_SIZE_PCT = 0.10     # percent of equity per trade (TV default_qty_value=10)
-COMMISSION_PCT = 0.0006      # 0.06% (Pine: commission_value=0.06 with commission_type=strategy.commission.percent)
-# ------------------------------------------------
+import optuna
 
 
-# =========================
-# Helpers: Wilder RMA, ATR
-# =========================
+# =============================
+# Helpers
+# =============================
+def sigmoid(x: float) -> float:
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
 
-def rma_wilder(x: np.ndarray, length: int) -> np.ndarray:
-    """
-    TradingView ta.rma(): Wilder smoothing.
-    Seed = SMA(length) at index length-1.
-    alpha = 1/length.
-    """
-    n = len(x)
-    out = np.full(n, np.nan, dtype=np.float64)
-    if length <= 0 or n < length:
-        return out
 
-    s = np.sum(x[:length])
-    out[length - 1] = s / length
-    alpha = 1.0 / float(length)
-
-    for i in range(length, n):
-        out[i] = out[i - 1] + alpha * (x[i] - out[i - 1])
+def ensure_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    cols = {c.lower(): c for c in df.columns}
+    required = ["open", "high", "low", "close"]
+    missing = [r for r in required if r not in cols]
+    if missing:
+        raise ValueError(f"Parquet missing required columns: {missing}. Found: {list(df.columns)}")
+    out = df[[cols["open"], cols["high"], cols["low"], cols["close"]]].copy()
+    out.columns = ["open", "high", "low", "close"]
     return out
 
 
-def true_range(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
-    n = len(close)
-    tr = np.zeros(n, dtype=np.float64)
-    tr[0] = high[0] - low[0]
-    for i in range(1, n):
-        hl = high[i] - low[i]
-        hc = abs(high[i] - close[i - 1])
-        lc = abs(low[i] - close[i - 1])
-        tr[i] = max(hl, hc, lc)
-    return tr
-
-
-def atr_wilder(high: np.ndarray, low: np.ndarray, close: np.ndarray, length: int) -> np.ndarray:
-    """
-    Match Pine ta.atr(length): RMA of true range.
-    """
-    tr = true_range(high, low, close)
-    return rma_wilder(tr, length)
-
-
-# =========================
-# Heikin Ashi from REAL OHLC
-# =========================
-
 def heikin_ashi_from_real(
-    open_: np.ndarray, high: np.ndarray, low: np.ndarray, close: np.ndarray
+    o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Match Pine:
-    haClose = (realO+realH+realL+realC)/4
-    var haOpen = na
-    haOpen := na(haOpen[1]) ? (realO+realC)/2 : (haOpen[1]+haClose[1])/2
-    haHigh = max(realHigh, max(haOpen, haClose))
-    haLow  = min(realLow,  min(haOpen, haClose))
-    """
-    n = len(close)
-    ha_close = (open_ + high + low + close) / 4.0
-
-    ha_open = np.full(n, np.nan, dtype=np.float64)
-    ha_high = np.full(n, np.nan, dtype=np.float64)
-    ha_low  = np.full(n, np.nan, dtype=np.float64)
-
-    if n == 0:
-        return ha_open, ha_high, ha_low, ha_close
-
-    ha_open[0] = (open_[0] + close[0]) / 2.0
-    ha_high[0] = max(high[0], ha_open[0], ha_close[0])
-    ha_low[0]  = min(low[0],  ha_open[0], ha_close[0])
-
-    for i in range(1, n):
+    ha_close = (o + h + l + c) / 4.0
+    ha_open = np.empty_like(ha_close)
+    ha_open[0] = (o[0] + c[0]) / 2.0
+    for i in range(1, len(ha_close)):
         ha_open[i] = (ha_open[i - 1] + ha_close[i - 1]) / 2.0
-        ha_high[i] = max(high[i], ha_open[i], ha_close[i])
-        ha_low[i]  = min(low[i],  ha_open[i], ha_close[i])
-
+    ha_high = np.maximum.reduce([h, ha_open, ha_close])
+    ha_low = np.minimum.reduce([l, ha_open, ha_close])
     return ha_open, ha_high, ha_low, ha_close
 
 
-# =========================
-# Pine-like cross helpers
-# =========================
+def atr_wilder(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> np.ndarray:
+    n = len(close)
+    tr = np.empty(n, dtype=float)
+    tr[0] = high[0] - low[0]
+    prev_close = close[0]
+    for i in range(1, n):
+        tr[i] = max(high[i] - low[i], abs(high[i] - prev_close), abs(low[i] - prev_close))
+        prev_close = close[i]
 
-def crossover(cur_x: float, prev_x: float, cur_y: float, prev_y: float) -> bool:
-    # ta.crossover(x,y): x>y and x[1] <= y[1]
-    return (cur_x > cur_y) and (prev_x <= prev_y)
+    atr = np.full(n, np.nan, dtype=float)
+    if period <= 1:
+        atr[:] = tr
+        return atr
+    if n < period:
+        return atr
 
-def crossunder(cur_x: float, prev_x: float, cur_y: float, prev_y: float) -> bool:
-    # ta.crossunder(x,y): x<y and x[1] >= y[1]
-    return (cur_x < cur_y) and (prev_x >= prev_y)
+    atr[period - 1] = np.mean(tr[:period])
+    for i in range(period, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+    return atr
 
 
-# =========================
-# Backtest: Dynamic_SR_a (HA signals, Real risk)
-# =========================
+def crossover(a_prev: float, a_now: float, b_prev: float, b_now: float) -> bool:
+    return (a_prev <= b_prev) and (a_now > b_now)
 
+
+def crossunder(a_prev: float, a_now: float, b_prev: float, b_now: float) -> bool:
+    return (a_prev >= b_prev) and (a_now < b_now)
+
+
+# =============================
+# Backtest core (simplified Dynamic SR)
+# =============================
 @dataclass
-class DynamicSRParams:
-    ## for siglRisk
-    atrPeriod: int = 32
-    slMultiplier: float = 1.1470695356016665
-    tpMultiplier: float = 0.5287079013335907
-    trailMultiplier: float = 4.30682894724224
-    
-    ## for realRisk
-    # atrPeriod: int = 7
-    # slMultiplier: float = 3.777544365622622
-    # tpMultiplier: float = 0.5136309391531768
-    # trailMultiplier: float = 5.997662923939894
-
-    initial_capital: float = INITIAL_CAPITAL
-    position_size_pct: float = POSITION_SIZE_PCT
-    commission_pct: float = COMMISSION_PCT
-
-    # execution model: TradingView-style (signals on bar i, fill at next bar open)
-    fill_mode: str = "next_open"  # "next_open" or "same_close"
+class TradeStats:
+    gross_profit: float = 0.0
+    gross_loss: float = 0.0
+    num_trades: int = 0
+    total_return: float = 0.0
+    maxdd: float = 0.0
+    profit_factor: float = 0.0
 
 
-def backtest_dynamic_sr_ha_realrisk(df: pd.DataFrame, p: DynamicSRParams) -> Dict[str, Any]:
-    """
-    Matches Pine script logic:
-
-    - sigClose = HA close computed from REAL OHLC
-    - riskHigh/Low/Close = REAL high/low/close
-    - riskATR = ta.atr(atrPeriod) on REAL OHLC
-    - support_resistance initialized as:
-        if na(sr): isUp := false; sr := riskHigh + riskATR * trailMultiplier
-      (no fallback if ATR is na; repeats until ATR available)
-    - Trend logic:
-        if isUp:
-            if crossunder(sigClose, sr): sellSignal, isUp=false, sr := riskHigh + riskATR*trailMultiplier
-            else sr := max(sr, riskLow - riskATR*trailMultiplier)
-        else:
-            if crossover(sigClose, sr): buySignal, isUp=true, sr := riskLow - riskATR*trailMultiplier
-            else sr := min(sr, riskHigh + riskATR*trailMultiplier)
-
-    - Entry (long only) on buySignal when flat:
-        trail_stop_level := riskLow - riskATR*slMultiplier
-        take_profit_low  := riskHigh + riskATR*tpMultiplier
-    - Exit checks while long:
-        if sellSignal -> close
-        if crossunder(sigClose, take_profit_low) -> close
-        if crossunder(sigClose, trail_stop_level) -> close
-        take_profit_low := max(take_profit_low, riskLow - (riskATR*tpMultiplier))
-      (Note: Pine uses sigClose for the crossunder checks even though levels are REAL.)
-    """
-    df = df.copy().reset_index(drop=True)
-    df.columns = [c.lower() for c in df.columns]
-
-    for col in ["open", "high", "low", "close"]:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
-
-    o = df["open"].astype(float).to_numpy()
-    h = df["high"].astype(float).to_numpy()
-    l = df["low"].astype(float).to_numpy()
-    c = df["close"].astype(float).to_numpy()
+def backtest_dynamic_sr(
+    df: pd.DataFrame,
+    atrPeriod: int,
+    slMult: float,
+    tpMult: float,
+    srBandMult: float,
+    commission_per_side: float,
+    fill_mode: str,
+    use_trailing_exit: bool = True,
+    trail_mode: str = "trail_only",
+    close_on_sellSignal: bool = True,
+) -> TradeStats:
+    o = df["open"].to_numpy(dtype=float)
+    h = df["high"].to_numpy(dtype=float)
+    l = df["low"].to_numpy(dtype=float)
+    c = df["close"].to_numpy(dtype=float)
     n = len(df)
+    if n < max(atrPeriod + 2, 60):
+        return TradeStats()
 
-    if n < 5:
-        return {
-            "equity_curve": [p.initial_capital],
-            "trades": [],
-            "sharpe": 0.0,
-            "maxdd": 0.0,
-            "num_trades": 0,
-            "final_equity": p.initial_capital,
-            "gross_profit": 0.0,
-            "gross_loss": 0.0,
-            "profit_factor": 0.0,
-        }
+    _, ha_h, ha_l, ha_c = heikin_ashi_from_real(o, h, l, c)
+    real_atr = atr_wilder(h, l, c, atrPeriod)
 
-    # HA (signals side) computed from REAL OHLC
-    ha_o, ha_h, ha_l, ha_c = heikin_ashi_from_real(o, h, l, c)
+    valid_idx = np.where(~np.isnan(real_atr))[0]
+    if len(valid_idx) == 0:
+        return TradeStats()
+    start = int(valid_idx[0])
 
-    # REAL ATR (risk side) = Pine ta.atr()
-    # risk_atr = atr_wilder(h, l, c, int(p.atrPeriod))
-    risk_atr = atr_wilder(ha_h, ha_l, ha_c, int(p.atrPeriod))
-
-    # Signals use HA close
-    sigClose = ha_c
-
-    # Risk management uses REAL series
-    # riskHigh  = h
-    # riskLow   = l
-    # riskClose = c
-    # Risk management uses HA series
-    riskHigh  = ha_h
-    riskLow   = ha_l
-    riskClose = ha_c
-
-    # Pine: trail_offset = riskATR * tpMultiplier
-    trail_offset = risk_atr * float(p.tpMultiplier)
-
-    # --- Pine var state ---
-    isUp = True
-
-    # We must model Pine series behavior for var levels:
-    # At bar i start, support_resistance equals value after bar i-1 updates.
-    # Thus crossover/crossunder at bar i uses:
-    #   y[i]   = sr_last     (computed end of i-1)
-    #   y[i-1] = sr_last_last(computed end of i-2)
-    sr_last = np.nan
-    sr_last_last = np.nan
-
-    # Similarly for TP and SL levels (var float)
-    tp_last = np.nan
-    tp_last_last = np.nan
-
-    sl_last = np.nan
-    sl_last_last = np.nan
-
-    # Position state (long-only)
-    in_pos = False
-    pending_entry = False
-    entry_fill_idx = None
-    qty = 0.0
-
-    cash = float(p.initial_capital)
-    equity_curve = np.zeros(n, dtype=np.float64)
-    trades: List[Dict[str, Any]] = []
-
-    # For cross detection on x series (sigClose)
-    prev_sigClose = sigClose[0] if n > 0 else np.nan
-
-    for i in range(n):
-        # -------------------------
-        # Handle pending entry fill
-        # -------------------------
-        if p.fill_mode == "next_open":
-            if pending_entry and entry_fill_idx == i:
-                fill_price = o[i]
-
-                pos_value = cash * float(p.position_size_pct)
-                qty = pos_value / fill_price if fill_price > 0 else 0.0
-
-                commission = pos_value * float(p.commission_pct)
-                cash -= (pos_value + commission)
-                in_pos = True
-                pending_entry = False
-
-                trades[-1].update({
-                    "fill_idx": int(i),
-                    "fill_price": float(fill_price),
-                    "commission_entry": float(commission),
-                    "qty": float(qty),
-                })
-
-        # -------------------------
-        # Initialize SR like Pine:
-        # if na(support_resistance)
-        #   isUp := false
-        #   support_resistance := riskHigh + riskATR * trailMultiplier
-        # (no fallback when ATR is na; it stays na until ATR exists)
-        # -------------------------
-        if np.isnan(sr_last):
-            isUp = False
-            sr_last = riskHigh[i] + risk_atr[i] * float(p.trailMultiplier)  # may remain nan
-
-        # -------------------------
-        # Compute signals (Pine ta.crossover/ta.crossunder)
-        # Using correct series indexing for SR:
-        #   y[i]   -> sr_last
-        #   y[i-1] -> sr_last_last
-        # -------------------------
-        buySignal = False
-        sellSignal = False
-
-        if i > 0 and (not np.isnan(sr_last)) and (not np.isnan(sr_last_last)) \
-           and (not np.isnan(sigClose[i])) and (not np.isnan(prev_sigClose)):
-            if isUp:
-                if crossunder(sigClose[i], prev_sigClose, sr_last, sr_last_last):
-                    sellSignal = True
-                    isUp = False
-                    sr_new = riskHigh[i] + risk_atr[i] * float(p.trailMultiplier)
-                else:
-                    sr_new = max(sr_last, riskLow[i] - risk_atr[i] * float(p.trailMultiplier))
-            else:
-                if crossover(sigClose[i], prev_sigClose, sr_last, sr_last_last):
-                    buySignal = True
-                    isUp = True
-                    sr_new = riskLow[i] - risk_atr[i] * float(p.trailMultiplier)
-                else:
-                    sr_new = min(sr_last, riskHigh[i] + risk_atr[i] * float(p.trailMultiplier))
+    # Dynamic SR line
+    sr = np.full(n, np.nan, dtype=float)
+    sr[start] = ha_c[start]
+    for i in range(start + 1, n):
+        band = srBandMult * real_atr[i]
+        prev = sr[i - 1]
+        if ha_c[i] > prev:
+            sr[i] = max(prev, ha_l[i] + band)
+        elif ha_c[i] < prev:
+            sr[i] = min(prev, ha_h[i] - band)
         else:
-            sr_new = sr_last  # no update if insufficient history / nans
+            sr[i] = prev
 
-        # -------------------------
-        # Entry logic (long-only)
-        # if buySignal and flat:
-        #   trail_stop_level := riskLow - riskATR*slMultiplier
-        #   take_profit_low  := riskHigh + riskATR*tpMultiplier
-        # -------------------------
-        if buySignal and (not in_pos) and (not pending_entry):
-            sl_last = riskLow[i] - risk_atr[i] * float(p.slMultiplier)
-            tp_last = riskHigh[i] + risk_atr[i] * float(p.tpMultiplier)
+    def get_fill(i: int) -> Optional[float]:
+        if fill_mode == "same_close":
+            return float(c[i])
+        if fill_mode == "next_open":
+            if i + 1 < n:
+                return float(o[i + 1])
+            return None
+        return float(c[i])
 
-            trades.append({
-                "signal_idx": int(i),
-                "side": "LONG",
-                "signal_price": float(riskClose[i]),
-            })
+    in_pos = False
+    entry = 0.0
+    stop = 0.0
+    trail_stop = np.nan
 
-            if p.fill_mode == "same_close":
-                fill_price = riskClose[i]
-                pos_value = cash * float(p.position_size_pct)
-                qty = pos_value / fill_price if fill_price > 0 else 0.0
+    equity = 1.0
+    peak = 1.0
+    maxdd = 0.0
 
-                commission = pos_value * float(p.commission_pct)
-                cash -= (pos_value + commission)
-                in_pos = True
+    gp = 0.0
+    gl = 0.0
+    trades = 0
 
-                trades[-1].update({
-                    "fill_idx": int(i),
-                    "fill_price": float(fill_price),
-                    "commission_entry": float(commission),
-                    "qty": float(qty),
-                })
-            else:
-                if i + 1 < n:
-                    pending_entry = True
-                    entry_fill_idx = i + 1
-                else:
-                    trades[-1].update({"ignored": True})
-
-        # -------------------------
-        # Exit logic (match Pine):
-        # while long:
-        #   if sellSignal -> close
-        #   if crossunder(sigClose, tp_last) -> close
-        #   if crossunder(sigClose, sl_last) -> close
-        #
-        # NOTE: Pine uses sigClose for these crosses
-        # and uses series y indexing (y[i]=level at bar start).
-        # So we must use:
-        #   y[i]   -> tp_last / sl_last
-        #   y[i-1] -> tp_last_last / sl_last_last
-        # -------------------------
-        if in_pos:
-            exit_reason = None
-            do_exit = False
-
-            if sellSignal:
-                exit_reason = "sellSignal(HA)"
-                do_exit = True
-            else:
-                if i > 0 and (not np.isnan(tp_last)) and (not np.isnan(tp_last_last)) \
-                   and (not np.isnan(sigClose[i])) and (not np.isnan(prev_sigClose)):
-                    if crossunder(sigClose[i], prev_sigClose, tp_last, tp_last_last):
-                        exit_reason = "trailingTP(RealLevel_HAcross)"
-                        do_exit = True
-
-                if (not do_exit) and i > 0 and (not np.isnan(sl_last)) and (not np.isnan(sl_last_last)) \
-                   and (not np.isnan(sigClose[i])) and (not np.isnan(prev_sigClose)):
-                    if crossunder(sigClose[i], prev_sigClose, sl_last, sl_last_last):
-                        exit_reason = "hardSL(RealLevel_HAcross)"
-                        do_exit = True
-
-            if do_exit:
-                # Fill exit
-                if p.fill_mode == "next_open":
-                    if i + 1 < n:
-                        fill_price = o[i + 1]
-                        fill_idx = i + 1
-                    else:
-                        fill_price = riskClose[i]
-                        fill_idx = i
-                else:
-                    fill_price = riskClose[i]
-                    fill_idx = i
-
-                exit_value = qty * fill_price
-                commission = exit_value * float(p.commission_pct)
-                cash += (exit_value - commission)
-
-                trades[-1].update({
-                    "exit_idx": int(fill_idx),
-                    "exit_price": float(fill_price),
-                    "commission_exit": float(commission),
-                    "reason": exit_reason
-                })
-
-                qty = 0.0
-                in_pos = False
-                pending_entry = False
-                entry_fill_idx = None
-
-                # Pine cleanup when flat (later in script):
-                tp_last = np.nan
-                sl_last = np.nan
-
-            else:
-                # Trail TP using REAL low:
-                # take_profit_low := max(take_profit_low, riskLow - trail_offset)
-                if (not np.isnan(tp_last)) and (not np.isnan(trail_offset[i])):
-                    tp_last = max(tp_last, riskLow[i] - trail_offset[i])
-
-        # -------------------------
-        # Mark-to-market equity on REAL close (like typical backtests)
-        # -------------------------
-        mtm = qty * riskClose[i] if in_pos else 0.0
-        equity_curve[i] = cash + mtm
-
-        # -------------------------
-        # Shift series “history” for next bar:
-        # After bar i finishes, Pine y[i] becomes the value used as y at bar i+1 start.
-        # So:
-        #   sr_last_last <- sr_last
-        #   sr_last      <- sr_new
-        # and same for tp/sl.
-        # -------------------------
-        sr_last_last = sr_last
-        sr_last = sr_new
-
-        tp_last_last = tp_last
-        sl_last_last = sl_last
-
-        prev_sigClose = sigClose[i]
-
-    # If still open at end, close at last REAL close
-    if in_pos and qty > 0:
-        fill_price = riskClose[-1]
-        exit_value = qty * fill_price
-        commission = exit_value * float(p.commission_pct)
-        cash += (exit_value - commission)
-        trades[-1].update({
-            "exit_idx": int(n - 1),
-            "exit_price": float(fill_price),
-            "commission_exit": float(commission),
-            "reason": "endClose"
-        })
-        qty = 0.0
-        in_pos = False
-        equity_curve[-1] = cash
-
-    # Metrics: sharpe, maxdd
-    eq = equity_curve.copy()
-    if len(eq) < 2:
-        sharpe = 0.0
-        maxdd = 0.0
-    else:
-        rets = np.diff(eq) / np.maximum(eq[:-1], 1e-12)
-        sharpe = float((np.mean(rets) / (np.std(rets) + 1e-12)) * math.sqrt(252.0)) if len(rets) > 1 else 0.0
-        peak = np.maximum.accumulate(eq)
-        dd = (eq - peak) / np.maximum(peak, 1e-12)
-        maxdd = float(np.min(dd))  # negative
-
-    # Completed trades
-    completed = [t for t in trades if ("exit_price" in t and "fill_price" in t and not t.get("ignored", False))]
-    num_trades = len(completed)
-
-    # Gross profit/loss (net of commissions)
-    gross_profit = 0.0
-    gross_loss = 0.0
-    for t in completed:
-        if "qty" not in t:
+    for i in range(start + 1, n):
+        if np.isnan(sr[i - 1]) or np.isnan(sr[i]):
             continue
-        q = float(t["qty"])
-        entry = float(t["fill_price"])
-        exitp = float(t["exit_price"])
-        entry_comm = float(t.get("commission_entry", 0.0))
-        exit_comm  = float(t.get("commission_exit", 0.0))
-        pnl = (exitp - entry) * q - entry_comm - exit_comm
-        if pnl > 0:
-            gross_profit += pnl
-        elif pnl < 0:
-            gross_loss += -pnl
 
-    # Profit factor
-    if gross_loss > 0:
-        profit_factor = gross_profit / gross_loss
-    else:
-        profit_factor = 10.0 if gross_profit > 0 else 0.0
+        buy_sig = crossover(ha_c[i - 1], ha_c[i], sr[i - 1], sr[i])
+        sell_sig = crossunder(ha_c[i - 1], ha_c[i], sr[i - 1], sr[i])
 
-    return {
-        "final_equity": float(eq[-1]),
-        "total_return": float(eq[-1] / p.initial_capital - 1.0),
-        "sharpe": float(sharpe),
-        "maxdd": float(maxdd),
-        "num_trades": int(num_trades),
-        "trades": trades,
-        "equity_curve": eq.tolist(),
-        "gross_profit": float(gross_profit),
-        "gross_loss": float(gross_loss),
-        "profit_factor": float(profit_factor),
-    }
+        # update trailing stop
+        if in_pos and use_trailing_exit and not np.isnan(real_atr[i]):
+            candidate = c[i] - real_atr[i] * tpMult
+            trail_stop = candidate if np.isnan(trail_stop) else max(trail_stop, candidate)
 
+        # entry
+        if (not in_pos) and buy_sig:
+            fill = get_fill(i)
+            if fill is None:
+                continue
+            in_pos = True
+            entry = fill
+            trades += 1
 
-# =========================
-# Optimization (Optuna)
-# =========================
+            equity *= (1.0 - commission_per_side)
 
-def ensure_dirs():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+            stop = entry - real_atr[i] * slMult if not np.isnan(real_atr[i]) else entry * 0.9
+            trail_stop = np.nan
 
-def load_files() -> Dict[str, pd.DataFrame]:
-    """
-    Loads all .csv and .parquet in DATA_DIR.
-    Keys are stem uppercased (e.g., NVDA from NVDA.parquet).
-    """
-    files = list(DATA_DIR.glob("*.parquet")) + list(DATA_DIR.glob("*.csv"))
-    files.sort()
-    data: Dict[str, pd.DataFrame] = {}
-    for fp in files:
-        try:
-            if fp.suffix.lower() == ".parquet":
-                df = pd.read_parquet(fp)
-            else:
-                df = pd.read_csv(fp)
-            data[fp.stem.upper()] = df
-        except Exception as e:
-            print(f"Failed to load {fp.name}: {e}")
-    return data
+        # exits
+        if in_pos:
+            exit_now = False
+            exit_price = None
 
+            # stop hit (conservative)
+            if l[i] <= stop:
+                exit_now = True
+                exit_price = stop
 
-def run_optuna_optimization(
-    n_trials: int = 200,
-    n_files: int = 200,
-    fill_mode: str = "next_open",
-    study_name: Optional[str] = None,
-    seed: int = 42,
-    use_penalties: bool = True,
-    pf_cap: float = 10.0,
-) -> Tuple[Dict[str, Any], pd.DataFrame]:
-    ensure_dirs()
-    data = load_files()
-    if not data:
-        raise SystemExit(f"No .csv/.parquet found in {DATA_DIR}. Put files there and re-run.")
+            # trailing stop
+            if (not exit_now) and use_trailing_exit and (not np.isnan(trail_stop)):
+                if l[i] <= trail_stop:
+                    exit_now = True
+                    exit_price = trail_stop
 
-    tickers_all = list(data.keys())
-    tickers_all.sort()
+            # close on sell signal
+            if (not exit_now) and close_on_sellSignal and sell_sig:
+                fill = get_fill(i)
+                if fill is not None:
+                    exit_now = True
+                    exit_price = fill
 
-    try:
-        import optuna
-        from optuna.samplers import TPESampler
-        from optuna.pruners import MedianPruner
-    except Exception as e:
-        raise SystemExit("Optuna not installed. pip install optuna") from e
+            if exit_now and exit_price is not None:
+                equity *= (1.0 - commission_per_side)
+                pnl = (exit_price - entry) / entry
+                equity *= (1.0 + pnl)
 
-    if study_name is None:
-        study_name = f"dynamic_sr_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                if pnl >= 0:
+                    gp += pnl
+                else:
+                    gl += abs(pnl)
 
-    storage_path = OUT_DIR / f"{study_name}.db"
-    storage_url = f"sqlite:///{storage_path}"
+                in_pos = False
+                entry = 0.0
+                stop = 0.0
+                trail_stop = np.nan
 
-    sampler = TPESampler(seed=seed, n_startup_trials=30, multivariate=True)
-    pruner = MedianPruner(n_startup_trials=20, n_warmup_steps=10)
+        if equity > peak:
+            peak = equity
+        dd = (equity / peak) - 1.0
+        if dd < maxdd:
+            maxdd = dd
 
-    study = optuna.create_study(
-        study_name=study_name,
-        storage=storage_url,
-        sampler=sampler,
-        pruner=pruner,
-        direction="maximize",
-        load_if_exists=True,
+    if in_pos:
+        equity *= (1.0 - commission_per_side)
+        pnl = (float(c[-1]) - entry) / entry
+        equity *= (1.0 + pnl)
+        if pnl >= 0:
+            gp += pnl
+        else:
+            gl += abs(pnl)
+
+    pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
+
+    return TradeStats(
+        gross_profit=gp,
+        gross_loss=gl,
+        num_trades=trades,
+        total_return=equity - 1.0,
+        maxdd=maxdd,
+        profit_factor=pf,
     )
 
-    rng = random.Random(seed)
 
-    def choose_tickers_for_trial() -> List[str]:
-        if n_files is None or n_files <= 0 or n_files >= len(tickers_all):
-            return tickers_all
-        return rng.sample(tickers_all, k=n_files)
+# =============================
+# Scoring + evaluation
+# =============================
+def score_from_stats(
+    st: TradeStats,
+    *,
+    min_trades: int,
+    pf_baseline: float,
+    pf_k: float,
+    trades_baseline: float,
+    trades_k: float,
+    weight_pf: float,
+    score_power: float,
+    pf_cap_score_only: float,
+    penalty_enabled: bool,
+    loss_floor: float,
+    penalty_ret_center: float,
+    penalty_ret_k: float,
+) -> float:
+    if st.num_trades < min_trades:
+        return 0.0
 
-    def opt_fn(trial):
-        # Keep optimization scope exactly as your header described
-        atrP = trial.suggest_int("atrPeriod", 5, 60)
-        slM  = trial.suggest_float("slMultiplier", 0.5, 10.0)
-        tpM  = trial.suggest_float("tpMultiplier", 0.5, 12.0)
-        trM  = trial.suggest_float("trailMultiplier", 0.5, 10.0)
+    gp = max(st.gross_profit, 0.0)
+    gl = max(st.gross_loss, 0.0)
 
-        tickers = choose_tickers_for_trial()
+    # loss-floor PF for scoring
+    if gp > 0:
+        effective_gl = max(gl, loss_floor * gp)
+    else:
+        effective_gl = max(gl, loss_floor)
 
-        total_gp = 0.0
-        total_gl = 0.0
-        agg_trades = 0
-        agg_dd = 0.0
+    pf_eff = (gp / effective_gl) if effective_gl > 0 else 0.0
+    pf_eff = min(pf_eff, pf_cap_score_only)
 
-        for tk in tickers:
-            params = DynamicSRParams(
-                atrPeriod=int(atrP),
-                slMultiplier=float(slM),
-                tpMultiplier=float(tpM),
-                trailMultiplier=float(trM),
-                initial_capital=INITIAL_CAPITAL,
-                position_size_pct=POSITION_SIZE_PCT,
-                commission_pct=COMMISSION_PCT,
-                fill_mode=fill_mode,
-            )
-            m = backtest_dynamic_sr_ha_realrisk(data[tk], params)
+    pf_w = sigmoid(pf_k * (pf_eff - pf_baseline))
+    tr_w = sigmoid(trades_k * (st.num_trades - trades_baseline))
 
-            total_gp += float(m.get("gross_profit", 0.0))
-            total_gl += float(m.get("gross_loss", 0.0))
-            agg_trades += int(m.get("num_trades", 0))
-            agg_dd += abs(float(m.get("maxdd", 0.0)))
+    s = weight_pf * pf_w + (1.0 - weight_pf) * tr_w
+    if score_power != 1.0:
+        s = s ** score_power
 
-        # OVERALL PF (Option A): pool profits & losses
-        if total_gl > 0:
-            pf_overall = total_gp / total_gl
-        else:
-            pf_overall = 10.0 if total_gp > 0 else 0.0
+    # ✅ soft (non-binary) penalty on negative returns
+    if penalty_enabled:
+        ret_mult = sigmoid(penalty_ret_k * (st.total_return - penalty_ret_center))
+        s *= ret_mult
 
-        pf_overall = float(min(pf_overall, float(pf_cap)))
+    return float(s)
 
-        score = pf_overall
-        penalty = 0.0
-        if use_penalties:
-            if agg_trades < 3:
-                penalty += 3.0
-            elif agg_trades < 10:
-                penalty += 1.0
-            score = pf_overall - (agg_dd * 0.25) - penalty
 
-        trial.set_user_attr("pf_overall", float(pf_overall))
-        trial.set_user_attr("total_gross_profit", float(total_gp))
-        trial.set_user_attr("total_gross_loss", float(total_gl))
-        trial.set_user_attr("total_trades", int(agg_trades))
-        trial.set_user_attr("sum_abs_maxdd", float(agg_dd))
-        trial.set_user_attr("penalty", float(penalty))
-        trial.set_user_attr("n_files_used", int(len(tickers)))
+def evaluate_params_on_files(
+    file_paths: List[Path],
+    *,
+    atrPeriod: int,
+    slMultiplier: float,
+    tpMultiplier: float,
+    srBandMultiplier: float,
+    commission_rate_per_side: float,
+    fill_mode: str,
+    use_trailing_exit: bool,
+    trail_mode: str,
+    close_on_sellSignal: bool,
+    # scoring opts
+    min_trades: int,
+    pf_baseline: float,
+    pf_k: float,
+    trades_baseline: float,
+    trades_k: float,
+    weight_pf: float,
+    score_power: float,
+    pf_cap_score_only: float,
+    penalty_enabled: bool,
+    loss_floor: float,
+    penalty_ret_center: float,
+    penalty_ret_k: float,
+) -> Tuple[float, Dict[str, Any], List[Dict[str, Any]], float, float]:
+    per: List[Dict[str, Any]] = []
+    scores: List[float] = []
+    num_neg = 0
 
-        return float(score)
+    for p in file_paths:
+        df = pd.read_parquet(p)  # PARQUET ONLY
+        df = ensure_ohlc(df)
 
-    study.optimize(opt_fn, n_trials=n_trials, n_jobs=1, show_progress_bar=True, gc_after_trial=True)
-
-    best_params = dict(study.best_params)
-    best_params["best_score"] = float(study.best_value)
-    best_params["fill_mode"] = fill_mode
-    best_params["timestamp"] = time.time()
-    best_params["score_is_pf_overall_optionA"] = True
-    best_params["pf_cap"] = float(pf_cap)
-    best_params["use_penalties"] = bool(use_penalties)
-
-    with open(OUT_DIR / "best_params_dynamic_sr.json", "w") as f:
-        json.dump(best_params, f, indent=2)
-
-    rows = []
-    for tk in tickers_all:
-        params = DynamicSRParams(
-            atrPeriod=int(best_params["atrPeriod"]),
-            slMultiplier=float(best_params["slMultiplier"]),
-            tpMultiplier=float(best_params["tpMultiplier"]),
-            trailMultiplier=float(best_params["trailMultiplier"]),
-            initial_capital=INITIAL_CAPITAL,
-            position_size_pct=POSITION_SIZE_PCT,
-            commission_pct=COMMISSION_PCT,
+        st = backtest_dynamic_sr(
+            df,
+            atrPeriod=atrPeriod,
+            slMult=slMultiplier,
+            tpMult=tpMultiplier,
+            srBandMult=srBandMultiplier,
+            commission_per_side=commission_rate_per_side,
             fill_mode=fill_mode,
+            use_trailing_exit=use_trailing_exit,
+            trail_mode=trail_mode,
+            close_on_sellSignal=close_on_sellSignal,
         )
-        m = backtest_dynamic_sr_ha_realrisk(data[tk], params)
-        rows.append({
-            "ticker": tk,
-            "final_equity": m["final_equity"],
-            "total_return": m["total_return"],
-            "sharpe": m["sharpe"],
-            "maxdd": m["maxdd"],
-            "num_trades": m["num_trades"],
-            "gross_profit": m["gross_profit"],
-            "gross_loss": m["gross_loss"],
-            "profit_factor": m["profit_factor"],
+
+        sc = score_from_stats(
+            st,
+            min_trades=min_trades,
+            pf_baseline=pf_baseline,
+            pf_k=pf_k,
+            trades_baseline=trades_baseline,
+            trades_k=trades_k,
+            weight_pf=weight_pf,
+            score_power=score_power,
+            pf_cap_score_only=pf_cap_score_only,
+            penalty_enabled=penalty_enabled,
+            loss_floor=loss_floor,
+            penalty_ret_center=penalty_ret_center,
+            penalty_ret_k=penalty_ret_k,
+        )
+
+        if st.total_return <= 0:
+            num_neg += 1
+
+        per.append({
+            "ticker": p.stem,
+            "profit_factor": st.profit_factor,
+            "num_trades": st.num_trades,
+            "ticker_score": sc,
+            "total_return": st.total_return,
+            "gross_profit": st.gross_profit,
+            "gross_loss": st.gross_loss,
         })
+        scores.append(sc)
 
-        pd.DataFrame(m["trades"]).to_csv(OUT_DIR / f"{tk}_trades_best.csv", index=False)
+    mean_score = float(np.mean(scores)) if scores else 0.0
+    pf_vals = [x["profit_factor"] for x in per if np.isfinite(x["profit_factor"])]
+    pf_avg = float(np.mean(pf_vals)) if pf_vals else float("inf")
+    trades_avg = float(np.mean([x["num_trades"] for x in per])) if per else 0.0
 
-        if HAS_PLT:
-            plt.figure(figsize=(10, 4))
-            plt.plot(m["equity_curve"])
-            plt.title(
-                f"{tk} Equity (Best)  atr={params.atrPeriod} sl={params.slMultiplier:.3f} "
-                f"tp={params.tpMultiplier:.3f} trail={params.trailMultiplier:.3f}"
+    overall = {
+        "mean_ticker_score": mean_score,
+        "avg_pf_raw": pf_avg,
+        "avg_trades": trades_avg,
+        "num_neg": f"{num_neg}/{len(per)}" if per else "0/0",
+    }
+    return mean_score, overall, per, pf_avg, trades_avg
+
+
+# =============================
+# CLI + Main
+# =============================
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", type=str, default="data", help="Folder containing per-ticker .parquet files.")
+    ap.add_argument("--output_dir", type=str, default="output")
+
+    ap.add_argument("--files", type=int, default=200, help="Max number of parquet files to use (random subset if more).")
+    ap.add_argument("--trials", type=int, default=2000, help="Optuna trials.")
+    ap.add_argument("--seed", type=int, default=7)
+
+    ap.add_argument("--commission_rate_per_side", type=float, default=0.0006)
+
+    # scoring knobs
+    ap.add_argument("--pf-cap", type=float, default=30.0, dest="pf_cap_score_only")
+    ap.add_argument("--pf-baseline", type=float, default=1.8)
+    ap.add_argument("--pf-k", type=float, default=1.5)
+    ap.add_argument("--trades-baseline", type=float, default=8.0)
+    ap.add_argument("--trades-k", type=float, default=5.0)
+    ap.add_argument("--weight-pf", type=float, default=0.9)
+    ap.add_argument("--score-power", type=float, default=1.0)
+    ap.add_argument("--min-trades", type=int, default=8)
+    ap.add_argument("--penalty", action="store_true")
+    ap.add_argument("--loss_floor", type=float, default=0.001)
+
+    # ✅ soft penalty knobs
+    ap.add_argument("--penalty-ret-center", type=float, default=0.0,
+                    help="Soft penalty center for total_return. 0.0 means break-even.")
+    ap.add_argument("--penalty-ret-k", type=float, default=10.0,
+                    help="Soft penalty steepness. Higher = harsher penalty against negative returns.")
+
+    ap.add_argument("--fill", type=str, default="same_close", choices=["same_close", "next_open"],
+                    help="Fill mode used for final reporting; objective uses robustness avg across both.")
+
+    # exits
+    ap.add_argument("--use_trailing_exit", type=bool, default=True)
+    ap.add_argument("--trail_mode", type=str, default="trail_only", choices=["trail_only"])
+    ap.add_argument("--close_on_sellSignal", type=bool, default=True)
+
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    data_dir = Path(args.data_dir)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    all_files = sorted(data_dir.glob("*.parquet"))  # PARQUET ONLY
+    if not all_files:
+        raise SystemExit(f"No .parquet files found in {data_dir.resolve()}")
+
+    if len(all_files) > args.files:
+        file_paths = random.sample(all_files, args.files)
+    else:
+        file_paths = all_files
+
+    ROBUST_FILLS = ["same_close", "next_open"]
+
+    def objective(trial: optuna.Trial) -> float:
+        atrPeriod = trial.suggest_int("atrPeriod", 10, 100)
+        slMultiplier = trial.suggest_float("slMultiplier", 1.5, 12.0)
+        tpMultiplier = trial.suggest_float("tpMultiplier", 1.0, 8.0)  # constraint #1
+        srBandMultiplier = trial.suggest_float("srBandMultiplier", 0.4, 3.0)
+
+        # constraint #2: enforce SL > TP
+        if slMultiplier <= tpMultiplier:
+            raise optuna.TrialPruned()
+    
+        scores = []
+        for fm in ROBUST_FILLS:
+            s, _, _, _, _ = evaluate_params_on_files(
+                file_paths,
+                atrPeriod=atrPeriod,
+                slMultiplier=slMultiplier,
+                tpMultiplier=tpMultiplier,
+                srBandMultiplier=srBandMultiplier,
+                commission_rate_per_side=args.commission_rate_per_side,
+                fill_mode=fm,
+                use_trailing_exit=args.use_trailing_exit,
+                trail_mode=args.trail_mode,
+                close_on_sellSignal=args.close_on_sellSignal,
+                min_trades=args.min_trades,
+                pf_baseline=args.pf_baseline,
+                pf_k=args.pf_k,
+                trades_baseline=args.trades_baseline,
+                trades_k=args.trades_k,
+                weight_pf=args.weight_pf,
+                score_power=args.score_power,
+                pf_cap_score_only=args.pf_cap_score_only,
+                penalty_enabled=args.penalty,
+                loss_floor=args.loss_floor,
+                penalty_ret_center=args.penalty_ret_center,
+                penalty_ret_k=args.penalty_ret_k,
             )
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(OUT_DIR / f"equity_{tk}_best.png")
-            plt.close()
+            scores.append(s)
 
-    summary_df = pd.DataFrame(rows).sort_values("profit_factor", ascending=False)
-    summary_df.to_csv(OUT_DIR / "optimization_summary_dynamic_sr.csv", index=False)
+        return float(np.mean(scores)) if scores else -1e9
 
-    trials_df = study.trials_dataframe()
-    trials_df.to_csv(OUT_DIR / "optuna_trials_dynamic_sr.csv", index=False)
+    sampler = optuna.samplers.TPESampler(seed=args.seed)
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+    study.optimize(objective, n_trials=args.trials, show_progress_bar=True)
 
-    if HAS_PLT:
-        plt.figure(figsize=(10, 6))
-        for tk in tickers_all:
-            params = DynamicSRParams(
-                atrPeriod=int(best_params["atrPeriod"]),
-                slMultiplier=float(best_params["slMultiplier"]),
-                tpMultiplier=float(best_params["tpMultiplier"]),
-                trailMultiplier=float(best_params["trailMultiplier"]),
-                initial_capital=INITIAL_CAPITAL,
-                position_size_pct=POSITION_SIZE_PCT,
-                commission_pct=COMMISSION_PCT,
-                fill_mode=fill_mode,
-            )
-            m = backtest_dynamic_sr_ha_realrisk(data[tk], params)
-            plt.plot(m["equity_curve"], label=tk)
-        plt.legend()
-        plt.title("Equity Curves - Best Params (Dynamic_SR_a HA signals / Real risk)")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(OUT_DIR / "equity_all_best_dynamic_sr.png")
-        plt.close()
+    best = study.best_trial
+    best_params = best.params
+    best_params["atrPeriod"] = int(best_params["atrPeriod"])
+    best_params["slMultiplier"] = float(best_params["slMultiplier"])
+    best_params["tpMultiplier"] = float(best_params["tpMultiplier"])
+    best_params["srBandMultiplier"] = float(best_params["srBandMultiplier"])
 
-    total_gp = 0.0
-    total_gl = 0.0
-    total_trades = 0
-    for tk in tickers_all:
-        params = DynamicSRParams(
-            atrPeriod=int(best_params["atrPeriod"]),
-            slMultiplier=float(best_params["slMultiplier"]),
-            tpMultiplier=float(best_params["tpMultiplier"]),
-            trailMultiplier=float(best_params["trailMultiplier"]),
-            initial_capital=INITIAL_CAPITAL,
-            position_size_pct=POSITION_SIZE_PCT,
-            commission_pct=COMMISSION_PCT,
-            fill_mode=fill_mode,
-        )
-        m = backtest_dynamic_sr_ha_realrisk(data[tk], params)
-        total_gp += float(m.get("gross_profit", 0.0))
-        total_gl += float(m.get("gross_loss", 0.0))
-        total_trades += int(m.get("num_trades", 0))
+    # Final reporting on chosen fill
+    best_score_single, overall, per, pf_avg, trades_avg = evaluate_params_on_files(
+        file_paths,
+        atrPeriod=best_params["atrPeriod"],
+        slMultiplier=best_params["slMultiplier"],
+        tpMultiplier=best_params["tpMultiplier"],
+        srBandMultiplier=best_params["srBandMultiplier"],
+        commission_rate_per_side=args.commission_rate_per_side,
+        fill_mode=args.fill,
+        use_trailing_exit=args.use_trailing_exit,
+        trail_mode=args.trail_mode,
+        close_on_sellSignal=args.close_on_sellSignal,
+        min_trades=args.min_trades,
+        pf_baseline=args.pf_baseline,
+        pf_k=args.pf_k,
+        trades_baseline=args.trades_baseline,
+        trades_k=args.trades_k,
+        weight_pf=args.weight_pf,
+        score_power=args.score_power,
+        pf_cap_score_only=args.pf_cap_score_only,
+        penalty_enabled=args.penalty,
+        loss_floor=args.loss_floor,
+        penalty_ret_center=args.penalty_ret_center,
+        penalty_ret_k=args.penalty_ret_k,
+    )
 
-    pf_all = (total_gp / total_gl) if total_gl > 0 else (10.0 if total_gp > 0 else 0.0)
-    pf_all = float(min(pf_all, float(pf_cap)))
+    per_df = pd.DataFrame(per).sort_values(
+        ["profit_factor", "total_return", "ticker_score", "num_trades"],
+        ascending=False
+    )
+    per_csv = out_dir / "per_ticker_summary.csv"
+    per_df.to_csv(per_csv, index=False)
+
+    print("\n=== OVERALL (ALL FILES) METRICS (BEST PARAMS) ===")
+    print(f"Avg Profit Factor (raw):      {overall['avg_pf_raw'] if np.isfinite(overall['avg_pf_raw']) else float('inf')}")
+    print(f"Avg Trades / Ticker:          {overall['avg_trades']:.3f}")
+    print(f"Mean Ticker Score:            {overall['mean_ticker_score']:.6f}")
+    print(f"Penalty enabled:              {args.penalty} (soft)")
+    print(f"Soft penalty center/k:        {args.penalty_ret_center} / {args.penalty_ret_k}")
+    print(f"num_neg (return<=0):          {overall['num_neg']}")
+    print(f"commission_rate_per_side:     {args.commission_rate_per_side:.6f}")
+    print(f"PF ROC baseline/k:            {args.pf_baseline:.3f} / {args.pf_k:.3f}")
+    print(f"Trades ROC baseline/k:        {args.trades_baseline:.3f} / {args.trades_k:.3f}")
+    print(f"weight_pf:                    {args.weight_pf:.3f}")
+    print(f"score_power:                  {args.score_power:.3f}")
+    print(f"min_trades gate:              {args.min_trades}")
+    print(f"loss_floor (scoring):         {args.loss_floor}")
+    print(f"Score (single fill '{args.fill}'): {best_score_single:.6f}")
 
     print("\n=== BEST PARAMS ===")
-    for k, v in best_params.items():
-        if k not in ("timestamp",):
-            print(f"{k}: {v}")
+    print(f"atrPeriod: {best_params['atrPeriod']}")
+    print(f"slMultiplier: {best_params['slMultiplier']}")
+    print(f"tpMultiplier: {best_params['tpMultiplier']}")
+    print(f"srBandMultiplier: {best_params['srBandMultiplier']}")
+    print(f"best_score (ROBUST avg fills): {best.value}")
+    print(f"fill_mode (report): {args.fill}")
+    print(f"pf_cap_score_only: {args.pf_cap_score_only}")
+    print(f"Saved per-ticker CSV to: {per_csv}")
 
-    print("\n=== OVERALL (ALL FILES) PROFIT FACTOR ===")
-    print(f"Gross Profit: {total_gp:,.2f}")
-    print(f"Gross Loss:   {total_gl:,.2f}")
-    print(f"PF Overall:   {pf_all:.4f}")
-    print(f"Total Trades: {total_trades}")
+    print("\n=== INDIVIDUAL (TICKER) METRICS (w/ BEST PARAMS) ===")
+    print(per_df[["ticker", "profit_factor", "num_trades", "ticker_score", "total_return", "gross_profit", "gross_loss"]].to_string(index=False))
 
-    print("\nSaved outputs to:", str(OUT_DIR))
-    print(summary_df.to_string(index=False))
-    return best_params, summary_df
-
-
-# =========================
-# CLI
-# =========================
 
 if __name__ == "__main__":
-    import argparse
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--trials", type=int, default=200, help="Optuna trials")
-    ap.add_argument("--files", type=int, default=200, help="Number of files to use per trial (subsample); if >= total -> use all")
-    ap.add_argument("--fill", choices=["next_open", "same_close"], default="same_close", help="Execution model")
-    ap.add_argument("--seed", type=int, default=42, help="RNG seed for file subsampling")
-    ap.add_argument("--no-penalties", action="store_true", help="Disable trade/DD penalties (score = PF_overall only)")
-    ap.add_argument("--pf-cap", type=float, default=10.0, help="Cap PF_overall at this value (default 10.0)")
-    args = ap.parse_args()
-
-    run_optuna_optimization(
-        n_trials=args.trials,
-        n_files=args.files,
-        fill_mode=args.fill,
-        seed=args.seed,
-        use_penalties=(not args.no_penalties),
-        pf_cap=args.pf_cap,
-    )
+    main()

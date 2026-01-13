@@ -21,7 +21,8 @@ What this version matches from the Pine you pasted (the merged-channel version):
     channelLength, channelMulti (channelMulti computed for parity; not required for trend decision)
     midChannel = sma(sigHL2, channelLength)
     uptrend    = sigClose > midChannel
-    above_lowerTF uses lowerTF_Length = max(1, channelLength//2), midChannel_lowerTF = sma(sigHL2, lowerTF_Length)
+    above_lowerTF uses lowerTF_Length = max(1, channelLength//2),
+      midChannel_lowerTF = sma(sigHL2, lowerTF_Length)
 - Minimal "future trend filter" is merged into same channel midline:
     futureOK = sigClose > midChannel
   (i.e., no futureLen/futureMulti)
@@ -33,9 +34,24 @@ Risk control (SL/TP/Trailing) matches Pine logic:
 - Stop breach by REAL low vs trail_stop_level
 - Trailing stop only ratchets upward
 
-Other features unchanged:
-- PF objective + per-ticker sigmoid weights + optional penalty
-- COST FLOOR for gross loss on losing trades
+Optimization objective (per-ticker SIGMOID weighting; then mean across tickers):
+- For each ticker:
+    if trades < min_trades: score_ticker = 0
+    else:
+      pf_for_score = min(PF_raw, pf_cap)   (pf_cap is used ONLY inside scoring)
+      pf_w         = sigmoid(pf_beta * (pf_for_score - pf_center))
+      tr_w         = sigmoid(beta    * (trades      - center))
+      score_ticker = pf_w * tr_w
+- Overall trial score = mean(score_ticker over tickers)
+Notes:
+- PF_raw is computed from realized trade PnL NET of commissions.
+- pf_cap is NOT applied to stored/printed PF values; it is used only inside scoring.
+
+Other features:
+- Optional penalty term (if enabled) based on fraction of tickers with maxdd < 0 and very-low trade counts
+- COST FLOOR for gross loss on losing trades when computing PF_raw:
+    loss_floor = cost * INITIAL_CAPITAL
+    for each non-winning trade: gross_loss += max(-pnl, loss_floor)
 - fill_mode: "same_close" or "next_open"
 """
 
@@ -61,7 +77,7 @@ OUT_DIR  = Path("output")
 
 INITIAL_CAPITAL = 100000.0
 POSITION_SIZE_PCT = 0.10
-COMMISSION_PCT = 0.0006  # 0.06%
+COMMISSION_PCT = 0.006  # 0.6% of INITIAL_CAPITAL per completed trade (round-trip)
 # ------------------------------------------------
 
 
@@ -221,48 +237,53 @@ def profit_factor_from_trades(
     trades: List[Dict[str, Any]],
     cost: float,
     total_capital: float,
+    commission_pct: float,     # <-- round-trip fraction of capital
 ) -> Tuple[float, float, float]:
     """
-    Uses realized trade PnL NET commissions.
-    pnl = qty*(exit - entry) - commission_entry - commission_exit
+    PF uses:
+      • price PnL
+      • cost floor on losing trades
+      • + fixed round-trip commission added to GROSS LOSS for every completed trade
 
-    Minimum gross loss floor for each non-winning trade:
-      loss_floor = cost * total_capital
-      if pnl <= 0 => gross_loss += max(-pnl, loss_floor)
+    commission per trade = commission_pct * total_capital
 
-    Returns (pf, gross_profit, gross_loss_abs) where gp/gl are net of commissions + loss floor.
+    Guarantees:
+      • if ≥1 trade: gross_loss > 0 → PF finite
+      • if 0 trades: PF = 0
     """
     gp = 0.0
     gl = 0.0
-    loss_floor = float(cost) * float(total_capital)
+    loss_floor = cost * total_capital
+    commission_per_trade = commission_pct * total_capital
+
+    completed = 0
 
     for t in trades:
         if t.get("ignored", False):
             continue
-        if ("fill_price" not in t) or ("exit_price" not in t) or ("qty" not in t):
+        if "fill_price" not in t or "exit_price" not in t or "qty" not in t:
             continue
 
-        qty = float(t.get("qty", 0.0))
-        entry = float(t.get("fill_price", np.nan))
-        exitp = float(t.get("exit_price", np.nan))
-        if qty <= 0 or np.isnan(entry) or np.isnan(exitp):
-            continue
+        qty = float(t["qty"])
+        entry = float(t["fill_price"])
+        exitp = float(t["exit_price"])
 
-        c_in = float(t.get("commission_entry", 0.0))
-        c_out = float(t.get("commission_exit", 0.0))
-        pnl = qty * (exitp - entry) - c_in - c_out
+        completed += 1
+
+        pnl = qty * (exitp - entry)   # PURE price PnL
 
         if pnl > 0:
             gp += pnl
         else:
             gl += max(-pnl, loss_floor)
 
-    if gl == 0.0:
-        pf = float("inf") if gp > 0.0 else 0.0
-    else:
-        pf = gp / gl
+        # always charge the round-trip commission
+        gl += commission_per_trade
 
-    return float(pf), float(gp), float(gl)
+    if completed == 0:
+        return 0.0, 0.0, 0.0
+
+    return gp / gl, gp, gl
 
 
 # =========================
@@ -399,8 +420,7 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, cost: float) -> Dic
             fill_price = real_o[i]
             pos_value = cash * float(p.position_size_pct)
             qty = pos_value / fill_price if fill_price > 0 else 0.0
-            commission = pos_value * float(p.commission_pct)
-            cash -= (pos_value + commission)
+            cash -= pos_value
 
             in_pos = True
             pending_entry = False
@@ -408,7 +428,7 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, cost: float) -> Dic
             trades[-1].update({
                 "fill_idx": int(i),
                 "fill_price": float(fill_price),
-                "commission_entry": float(commission),
+                "commission_entry": 0,
                 "qty": float(qty),
             })
 
@@ -458,14 +478,13 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, cost: float) -> Dic
                     fill_price = riskClose[i]
                     pos_value = cash * float(p.position_size_pct)
                     qty = pos_value / fill_price if fill_price > 0 else 0.0
-                    commission = pos_value * float(p.commission_pct)
-                    cash -= (pos_value + commission)
+                    cash -= pos_value
 
                     in_pos = True
                     trades[-1].update({
                         "fill_idx": int(i),
                         "fill_price": float(fill_price),
-                        "commission_entry": float(commission),
+                        "commission_entry": 0,
                         "qty": float(qty),
                     })
                 else:
@@ -585,7 +604,12 @@ def backtest_half_rsi_hr(df: pd.DataFrame, p: HalfRSIParams, cost: float) -> Dic
     completed = [t for t in trades if ("exit_price" in t and "fill_price" in t and not t.get("ignored", False))]
     num_trades = len(completed)
 
-    pf, gp, gl = profit_factor_from_trades(trades, cost=float(cost), total_capital=float(p.initial_capital))
+    pf, gp, gl = profit_factor_from_trades(
+        trades,
+        cost=float(cost),
+        total_capital=float(p.initial_capital),
+        commission_pct=float(COMMISSION_PCT),
+    )
 
     return {
         "final_equity": final_equity,
@@ -695,10 +719,10 @@ def run_optuna_optimization(
         else:
             pf_for_score = pf_cap_score
 
-        pf_norm = pf_for_score / pf_cap_score
+        # NO pf_norm term (no division by pf_cap)
         pf_w = sigmoid(float(pf_beta) * (pf_for_score - float(pf_center)))
         tr_w = sigmoid(float(beta) * (float(num_trades) - float(center)))
-        return float(pf_norm) * float(pf_w) * float(tr_w)
+        return float(pf_w) * float(tr_w)
 
     def opt_fn(trial):
         slowW = trial.suggest_int("slow_window", 14, 80)
@@ -791,7 +815,7 @@ def run_optuna_optimization(
     best_params["timestamp"] = time.time()
     best_params["score"] = (
         "mean_over_tickers( "
-        "  [trades<min_trades?0 : (min(PF,pf_cap)/pf_cap) * sigmoid(pf_beta*(min(PF,pf_cap)-pf_center)) * sigmoid(beta*(trades-center))] "
+        "  [trades<min_trades?0 : sigmoid(pf_beta*(min(PF,pf_cap)-pf_center)) * sigmoid(beta*(trades-center))] "
         ")"
     )
     best_params["penalty"] = bool(penalty)
@@ -920,10 +944,11 @@ def run_optuna_optimization(
         if nt < int(min_trades):
             return 0.0
         pf_for_score = min(float(pf_raw), pf_cap_score) if math.isfinite(float(pf_raw)) else pf_cap_score
-        pf_norm = pf_for_score / pf_cap_score
+
+        # NO pf_norm term (no division by pf_cap)
         pf_w = sigmoid(float(pf_beta) * (pf_for_score - float(pf_center)))
         tr_w = sigmoid(float(beta) * (float(nt) - float(center)))
-        return float(pf_norm) * float(pf_w) * float(tr_w)
+        return float(pf_w) * float(tr_w)
 
     summary_df["ticker_score"] = [
         ticker_score_for_row(pf, int(nt))

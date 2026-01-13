@@ -1,6 +1,6 @@
 ## default nTrails=200
 nTrails=2000
-nFiles=1000
+nFiles=200
 alpha=0.25
 fillOpt=same_close
 #fillOpt=next_open

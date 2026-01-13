@@ -1,12 +1,13 @@
 nTrails=2000
-nFiles=1000
+nFiles=200
+#fillOpt=next_open
 fillOpt=same_close
 min_trades=2
 center=3
 beta=1
 pf_center=2
 pf_beta=1
-pf_cap=100
+pf_cap=50
 
 ## use --penalty to turn penalty ON
 
@@ -34,7 +35,8 @@ pf_cap=100
 #~3 trades/ticker → weight ≈ 0.259
 #~1 trade/ticker → weight ≈ 0.095
 
+
 echo python Bayes_opt_half_RSI_trend.py --trials $nTrails --files $nFiles --min-trades $min_trades --center $center --beta $beta --pf-center $pf_center --pf-beta $pf_beta --pf-cap $pf_cap --fill $fillOpt
 python Bayes_opt_half_RSI_trend.py --trials $nTrails --files $nFiles --min-trades $min_trades --center $center --beta $beta --pf-center $pf_center --pf-beta $pf_beta --pf-cap $pf_cap --fill $fillOpt
 
-echo Done: python Bayes_opt_half_RSI_trend.py --trials $nTrails --files $nFiles --min-trades $min_trades --center $center --beta $beta --pf-center $pf_center --pf-beta $pf_beta --pf-cap $pf_cap --fill $fillOpt
+echo Done: Bayes_opt_half_RSI_trend.py --trials $nTrails --files $nFiles --min-trades $min_trades --center $center --beta $beta --pf-center $pf_center --pf-beta $pf_beta --pf-cap $pf_cap --fill $fillOpt
