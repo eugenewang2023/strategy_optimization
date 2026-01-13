@@ -12,14 +12,34 @@ Features:
 - --loss_floor (default 0.001) used in PF scoring:
     effective_gl = max(gross_loss, loss_floor * gross_profit)  (if gross_profit>0)
 
-Penalty (NON-BINARY / soft):
+Penalty (SOFT, non-binary):
 - Keep --penalty, but don't zero-out negative-return tickers.
-- Instead multiply ticker score by:
+- Multiply score by:
       ret_mult = sigmoid(penalty_ret_k * (total_return - penalty_ret_center))
-  Defaults:
-      penalty_ret_center = 0.0
-      penalty_ret_k      = 10.0
-  so slightly negative returns get down-weighted, not killed.
+
+Tail-protection penalty (return floor; protects worst tickers)
+- Multiply score by:
+      ret_floor_mult = sigmoid(ret_floor_k * (total_return - ret_floor))
+
+Soft overtrading penalty:
+- Multiply score by:
+      over_mult = sigmoid(max_trades_k * (max_trades - num_trades))
+
+PF floor penalty (raise PF by fixing worst offenders):
+- Multiply score by:
+      pf_floor_mult = sigmoid(pf_floor_k * (pf_eff - pf_floor))
+
+Cooldown:
+- --cooldown N adds a re-entry cooldown after exits.
+- IMPORTANT: this version implements "cooldown after loss only":
+    cooldown is applied ONLY if the exiting trade's pnl < 0.
+
+Time stop:
+- exit after N bars if trade STILL hasn't gone positive at the checkpoint
+  (less aggressive than "never-positive"):
+    after time_stop bars, if current unrealized PnL <= 0 => exit
+- --time-stop 0 disables time stop
+- --opt-time-stop lets Optuna optimize time_stop bars.
 
 Dependencies:
   pip install optuna pandas numpy pyarrow
@@ -30,11 +50,10 @@ import random
 import argparse
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Any, Optional
+from typing import List, Tuple, Any, Optional, Dict
 
 import numpy as np
 import pandas as pd
-
 import optuna
 
 
@@ -127,6 +146,8 @@ def backtest_dynamic_sr(
     use_trailing_exit: bool = True,
     trail_mode: str = "trail_only",
     close_on_sellSignal: bool = True,
+    cooldown_bars: int = 0,
+    time_stop_bars: int = 0,
 ) -> TradeStats:
     o = df["open"].to_numpy(dtype=float)
     h = df["high"].to_numpy(dtype=float)
@@ -179,7 +200,16 @@ def backtest_dynamic_sr(
     gl = 0.0
     trades = 0
 
+    cooldown_left = 0
+
+    # time-stop state
+    bars_in_trade = 0
+    ts_bars = max(0, int(time_stop_bars))
+
     for i in range(start + 1, n):
+        if cooldown_left > 0:
+            cooldown_left -= 1
+
         if np.isnan(sr[i - 1]) or np.isnan(sr[i]):
             continue
 
@@ -191,8 +221,12 @@ def backtest_dynamic_sr(
             candidate = c[i] - real_atr[i] * tpMult
             trail_stop = candidate if np.isnan(trail_stop) else max(trail_stop, candidate)
 
-        # entry
-        if (not in_pos) and buy_sig:
+        # update time-stop state while in position
+        if in_pos:
+            bars_in_trade += 1
+
+        # entry (blocked during cooldown)
+        if (not in_pos) and buy_sig and (cooldown_left == 0):
             fill = get_fill(i)
             if fill is None:
                 continue
@@ -204,6 +238,9 @@ def backtest_dynamic_sr(
 
             stop = entry - real_atr[i] * slMult if not np.isnan(real_atr[i]) else entry * 0.9
             trail_stop = np.nan
+
+            # reset time-stop state
+            bars_in_trade = 0
 
         # exits
         if in_pos:
@@ -221,6 +258,15 @@ def backtest_dynamic_sr(
                     exit_now = True
                     exit_price = trail_stop
 
+            # time stop (less aggressive): after N bars, exit only if STILL not positive right now
+            if (not exit_now) and (ts_bars > 0) and (bars_in_trade >= ts_bars):
+                fill = get_fill(i)
+                if fill is not None:
+                    unreal_pnl = (fill - entry) / entry
+                    if unreal_pnl <= 0.0:
+                        exit_now = True
+                        exit_price = fill
+
             # close on sell signal
             if (not exit_now) and close_on_sellSignal and sell_sig:
                 fill = get_fill(i)
@@ -237,11 +283,16 @@ def backtest_dynamic_sr(
                     gp += pnl
                 else:
                     gl += abs(pnl)
+                    # ✅ cooldown after LOSS ONLY
+                    cooldown_left = max(0, int(cooldown_bars))
 
                 in_pos = False
                 entry = 0.0
                 stop = 0.0
                 trail_stop = np.nan
+
+                # reset time-stop state
+                bars_in_trade = 0
 
         if equity > peak:
             peak = equity
@@ -249,6 +300,7 @@ def backtest_dynamic_sr(
         if dd < maxdd:
             maxdd = dd
 
+    # Force-close at end
     if in_pos:
         equity *= (1.0 - commission_per_side)
         pnl = (float(c[-1]) - entry) / entry
@@ -257,6 +309,10 @@ def backtest_dynamic_sr(
             gp += pnl
         else:
             gl += abs(pnl)
+            # ✅ cooldown after LOSS ONLY (forced close)
+            cooldown_left = max(0, int(cooldown_bars))
+        in_pos = False
+        bars_in_trade = 0
 
     pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
 
@@ -288,6 +344,12 @@ def score_from_stats(
     loss_floor: float,
     penalty_ret_center: float,
     penalty_ret_k: float,
+    max_trades: int,
+    max_trades_k: float,
+    pf_floor: float,
+    pf_floor_k: float,
+    ret_floor: float,
+    ret_floor_k: float,
 ) -> float:
     if st.num_trades < min_trades:
         return 0.0
@@ -304,6 +366,8 @@ def score_from_stats(
     pf_eff = (gp / effective_gl) if effective_gl > 0 else 0.0
     pf_eff = min(pf_eff, pf_cap_score_only)
 
+    pf_floor_mult = sigmoid(pf_floor_k * (pf_eff - pf_floor))
+
     pf_w = sigmoid(pf_k * (pf_eff - pf_baseline))
     tr_w = sigmoid(trades_k * (st.num_trades - trades_baseline))
 
@@ -311,10 +375,21 @@ def score_from_stats(
     if score_power != 1.0:
         s = s ** score_power
 
-    # ✅ soft (non-binary) penalty on negative returns
+    # soft return penalty around penalty_ret_center
     if penalty_enabled:
         ret_mult = sigmoid(penalty_ret_k * (st.total_return - penalty_ret_center))
         s *= ret_mult
+
+    # tail-protection floor
+    ret_floor_mult = sigmoid(ret_floor_k * (st.total_return - ret_floor))
+    s *= ret_floor_mult
+
+    # soft over-trading penalty
+    over_mult = sigmoid(max_trades_k * (max_trades - st.num_trades))
+    s *= over_mult
+
+    # PF floor penalty
+    s *= pf_floor_mult
 
     return float(s)
 
@@ -331,6 +406,8 @@ def evaluate_params_on_files(
     use_trailing_exit: bool,
     trail_mode: str,
     close_on_sellSignal: bool,
+    cooldown_bars: int,
+    time_stop_bars: int,
     # scoring opts
     min_trades: int,
     pf_baseline: float,
@@ -344,6 +421,12 @@ def evaluate_params_on_files(
     loss_floor: float,
     penalty_ret_center: float,
     penalty_ret_k: float,
+    max_trades: int,
+    max_trades_k: float,
+    pf_floor: float,
+    pf_floor_k: float,
+    ret_floor: float,
+    ret_floor_k: float,
 ) -> Tuple[float, Dict[str, Any], List[Dict[str, Any]], float, float]:
     per: List[Dict[str, Any]] = []
     scores: List[float] = []
@@ -364,6 +447,8 @@ def evaluate_params_on_files(
             use_trailing_exit=use_trailing_exit,
             trail_mode=trail_mode,
             close_on_sellSignal=close_on_sellSignal,
+            cooldown_bars=cooldown_bars,
+            time_stop_bars=time_stop_bars,
         )
 
         sc = score_from_stats(
@@ -380,6 +465,12 @@ def evaluate_params_on_files(
             loss_floor=loss_floor,
             penalty_ret_center=penalty_ret_center,
             penalty_ret_k=penalty_ret_k,
+            max_trades=max_trades,
+            max_trades_k=max_trades_k,
+            pf_floor=pf_floor,
+            pf_floor_k=pf_floor_k,
+            ret_floor=ret_floor,
+            ret_floor_k=ret_floor_k,
         )
 
         if st.total_return <= 0:
@@ -425,22 +516,40 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--commission_rate_per_side", type=float, default=0.0006)
 
     # scoring knobs
-    ap.add_argument("--pf-cap", type=float, default=30.0, dest="pf_cap_score_only")
+    ap.add_argument("--pf-cap", type=float, default=10.0, dest="pf_cap_score_only")
     ap.add_argument("--pf-baseline", type=float, default=1.8)
     ap.add_argument("--pf-k", type=float, default=1.5)
-    ap.add_argument("--trades-baseline", type=float, default=8.0)
-    ap.add_argument("--trades-k", type=float, default=5.0)
+    ap.add_argument("--trades-baseline", type=float, default=20.0)
+    ap.add_argument("--trades-k", type=float, default=0.5)
     ap.add_argument("--weight-pf", type=float, default=0.9)
     ap.add_argument("--score-power", type=float, default=1.0)
     ap.add_argument("--min-trades", type=int, default=8)
     ap.add_argument("--penalty", action="store_true")
     ap.add_argument("--loss_floor", type=float, default=0.001)
 
-    # ✅ soft penalty knobs
-    ap.add_argument("--penalty-ret-center", type=float, default=0.0,
-                    help="Soft penalty center for total_return. 0.0 means break-even.")
-    ap.add_argument("--penalty-ret-k", type=float, default=10.0,
+    # soft return penalty knobs
+    ap.add_argument("--penalty-ret-center", type=float, default=-0.02,
+                    help="Soft penalty center for total_return. -0.02 means tolerate ~-2%.")
+    ap.add_argument("--penalty-ret-k", type=float, default=8.0,
                     help="Soft penalty steepness. Higher = harsher penalty against negative returns.")
+
+    # tail-protection return floor knobs
+    ap.add_argument("--ret-floor", type=float, default=0.0,
+                    help="Tail-protection floor for total_return. 0.0 pushes tickers toward non-negative return.")
+    ap.add_argument("--ret-floor-k", type=float, default=8.0,
+                    help="Steepness for tail-protection return floor penalty.")
+
+    # soft max-trades penalty knobs
+    ap.add_argument("--max-trades", type=int, default=60,
+                    help="Soft ceiling for trades per ticker. Above this, score is penalized smoothly.")
+    ap.add_argument("--max-trades-k", type=float, default=0.15,
+                    help="Steepness for max-trades penalty.")
+
+    # PF floor penalty knobs
+    ap.add_argument("--pf-floor", type=float, default=1.0,
+                    help="Soft PF floor. Tickers below this PF are penalized smoothly.")
+    ap.add_argument("--pf-floor-k", type=float, default=6.0,
+                    help="Steepness for PF-floor penalty.")
 
     ap.add_argument("--fill", type=str, default="same_close", choices=["same_close", "next_open"],
                     help="Fill mode used for final reporting; objective uses robustness avg across both.")
@@ -449,6 +558,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--use_trailing_exit", type=bool, default=True)
     ap.add_argument("--trail_mode", type=str, default="trail_only", choices=["trail_only"])
     ap.add_argument("--close_on_sellSignal", type=bool, default=True)
+
+    # cooldown
+    ap.add_argument("--cooldown", type=int, default=1,
+                    help="Cooldown bars AFTER A LOSING TRADE ONLY. 0 disables cooldown.")
+    ap.add_argument("--opt-cooldown", action="store_true",
+                    help="If set, Optuna will optimize cooldown (overrides --cooldown during objective).")
+
+    # time stop
+    ap.add_argument("--time-stop", type=int, default=0,
+                    help="Time stop bars. After N bars, exit only if STILL not positive now. 0 disables.")
+    ap.add_argument("--opt-time-stop", action="store_true",
+                    help="If set, Optuna will optimize time stop (overrides --time-stop during objective).")
 
     return ap.parse_args()
 
@@ -474,15 +595,27 @@ def main() -> None:
     ROBUST_FILLS = ["same_close", "next_open"]
 
     def objective(trial: optuna.Trial) -> float:
-        atrPeriod = trial.suggest_int("atrPeriod", 10, 100)
-        slMultiplier = trial.suggest_float("slMultiplier", 1.5, 12.0)
-        tpMultiplier = trial.suggest_float("tpMultiplier", 1.0, 8.0)  # constraint #1
-        srBandMultiplier = trial.suggest_float("srBandMultiplier", 0.4, 3.0)
+        atrPeriod = trial.suggest_int("atrPeriod", 50, 70)
+        slMultiplier = trial.suggest_float("slMultiplier",6.0, 10.0)
+        tpMultiplier = trial.suggest_float("tpMultiplier", 4.0, 8.0)
+        srBandMultiplier = trial.suggest_float("srBandMultiplier", 0.44, 1.0)
 
-        # constraint #2: enforce SL > TP
+        # enforce SL > TP
         if slMultiplier <= tpMultiplier:
             raise optuna.TrialPruned()
-    
+
+        # cooldown: either fixed from CLI, or optimized
+        if args.opt_cooldown:
+            cooldown_bars = trial.suggest_int("cooldown", 0, 7)
+        else:
+            cooldown_bars = int(args.cooldown)
+
+        # time stop: either fixed from CLI, or optimized
+        if args.opt_time_stop:
+            time_stop_bars = trial.suggest_int("time_stop", 0, 20)
+        else:
+            time_stop_bars = int(args.time_stop)
+
         scores = []
         for fm in ROBUST_FILLS:
             s, _, _, _, _ = evaluate_params_on_files(
@@ -496,6 +629,8 @@ def main() -> None:
                 use_trailing_exit=args.use_trailing_exit,
                 trail_mode=args.trail_mode,
                 close_on_sellSignal=args.close_on_sellSignal,
+                cooldown_bars=cooldown_bars,
+                time_stop_bars=time_stop_bars,
                 min_trades=args.min_trades,
                 pf_baseline=args.pf_baseline,
                 pf_k=args.pf_k,
@@ -508,6 +643,12 @@ def main() -> None:
                 loss_floor=args.loss_floor,
                 penalty_ret_center=args.penalty_ret_center,
                 penalty_ret_k=args.penalty_ret_k,
+                max_trades=args.max_trades,
+                max_trades_k=args.max_trades_k,
+                pf_floor=args.pf_floor,
+                pf_floor_k=args.pf_floor_k,
+                ret_floor=args.ret_floor,
+                ret_floor_k=args.ret_floor_k,
             )
             scores.append(s)
 
@@ -519,12 +660,25 @@ def main() -> None:
 
     best = study.best_trial
     best_params = best.params
+
+    # normalize types
     best_params["atrPeriod"] = int(best_params["atrPeriod"])
     best_params["slMultiplier"] = float(best_params["slMultiplier"])
     best_params["tpMultiplier"] = float(best_params["tpMultiplier"])
     best_params["srBandMultiplier"] = float(best_params["srBandMultiplier"])
 
-    # Final reporting on chosen fill
+    # final cooldown
+    if args.opt_cooldown:
+        best_cooldown = int(best_params.get("cooldown", 0))
+    else:
+        best_cooldown = int(args.cooldown)
+
+    # final time stop
+    if args.opt_time_stop:
+        best_time_stop = int(best_params.get("time_stop", 0))
+    else:
+        best_time_stop = int(args.time_stop)
+
     best_score_single, overall, per, pf_avg, trades_avg = evaluate_params_on_files(
         file_paths,
         atrPeriod=best_params["atrPeriod"],
@@ -536,6 +690,8 @@ def main() -> None:
         use_trailing_exit=args.use_trailing_exit,
         trail_mode=args.trail_mode,
         close_on_sellSignal=args.close_on_sellSignal,
+        cooldown_bars=best_cooldown,
+        time_stop_bars=best_time_stop,
         min_trades=args.min_trades,
         pf_baseline=args.pf_baseline,
         pf_k=args.pf_k,
@@ -548,10 +704,16 @@ def main() -> None:
         loss_floor=args.loss_floor,
         penalty_ret_center=args.penalty_ret_center,
         penalty_ret_k=args.penalty_ret_k,
+        max_trades=args.max_trades,
+        max_trades_k=args.max_trades_k,
+        pf_floor=args.pf_floor,
+        pf_floor_k=args.pf_floor_k,
+        ret_floor=args.ret_floor,
+        ret_floor_k=args.ret_floor_k,
     )
 
     per_df = pd.DataFrame(per).sort_values(
-        ["profit_factor", "total_return", "ticker_score", "num_trades"],
+        ["ticker_score", "total_return", "profit_factor", "num_trades"],
         ascending=False
     )
     per_csv = out_dir / "per_ticker_summary.csv"
@@ -563,6 +725,11 @@ def main() -> None:
     print(f"Mean Ticker Score:            {overall['mean_ticker_score']:.6f}")
     print(f"Penalty enabled:              {args.penalty} (soft)")
     print(f"Soft penalty center/k:        {args.penalty_ret_center} / {args.penalty_ret_k}")
+    print(f"Tail-protection ret floor/k:  {args.ret_floor} / {args.ret_floor_k}")
+    print(f"Max-trades penalty:           max_trades={args.max_trades}, k={args.max_trades_k}")
+    print(f"PF-floor penalty:             pf_floor={args.pf_floor}, k={args.pf_floor_k}")
+    print(f"cooldown_bars:                {best_cooldown} (opt={args.opt_cooldown})  [loss-only]")
+    print(f"time_stop_bars:               {best_time_stop} (0=disabled)  (opt={args.opt_time_stop})  [not-positive-now]")
     print(f"num_neg (return<=0):          {overall['num_neg']}")
     print(f"commission_rate_per_side:     {args.commission_rate_per_side:.6f}")
     print(f"PF ROC baseline/k:            {args.pf_baseline:.3f} / {args.pf_k:.3f}")
@@ -578,6 +745,10 @@ def main() -> None:
     print(f"slMultiplier: {best_params['slMultiplier']}")
     print(f"tpMultiplier: {best_params['tpMultiplier']}")
     print(f"srBandMultiplier: {best_params['srBandMultiplier']}")
+    if args.opt_cooldown:
+        print(f"cooldown (best): {best_cooldown}")
+    if args.opt_time_stop:
+        print(f"time_stop (best): {best_time_stop}")
     print(f"best_score (ROBUST avg fills): {best.value}")
     print(f"fill_mode (report): {args.fill}")
     print(f"pf_cap_score_only: {args.pf_cap_score_only}")
@@ -586,6 +757,35 @@ def main() -> None:
     print("\n=== INDIVIDUAL (TICKER) METRICS (w/ BEST PARAMS) ===")
     print(per_df[["ticker", "profit_factor", "num_trades", "ticker_score", "total_return", "gross_profit", "gross_loss"]].to_string(index=False))
 
+    print(
+        f"Done: Bayes_opt_dynamic_SR.py "
+        f"--trials {args.trials} "
+        f"--files {args.files} "
+        f"{'--penalty ' if args.penalty else ''}"
+        f"--penalty-ret-center {args.penalty_ret_center} "
+        f"--penalty-ret-k {args.penalty_ret_k} "
+        f"--min-trades {args.min_trades} "
+        f"--trades-baseline {args.trades_baseline} "
+        f"--trades-k {args.trades_k} "
+        f"--max-trades {args.max_trades} "
+        f"--max-trades-k {args.max_trades_k} "
+        f"--ret-floor {args.ret_floor} "
+        f"--ret-floor-k {args.ret_floor_k} "
+        f"--pf-cap {args.pf_cap_score_only} "
+        f"--pf-baseline {args.pf_baseline} "
+        f"--pf-k {args.pf_k} "
+        f"--pf-floor {args.pf_floor} "
+        f"--pf-floor-k {args.pf_floor_k} "
+        f"--weight-pf {args.weight_pf} "
+        f"--score-power {args.score_power} "
+        f"--commission_rate_per_side {args.commission_rate_per_side} "
+        f"--loss_floor {args.loss_floor} "
+        f"--fill {args.fill} "
+        f"--cooldown {best_cooldown} "
+        f"--time-stop {best_time_stop} "
+        f"{'--opt-cooldown ' if args.opt_cooldown else ''}"
+        f"{'--opt-time-stop' if args.opt_time_stop else ''}"
+    )
 
 if __name__ == "__main__":
     main()
