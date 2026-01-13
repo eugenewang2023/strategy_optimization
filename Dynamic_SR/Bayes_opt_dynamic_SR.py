@@ -745,13 +745,13 @@ def main() -> None:
     print(f"slMultiplier: {best_params['slMultiplier']}")
     print(f"tpMultiplier: {best_params['tpMultiplier']}")
     print(f"srBandMultiplier: {best_params['srBandMultiplier']}")
+    print(f"best_score (ROBUST avg fills): {best.value}")
+    print(f"pf_cap_score_only: {args.pf_cap_score_only}")
     if args.opt_cooldown:
         print(f"cooldown (best): {best_cooldown}")
     if args.opt_time_stop:
         print(f"time_stop (best): {best_time_stop}")
-    print(f"best_score (ROBUST avg fills): {best.value}")
     print(f"fill_mode (report): {args.fill}")
-    print(f"pf_cap_score_only: {args.pf_cap_score_only}")
     print(f"Saved per-ticker CSV to: {per_csv}")
 
     print("\n=== INDIVIDUAL (TICKER) METRICS (w/ BEST PARAMS) ===")
