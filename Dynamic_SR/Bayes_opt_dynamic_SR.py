@@ -554,11 +554,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tp2sl-auto", action="store_true",
                     help="If set, enforce an adaptive TP/SL asymmetry constraint based on srBandMultiplier.")
     ap.add_argument("--tp2sl-base", type=float, default=1.25,
-                    help="Base min_tp2sl at srBandMultiplier = tp2sl-sr0.")
-    ap.add_argument("--tp2sl-sr0", type=float, default=0.65,
-                    help="Reference srBandMultiplier for tp2sl-base.")
-    ap.add_argument("--tp2sl-k", type=float, default=0.60,
-                    help="Slope: how much min_tp2sl increases per +1.0 srBandMultiplier.")
+                    help="Base min_tp2sl at atrPeriod = tp2sl-sr0 (sr0 now means atr0 for tp2sl-auto).")
+    ap.add_argument("--tp2sl-sr0", type=float, default=30.0,
+                    help="Reference atrPeriod (atr0) for tp2sl-base when --tp2sl-auto is enabled.")
+    ap.add_argument("--tp2sl-k", type=float, default=0.01,
+                    help="Slope: how much min_tp2sl increases per +1 atrPeriod when --tp2sl-auto is enabled.")
     ap.add_argument("--tp2sl-min", type=float, default=1.10,
                     help="Clamp lower bound for adaptive min_tp2sl.")
     ap.add_argument("--tp2sl-max", type=float, default=2.20,
@@ -694,8 +694,10 @@ def main() -> None:
         srBandMultiplier = trial.suggest_float("srBandMultiplier", 0.44, 0.66)
 
         # --- TP/SL asymmetry constraint (FIXED or AUTO) ---
+        # AUTO now adapts off atrPeriod (like Half_RSI), not srBandMultiplier.
         if args.tp2sl_auto:
-            min_tp2sl_eff = args.tp2sl_base + args.tp2sl_k * (srBandMultiplier - args.tp2sl_sr0)
+            # NOTE: args.tp2sl_sr0 is treated as atr0 (reference ATR period)
+            min_tp2sl_eff = args.tp2sl_base + args.tp2sl_k * (atrPeriod - args.tp2sl_sr0)
             min_tp2sl_eff = max(args.tp2sl_min, min(args.tp2sl_max, min_tp2sl_eff))
         else:
             min_tp2sl_eff = args.min_tp2sl
@@ -766,7 +768,8 @@ def main() -> None:
 
     # compute effective constraint at best params
     if args.tp2sl_auto:
-        best_min_tp2sl_eff = args.tp2sl_base + args.tp2sl_k * (best_params["srBandMultiplier"] - args.tp2sl_sr0)
+        # NOTE: args.tp2sl_sr0 is treated as atr0 (reference ATR period)
+        best_min_tp2sl_eff = args.tp2sl_base + args.tp2sl_k * (best_params["atrPeriod"] - args.tp2sl_sr0)
         best_min_tp2sl_eff = max(args.tp2sl_min, min(args.tp2sl_max, best_min_tp2sl_eff))
         constraint_mode = "auto"
     else:
