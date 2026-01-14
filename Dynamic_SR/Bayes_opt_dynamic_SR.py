@@ -1,48 +1,17 @@
 #!/usr/bin/env python3
 """
-Optuna_opt_dynamic_SR.py  (PARQUET-ONLY)
+Bayes_opt_dynamic_SR.py  (PARQUET-ONLY)  ✅ Pine-match for Dynamic_SR_hrr (HA-envelope SR + REAL exits)
 
-Features:
-- Parquet only (*.parquet)
-- Hard constraints:
-    1) tpMultiplier >= 1.0
-    2) slMultiplier > tpMultiplier
-- Robustness check in objective:
-    target = average score across fills: ["same_close", "next_open"]
-- --loss_floor (default 0.001) used in PF scoring:
-    effective_gl = max(gross_loss, loss_floor * gross_profit)  (if gross_profit>0)
+Change in this version (per your request):
+- Add CLI input option --min-tp2sl to FIX the asymmetry constraint:
+      slMultiplier > min_tp2sl * tpMultiplier
+- Remove optimization of min_tp2sl (no --opt-min-tp2sl, no trial.suggest for it)
 
-Penalty (SOFT, non-binary):
-- Keep --penalty, but don't zero-out negative-return tickers.
-- Multiply score by:
-      ret_mult = sigmoid(penalty_ret_k * (total_return - penalty_ret_center))
+Bonus (kept, but fixed):
+- Optional adaptive constraint mode --tp2sl-auto that scales min_tp2sl with srBandMultiplier
+  (if enabled, --min-tp2sl is ignored)
 
-Tail-protection penalty (return floor; protects worst tickers)
-- Multiply score by:
-      ret_floor_mult = sigmoid(ret_floor_k * (total_return - ret_floor))
-
-Soft overtrading penalty:
-- Multiply score by:
-      over_mult = sigmoid(max_trades_k * (max_trades - num_trades))
-
-PF floor penalty (raise PF by fixing worst offenders):
-- Multiply score by:
-      pf_floor_mult = sigmoid(pf_floor_k * (pf_eff - pf_floor))
-
-Cooldown:
-- --cooldown N adds a re-entry cooldown after exits.
-- IMPORTANT: this version implements "cooldown after loss only":
-    cooldown is applied ONLY if the exiting trade's pnl < 0.
-
-Time stop:
-- exit after N bars if trade STILL hasn't gone positive at the checkpoint
-  (less aggressive than "never-positive"):
-    after time_stop bars, if current unrealized PnL <= 0 => exit
-- --time-stop 0 disables time stop
-- --opt-time-stop lets Optuna optimize time_stop bars.
-
-Dependencies:
-  pip install optuna pandas numpy pyarrow
+Everything else stays the same.
 """
 
 import math
@@ -123,7 +92,7 @@ def crossunder(a_prev: float, a_now: float, b_prev: float, b_now: float) -> bool
 
 
 # =============================
-# Backtest core (simplified Dynamic SR)
+# Backtest core
 # =============================
 @dataclass
 class TradeStats:
@@ -144,20 +113,30 @@ def backtest_dynamic_sr(
     commission_per_side: float,
     fill_mode: str,
     use_trailing_exit: bool = True,
-    trail_mode: str = "trail_only",
+    trail_mode: str = "trail_only",          # "trail_only" or "trail_plus_hard_sl"
     close_on_sellSignal: bool = True,
     cooldown_bars: int = 0,
     time_stop_bars: int = 0,
 ) -> TradeStats:
+    """
+    Pine-matching core:
+    - SR: HA-anchored envelope with REAL ATR band
+    - Entries: buySignal cross of HA close vs SR
+    - Exits: REAL dynamic stop/limit + optional trailing (TV trail_offset semantics)
+    """
     o = df["open"].to_numpy(dtype=float)
     h = df["high"].to_numpy(dtype=float)
     l = df["low"].to_numpy(dtype=float)
     c = df["close"].to_numpy(dtype=float)
     n = len(df)
+
     if n < max(atrPeriod + 2, 60):
         return TradeStats()
 
+    # HA from REAL
     _, ha_h, ha_l, ha_c = heikin_ashi_from_real(o, h, l, c)
+
+    # REAL ATR for SR band + exits (matches Pine riskATR = realATR(atrPeriod))
     real_atr = atr_wilder(h, l, c, atrPeriod)
 
     valid_idx = np.where(~np.isnan(real_atr))[0]
@@ -165,12 +144,25 @@ def backtest_dynamic_sr(
         return TradeStats()
     start = int(valid_idx[0])
 
-    # Dynamic SR line
+    def get_fill(i: int) -> Optional[float]:
+        if fill_mode == "same_close":
+            return float(c[i])
+        if fill_mode == "next_open":
+            return float(o[i + 1]) if (i + 1 < n) else None
+        return float(c[i])
+
+    # SR: HA-anchored envelope with REAL ATR band
     sr = np.full(n, np.nan, dtype=float)
     sr[start] = ha_c[start]
+
     for i in range(start + 1, n):
-        band = srBandMult * real_atr[i]
+        if np.isnan(real_atr[i]):
+            sr[i] = sr[i - 1]
+            continue
+
+        band = real_atr[i] * srBandMult
         prev = sr[i - 1]
+
         if ha_c[i] > prev:
             sr[i] = max(prev, ha_l[i] + band)
         elif ha_c[i] < prev:
@@ -178,19 +170,9 @@ def backtest_dynamic_sr(
         else:
             sr[i] = prev
 
-    def get_fill(i: int) -> Optional[float]:
-        if fill_mode == "same_close":
-            return float(c[i])
-        if fill_mode == "next_open":
-            if i + 1 < n:
-                return float(o[i + 1])
-            return None
-        return float(c[i])
-
     in_pos = False
     entry = 0.0
-    stop = 0.0
-    trail_stop = np.nan
+    trades = 0
 
     equity = 1.0
     peak = 1.0
@@ -198,84 +180,104 @@ def backtest_dynamic_sr(
 
     gp = 0.0
     gl = 0.0
-    trades = 0
 
     cooldown_left = 0
-
-    # time-stop state
     bars_in_trade = 0
     ts_bars = max(0, int(time_stop_bars))
 
+    # trailing state (TV-like)
+    trail_active = False
+    trail_stop = np.nan
+    trail_high_since = np.nan
+    trail_dist = np.nan
+
+    def apply_commission(eq: float) -> float:
+        return eq * (1.0 - commission_per_side)
+
     for i in range(start + 1, n):
+        if np.isnan(sr[i - 1]) or np.isnan(sr[i]) or np.isnan(real_atr[i]):
+            continue
+
         if cooldown_left > 0:
             cooldown_left -= 1
-
-        if np.isnan(sr[i - 1]) or np.isnan(sr[i]):
-            continue
 
         buy_sig = crossover(ha_c[i - 1], ha_c[i], sr[i - 1], sr[i])
         sell_sig = crossunder(ha_c[i - 1], ha_c[i], sr[i - 1], sr[i])
 
-        # update trailing stop
-        if in_pos and use_trailing_exit and not np.isnan(real_atr[i]):
-            candidate = c[i] - real_atr[i] * tpMult
-            trail_stop = candidate if np.isnan(trail_stop) else max(trail_stop, candidate)
-
-        # update time-stop state while in position
-        if in_pos:
-            bars_in_trade += 1
-
-        # entry (blocked during cooldown)
+        # Entry
         if (not in_pos) and buy_sig and (cooldown_left == 0):
             fill = get_fill(i)
             if fill is None:
                 continue
             in_pos = True
-            entry = fill
+            entry = float(fill)
             trades += 1
+            equity = apply_commission(equity)
 
-            equity *= (1.0 - commission_per_side)
-
-            stop = entry - real_atr[i] * slMult if not np.isnan(real_atr[i]) else entry * 0.9
-            trail_stop = np.nan
-
-            # reset time-stop state
             bars_in_trade = 0
+            trail_active = False
+            trail_stop = np.nan
+            trail_high_since = np.nan
+            trail_dist = np.nan
 
-        # exits
+        # Manage open position
         if in_pos:
+            bars_in_trade += 1
+
+            stop_level = l[i] - real_atr[i] * slMult
+            tgt_level = h[i] + real_atr[i] * tpMult
+            trail_dist = real_atr[i] * tpMult
+
             exit_now = False
-            exit_price = None
+            exit_price: Optional[float] = None
 
-            # stop hit (conservative)
-            if l[i] <= stop:
+            # Trailing activation/update (TV semantics)
+            if use_trailing_exit:
+                if (not trail_active) and (h[i] >= entry + trail_dist):
+                    trail_active = True
+                    trail_high_since = float(h[i])
+                    trail_stop = trail_high_since - trail_dist
+                elif trail_active:
+                    trail_high_since = float(h[i]) if np.isnan(trail_high_since) else max(trail_high_since, float(h[i]))
+                    trail_stop = trail_high_since - trail_dist
+
+            # Intrabar triggers (conservative for long):
+            # 1) hard stop (if enabled)
+            # 2) trailing stop (if active)
+            # 3) limit target
+            # 4) time stop (fill-based)
+            # 5) sell signal close (fill-based)
+
+            hard_stop_enabled = (not use_trailing_exit) or (trail_mode == "trail_plus_hard_sl")
+            if hard_stop_enabled and (l[i] <= stop_level):
                 exit_now = True
-                exit_price = stop
+                exit_price = float(stop_level)
 
-            # trailing stop
-            if (not exit_now) and use_trailing_exit and (not np.isnan(trail_stop)):
+            if (not exit_now) and use_trailing_exit and trail_active and (not np.isnan(trail_stop)):
                 if l[i] <= trail_stop:
                     exit_now = True
-                    exit_price = trail_stop
+                    exit_price = float(trail_stop)
 
-            # time stop (less aggressive): after N bars, exit only if STILL not positive right now
+            if (not exit_now) and (h[i] >= tgt_level):
+                exit_now = True
+                exit_price = float(tgt_level)
+
             if (not exit_now) and (ts_bars > 0) and (bars_in_trade >= ts_bars):
                 fill = get_fill(i)
                 if fill is not None:
-                    unreal_pnl = (fill - entry) / entry
-                    if unreal_pnl <= 0.0:
+                    unreal = (float(fill) - entry) / entry
+                    if unreal <= 0.0:
                         exit_now = True
-                        exit_price = fill
+                        exit_price = float(fill)
 
-            # close on sell signal
             if (not exit_now) and close_on_sellSignal and sell_sig:
                 fill = get_fill(i)
                 if fill is not None:
                     exit_now = True
-                    exit_price = fill
+                    exit_price = float(fill)
 
-            if exit_now and exit_price is not None:
-                equity *= (1.0 - commission_per_side)
+            if exit_now and (exit_price is not None):
+                equity = apply_commission(equity)
                 pnl = (exit_price - entry) / entry
                 equity *= (1.0 + pnl)
 
@@ -283,16 +285,15 @@ def backtest_dynamic_sr(
                     gp += pnl
                 else:
                     gl += abs(pnl)
-                    # ✅ cooldown after LOSS ONLY
                     cooldown_left = max(0, int(cooldown_bars))
 
                 in_pos = False
                 entry = 0.0
-                stop = 0.0
-                trail_stop = np.nan
-
-                # reset time-stop state
                 bars_in_trade = 0
+                trail_active = False
+                trail_stop = np.nan
+                trail_high_since = np.nan
+                trail_dist = np.nan
 
         if equity > peak:
             peak = equity
@@ -302,17 +303,14 @@ def backtest_dynamic_sr(
 
     # Force-close at end
     if in_pos:
-        equity *= (1.0 - commission_per_side)
+        equity = apply_commission(equity)
         pnl = (float(c[-1]) - entry) / entry
         equity *= (1.0 + pnl)
         if pnl >= 0:
             gp += pnl
         else:
             gl += abs(pnl)
-            # ✅ cooldown after LOSS ONLY (forced close)
             cooldown_left = max(0, int(cooldown_bars))
-        in_pos = False
-        bars_in_trade = 0
 
     pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
 
@@ -357,7 +355,6 @@ def score_from_stats(
     gp = max(st.gross_profit, 0.0)
     gl = max(st.gross_loss, 0.0)
 
-    # loss-floor PF for scoring
     if gp > 0:
         effective_gl = max(gl, loss_floor * gp)
     else:
@@ -367,7 +364,6 @@ def score_from_stats(
     pf_eff = min(pf_eff, pf_cap_score_only)
 
     pf_floor_mult = sigmoid(pf_floor_k * (pf_eff - pf_floor))
-
     pf_w = sigmoid(pf_k * (pf_eff - pf_baseline))
     tr_w = sigmoid(trades_k * (st.num_trades - trades_baseline))
 
@@ -375,22 +371,17 @@ def score_from_stats(
     if score_power != 1.0:
         s = s ** score_power
 
-    # soft return penalty around penalty_ret_center
     if penalty_enabled:
         ret_mult = sigmoid(penalty_ret_k * (st.total_return - penalty_ret_center))
         s *= ret_mult
 
-    # tail-protection floor
     ret_floor_mult = sigmoid(ret_floor_k * (st.total_return - ret_floor))
     s *= ret_floor_mult
 
-    # soft over-trading penalty
     over_mult = sigmoid(max_trades_k * (max_trades - st.num_trades))
     s *= over_mult
 
-    # PF floor penalty
     s *= pf_floor_mult
-
     return float(s)
 
 
@@ -408,7 +399,6 @@ def evaluate_params_on_files(
     close_on_sellSignal: bool,
     cooldown_bars: int,
     time_stop_bars: int,
-    # scoring opts
     min_trades: int,
     pf_baseline: float,
     pf_k: float,
@@ -433,7 +423,7 @@ def evaluate_params_on_files(
     num_neg = 0
 
     for p in file_paths:
-        df = pd.read_parquet(p)  # PARQUET ONLY
+        df = pd.read_parquet(p)
         df = ensure_ohlc(df)
 
         st = backtest_dynamic_sr(
@@ -484,6 +474,7 @@ def evaluate_params_on_files(
             "total_return": st.total_return,
             "gross_profit": st.gross_profit,
             "gross_loss": st.gross_loss,
+            "maxdd": st.maxdd,
         })
         scores.append(sc)
 
@@ -527,49 +518,61 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--penalty", action="store_true")
     ap.add_argument("--loss_floor", type=float, default=0.001)
 
-    # soft return penalty knobs
-    ap.add_argument("--penalty-ret-center", type=float, default=-0.02,
-                    help="Soft penalty center for total_return. -0.02 means tolerate ~-2%.")
-    ap.add_argument("--penalty-ret-k", type=float, default=8.0,
-                    help="Soft penalty steepness. Higher = harsher penalty against negative returns.")
+    ap.add_argument("--penalty-ret-center", type=float, default=-0.02)
+    ap.add_argument("--penalty-ret-k", type=float, default=8.0)
 
-    # tail-protection return floor knobs
-    ap.add_argument("--ret-floor", type=float, default=0.0,
-                    help="Tail-protection floor for total_return. 0.0 pushes tickers toward non-negative return.")
-    ap.add_argument("--ret-floor-k", type=float, default=8.0,
-                    help="Steepness for tail-protection return floor penalty.")
+    ap.add_argument("--ret-floor", type=float, default=0.0)
+    ap.add_argument("--ret-floor-k", type=float, default=8.0)
 
-    # soft max-trades penalty knobs
-    ap.add_argument("--max-trades", type=int, default=60,
-                    help="Soft ceiling for trades per ticker. Above this, score is penalized smoothly.")
-    ap.add_argument("--max-trades-k", type=float, default=0.15,
-                    help="Steepness for max-trades penalty.")
+    ap.add_argument("--max-trades", type=int, default=60)
+    ap.add_argument("--max-trades-k", type=float, default=0.15)
 
-    # PF floor penalty knobs
-    ap.add_argument("--pf-floor", type=float, default=1.0,
-                    help="Soft PF floor. Tickers below this PF are penalized smoothly.")
-    ap.add_argument("--pf-floor-k", type=float, default=6.0,
-                    help="Steepness for PF-floor penalty.")
+    ap.add_argument("--pf-floor", type=float, default=1.0)
+    ap.add_argument("--pf-floor-k", type=float, default=6.0)
 
-    ap.add_argument("--fill", type=str, default="same_close", choices=["same_close", "next_open"],
-                    help="Fill mode used for final reporting; objective uses robustness avg across both.")
+    ap.add_argument("--fill", type=str, default="same_close", choices=["same_close", "next_open"])
 
     # exits
     ap.add_argument("--use_trailing_exit", type=bool, default=True)
-    ap.add_argument("--trail_mode", type=str, default="trail_only", choices=["trail_only"])
+    ap.add_argument("--trail_mode", type=str, default="trail_only", choices=["trail_only", "trail_plus_hard_sl"])
     ap.add_argument("--close_on_sellSignal", type=bool, default=True)
 
     # cooldown
-    ap.add_argument("--cooldown", type=int, default=1,
-                    help="Cooldown bars AFTER A LOSING TRADE ONLY. 0 disables cooldown.")
-    ap.add_argument("--opt-cooldown", action="store_true",
-                    help="If set, Optuna will optimize cooldown (overrides --cooldown during objective).")
+    ap.add_argument("--cooldown", type=int, default=1)
+    ap.add_argument("--opt-cooldown", action="store_true")
 
     # time stop
-    ap.add_argument("--time-stop", type=int, default=0,
-                    help="Time stop bars. After N bars, exit only if STILL not positive now. 0 disables.")
-    ap.add_argument("--opt-time-stop", action="store_true",
-                    help="If set, Optuna will optimize time stop (overrides --time-stop during objective).")
+    ap.add_argument("--time-stop", type=int, default=0)
+    ap.add_argument("--opt-time-stop", action="store_true")
+
+    # --- TP/SL asymmetry constraint ---
+    # Fixed constraint (manual)
+    ap.add_argument("--min-tp2sl", type=float, default=1.30,
+                    help="Require slMultiplier > min_tp2sl * tpMultiplier.")
+
+    # Optional auto scaling mode (if enabled, ignores --min-tp2sl)
+    ap.add_argument("--tp2sl-auto", action="store_true",
+                    help="If set, enforce an adaptive TP/SL asymmetry constraint based on srBandMultiplier.")
+    ap.add_argument("--tp2sl-base", type=float, default=1.25,
+                    help="Base min_tp2sl at srBandMultiplier = tp2sl-sr0.")
+    ap.add_argument("--tp2sl-sr0", type=float, default=0.65,
+                    help="Reference srBandMultiplier for tp2sl-base.")
+    ap.add_argument("--tp2sl-k", type=float, default=0.60,
+                    help="Slope: how much min_tp2sl increases per +1.0 srBandMultiplier.")
+    ap.add_argument("--tp2sl-min", type=float, default=1.10,
+                    help="Clamp lower bound for adaptive min_tp2sl.")
+    ap.add_argument("--tp2sl-max", type=float, default=2.20,
+                    help="Clamp upper bound for adaptive min_tp2sl.")
+
+    # ===== Reporting helpers =====
+    ap.add_argument("--report-only", action="store_true",
+                    help="Skip Optuna and only report using fixed params.")
+    ap.add_argument("--report-both-fills", action="store_true",
+                    help="When used with --report-only, run both same_close and next_open.")
+    ap.add_argument("--atrPeriod-fixed", type=int, default=None)
+    ap.add_argument("--slMultiplier-fixed", type=float, default=None)
+    ap.add_argument("--tpMultiplier-fixed", type=float, default=None)
+    ap.add_argument("--srBandMultiplier-fixed", type=float, default=None)
 
     return ap.parse_args()
 
@@ -579,42 +582,133 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    # =========================
+    # REPORT ONLY MODE
+    # =========================
+    if args.report_only:
+        required = [
+            ("--atrPeriod-fixed", args.atrPeriod_fixed),
+            ("--slMultiplier-fixed", args.slMultiplier_fixed),
+            ("--tpMultiplier-fixed", args.tpMultiplier_fixed),
+            ("--srBandMultiplier-fixed", args.srBandMultiplier_fixed),
+        ]
+        missing = [name for name, val in required if val is None]
+        if missing:
+            raise SystemExit("Missing required flags: " + ", ".join(missing))
+
+        fills = ["same_close", "next_open"] if args.report_both_fills else [args.fill]
+
+        data_dir = Path(args.data_dir)
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        all_files = sorted(data_dir.glob("*.parquet"))
+        if not all_files:
+            raise SystemExit(f"No .parquet files found in {data_dir.resolve()}")
+
+        file_paths = random.sample(all_files, args.files) if (len(all_files) > args.files) else all_files
+
+        for fm in fills:
+            best_score_single, overall, per, pf_avg, trades_avg = evaluate_params_on_files(
+                file_paths,
+                atrPeriod=int(args.atrPeriod_fixed),
+                slMultiplier=float(args.slMultiplier_fixed),
+                tpMultiplier=float(args.tpMultiplier_fixed),
+                srBandMultiplier=float(args.srBandMultiplier_fixed),
+                commission_rate_per_side=args.commission_rate_per_side,
+                fill_mode=fm,
+                use_trailing_exit=args.use_trailing_exit,
+                trail_mode=args.trail_mode,
+                close_on_sellSignal=args.close_on_sellSignal,
+                cooldown_bars=int(args.cooldown),
+                time_stop_bars=int(args.time_stop),
+                min_trades=args.min_trades,
+                pf_baseline=args.pf_baseline,
+                pf_k=args.pf_k,
+                trades_baseline=args.trades_baseline,
+                trades_k=args.trades_k,
+                weight_pf=args.weight_pf,
+                score_power=args.score_power,
+                pf_cap_score_only=args.pf_cap_score_only,
+                penalty_enabled=args.penalty,
+                loss_floor=args.loss_floor,
+                penalty_ret_center=args.penalty_ret_center,
+                penalty_ret_k=args.penalty_ret_k,
+                max_trades=args.max_trades,
+                max_trades_k=args.max_trades_k,
+                pf_floor=args.pf_floor,
+                pf_floor_k=args.pf_floor_k,
+                ret_floor=args.ret_floor,
+                ret_floor_k=args.ret_floor_k,
+            )
+
+            per_df = pd.DataFrame(per).sort_values(
+                ["ticker_score", "total_return", "profit_factor", "num_trades"],
+                ascending=False
+            )
+
+            per_csv = out_dir / f"per_ticker_summary_{fm}.csv"
+            per_df.to_csv(per_csv, index=False)
+
+            print(f"\n=== REPORT ONLY ({fm}) ===")
+            print(f"Saved: {per_csv}")
+            print(f"Avg PF: {overall['avg_pf_raw']}")
+            print(f"Avg Trades: {overall['avg_trades']}")
+            print(f"Mean Score: {overall['mean_ticker_score']}")
+            print(f"num_neg: {overall['num_neg']}")
+            print(f"Score: {best_score_single}")
+
+        print("\n=== FIXED PARAMS USED ===")
+        print(f"atrPeriod: {args.atrPeriod_fixed}")
+        print(f"slMultiplier: {args.slMultiplier_fixed}")
+        print(f"tpMultiplier: {args.tpMultiplier_fixed}")
+        print(f"srBandMultiplier: {args.srBandMultiplier_fixed}")
+        return
+
+    # Validate constraint knobs
+    if args.tp2sl_auto:
+        if args.tp2sl_min <= 0 or args.tp2sl_max <= 0:
+            raise SystemExit("--tp2sl-min and --tp2sl-max must be > 0")
+        if args.tp2sl_min > args.tp2sl_max:
+            raise SystemExit("--tp2sl-min must be <= --tp2sl-max")
+    else:
+        if args.min_tp2sl <= 0:
+            raise SystemExit("--min-tp2sl must be > 0")
+
     data_dir = Path(args.data_dir)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_files = sorted(data_dir.glob("*.parquet"))  # PARQUET ONLY
+    all_files = sorted(data_dir.glob("*.parquet"))
     if not all_files:
         raise SystemExit(f"No .parquet files found in {data_dir.resolve()}")
 
-    if len(all_files) > args.files:
-        file_paths = random.sample(all_files, args.files)
-    else:
-        file_paths = all_files
+    file_paths = random.sample(all_files, args.files) if (len(all_files) > args.files) else all_files
 
     ROBUST_FILLS = ["same_close", "next_open"]
 
     def objective(trial: optuna.Trial) -> float:
-        atrPeriod = trial.suggest_int("atrPeriod", 50, 70)
-        slMultiplier = trial.suggest_float("slMultiplier",6.0, 10.0)
-        tpMultiplier = trial.suggest_float("tpMultiplier", 4.0, 8.0)
-        srBandMultiplier = trial.suggest_float("srBandMultiplier", 0.44, 1.0)
+        atrPeriod = trial.suggest_int("atrPeriod", 50, 75)
+        slMultiplier = trial.suggest_float("slMultiplier", 6.0, 12.0)
+        tpMultiplier = trial.suggest_float("tpMultiplier", 4.5, 7.0)
+        srBandMultiplier = trial.suggest_float("srBandMultiplier", 0.44, 0.66)
 
-        # enforce SL > TP
-        if slMultiplier <= tpMultiplier:
+        # --- TP/SL asymmetry constraint (FIXED or AUTO) ---
+        if args.tp2sl_auto:
+            min_tp2sl_eff = args.tp2sl_base + args.tp2sl_k * (srBandMultiplier - args.tp2sl_sr0)
+            min_tp2sl_eff = max(args.tp2sl_min, min(args.tp2sl_max, min_tp2sl_eff))
+        else:
+            min_tp2sl_eff = args.min_tp2sl
+
+        if slMultiplier <= (min_tp2sl_eff * tpMultiplier):
             raise optuna.TrialPruned()
 
-        # cooldown: either fixed from CLI, or optimized
-        if args.opt_cooldown:
-            cooldown_bars = trial.suggest_int("cooldown", 0, 7)
-        else:
-            cooldown_bars = int(args.cooldown)
+        # optional prune for extreme combos
+        if tpMultiplier < 4.5 and srBandMultiplier > 0.95:
+            raise optuna.TrialPruned()
 
-        # time stop: either fixed from CLI, or optimized
-        if args.opt_time_stop:
-            time_stop_bars = trial.suggest_int("time_stop", 0, 20)
-        else:
-            time_stop_bars = int(args.time_stop)
+        cooldown_bars = trial.suggest_int("cooldown", 0, 7) if args.opt_cooldown else int(args.cooldown)
+        time_stop_bars = trial.suggest_int("time_stop", 0, 12) if args.opt_time_stop else int(args.time_stop)
 
         scores = []
         for fm in ROBUST_FILLS:
@@ -659,7 +753,7 @@ def main() -> None:
     study.optimize(objective, n_trials=args.trials, show_progress_bar=True)
 
     best = study.best_trial
-    best_params = best.params
+    best_params = dict(best.params)
 
     # normalize types
     best_params["atrPeriod"] = int(best_params["atrPeriod"])
@@ -667,19 +761,19 @@ def main() -> None:
     best_params["tpMultiplier"] = float(best_params["tpMultiplier"])
     best_params["srBandMultiplier"] = float(best_params["srBandMultiplier"])
 
-    # final cooldown
-    if args.opt_cooldown:
-        best_cooldown = int(best_params.get("cooldown", 0))
-    else:
-        best_cooldown = int(args.cooldown)
+    best_cooldown = int(best_params.get("cooldown", 0)) if args.opt_cooldown else int(args.cooldown)
+    best_time_stop = int(best_params.get("time_stop", 0)) if args.opt_time_stop else int(args.time_stop)
 
-    # final time stop
-    if args.opt_time_stop:
-        best_time_stop = int(best_params.get("time_stop", 0))
+    # compute effective constraint at best params
+    if args.tp2sl_auto:
+        best_min_tp2sl_eff = args.tp2sl_base + args.tp2sl_k * (best_params["srBandMultiplier"] - args.tp2sl_sr0)
+        best_min_tp2sl_eff = max(args.tp2sl_min, min(args.tp2sl_max, best_min_tp2sl_eff))
+        constraint_mode = "auto"
     else:
-        best_time_stop = int(args.time_stop)
+        best_min_tp2sl_eff = args.min_tp2sl
+        constraint_mode = "fixed"
 
-    best_score_single, overall, per, pf_avg, trades_avg = evaluate_params_on_files(
+    best_score_single, overall, per, _, _ = evaluate_params_on_files(
         file_paths,
         atrPeriod=best_params["atrPeriod"],
         slMultiplier=best_params["slMultiplier"],
@@ -738,6 +832,7 @@ def main() -> None:
     print(f"score_power:                  {args.score_power:.3f}")
     print(f"min_trades gate:              {args.min_trades}")
     print(f"loss_floor (scoring):         {args.loss_floor}")
+    print(f"min_tp2sl_eff (constraint):   {best_min_tp2sl_eff:.4f} ({constraint_mode})")
     print(f"Score (single fill '{args.fill}'): {best_score_single:.6f}")
 
     print("\n=== BEST PARAMS ===")
@@ -755,7 +850,8 @@ def main() -> None:
     print(f"Saved per-ticker CSV to: {per_csv}")
 
     print("\n=== INDIVIDUAL (TICKER) METRICS (w/ BEST PARAMS) ===")
-    print(per_df[["ticker", "profit_factor", "num_trades", "ticker_score", "total_return", "gross_profit", "gross_loss"]].to_string(index=False))
+    print(per_df[["ticker", "profit_factor", "num_trades", "ticker_score", "total_return",
+                 "gross_profit", "gross_loss", "maxdd"]].to_string(index=False))
 
     print(
         f"Done: Bayes_opt_dynamic_SR.py "
@@ -783,9 +879,11 @@ def main() -> None:
         f"--fill {args.fill} "
         f"--cooldown {best_cooldown} "
         f"--time-stop {best_time_stop} "
+        f"{'--tp2sl-auto ' if args.tp2sl_auto else ''}"
         f"{'--opt-cooldown ' if args.opt_cooldown else ''}"
         f"{'--opt-time-stop' if args.opt_time_stop else ''}"
     )
+
 
 if __name__ == "__main__":
     main()

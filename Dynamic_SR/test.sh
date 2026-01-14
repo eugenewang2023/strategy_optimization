@@ -1,0 +1,18 @@
+python Bayes_opt_dynamic_SR.py \
+  --report-only \
+  --report-both-fills \
+  --atrPeriod-fixed 59 \
+  --slMultiplier-fixed 11.659123072233372 \
+  --tpMultiplier-fixed 5.84193019452752 \
+  --srBandMultiplier-fixed 0.4646226032697182 \
+  --files 200 \
+  --penalty --penalty-ret-center -0.02 --penalty-ret-k 8 \
+  --min-trades 8 --trades-baseline 18 --trades-k 0.15 \
+  --max-trades 55 --max-trades-k 0.1 \
+  --ret-floor 0.005 --ret-floor-k 14 \
+  --pf-cap 10 --pf-baseline 2.2 --pf-k 2.0 \
+  --pf-floor 2.0 --pf-floor-k 2.0 \
+  --weight-pf 0.9 --score-power 1.0 \
+  --commission_rate_per_side 0.0006 --loss_floor 0.001 \
+  --cooldown 3 --time-stop 6 \
+  --tp2sl-auto
