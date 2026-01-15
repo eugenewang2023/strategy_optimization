@@ -215,9 +215,6 @@ def shift_series(x: np.ndarray, shift: int) -> np.ndarray:
     out[shift:] = x[:-shift]
     return out
 
-def pine_round(x):
-    # Matches Pine's math.round: rounds .5 away from zero
-    return np.floor(x + 0.5) if x >= 0 else np.ceil(x - 0.5)
 
 # =============================
 # Backtest core (dynamic_SR engine; ONLY signals differ)
@@ -290,15 +287,12 @@ def backtest_adapt_half_rsi_dynamic_engine(
     base_rsi = rsi_tv(sigClose, baseP)
 
     scaled = (100.0 - base_rsi) / 100.0
-    # adapt_raw = np.rint(scaled * float(maxP - minP) + float(minP))  # Pine: round()
-    # Replace np.rint in your script:
-    adapt_raw = pine_round(scaled * float(maxP - minP) + float(minP))
+    adapt_raw = np.rint(scaled * float(maxP - minP) + float(minP))  # Pine: round()
 
     adapt_clipped = np.clip(adapt_raw, float(minP), float(maxP))
     adaptive = np.where(np.isfinite(adapt_clipped), adapt_clipped, float(minP)).astype(int)
 
-    # fast_len = np.maximum(np.rint(adaptive.astype(float) / 2.0).astype(int), 1)
-    fast_len = np.maximum(pine_round(adaptive.astype(float) / 2.0).astype(int), 1)
+    fast_len = np.maximum(np.rint(adaptive.astype(float) / 2.0).astype(int), 1)
     slow_len = np.maximum(adaptive.astype(int), 2)
 
     rsi_by_len: Dict[int, np.ndarray] = {}
@@ -1049,7 +1043,7 @@ def main() -> None:
     per_df = pd.DataFrame(per)
     per_df["ticker_score"] = per_df["ticker_score"].fillna(0.0)
     per_df = per_df.sort_values(
-        ["profit_factor", "ticker_score", "total_return", "num_trades"],
+        ["profit_factor", "ticker_score", "total_return",  "num_trades"],
         ascending=False
     )
     per_csv = out_dir / "per_ticker_summary.csv"
