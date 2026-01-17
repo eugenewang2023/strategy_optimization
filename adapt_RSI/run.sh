@@ -3,11 +3,11 @@ set -euo pipefail
 set +x   # force-disable xtrace if inherited
 
 ###=================================================================================
-### PHASE-4 (High-Density Aggression & Trade Expansion)
-### Goal: Push trades from ~7 -> ~10+ | Tighten stops | Maximize rotation
+### PHASE-4 (Two-Regime High-Density Aggression)
+### Goal: Push trades to 10+ | Balanced Trend/Chop scoring | Forced Rotation
 ###=================================================================================
 
-# --- run from script directory (avoids path issues when launched elsewhere) ---
+# --- run from script directory ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -27,54 +27,55 @@ fi
 # --- reproducibility ---
 seed=7
 
-nTrials=1200      # Increased for tighter search space exploration
+nTrials=1200      # Sufficient trials to explore the sensitive search space
 nFiles=160
 fillOpt=next_open
 
 # 1) Trade gating (AGGRESSIVE TARGETS)
 min_trades=5
-trades_baseline=10    # Peak score reward only at 10+ trades
-trades_k=0.4          # Steeper penalty for low trade counts
-max_trades=250        # Higher ceiling for high-velocity tickers
+trades_baseline=10.0  # Crucial: Rewards peak at 10 trades per ticker
+trades_k=0.4          # Punishes low frequency heavily
+max_trades=250        # High ceiling for momentum runners
 max_trades_k=0.03
 
 # 2) Returns & penalties
-ret_floor=0.01        # Lowered to allow smaller, frequent winners
-ret_floor_k=8.0       # Sharper protection against "dust" returns
+ret_floor=0.01        # Low enough to capture micro-momentum
+ret_floor_k=8.0       # Steep tail protection
 penalty_center=0.0    
 penalty_k=6.0
 
 # 3) PF shaping
-pf_cap=5.0            # Cap vanity PFs to focus on frequency
-pf_baseline=1.02      # Lowered baseline for high-frequency acceptance
-pf_k=1.2              # Increased sensitivity to quality
+pf_cap=5.0            # Keeps Optuna focused on consistency over "lottery" wins
+pf_baseline=1.02      
+pf_k=1.2              
 pf_floor=1.0
 pf_floor_k=1.5
 
 # 4) Scoring balance
-weight_pf=0.40        # Shifted weight toward trade count (trades now ~60%)
-score_power=1.1       # Penalizes mediocre scores more aggressively
-coverage_target=0.85  # Demands high eligibility across tickers
+weight_pf=0.40        # Favors trade count and stability over raw PF
+score_power=1.1       
+coverage_target=0.85  # Targets high participation across tickers
 coverage_k=8.0
 
 # 5) Execution (FORCED ROTATION)
 commission_per_side=0.0006
 loss_floor=0.001
-cooldown=1            # Mandatory 1-bar cooldown for high frequency
-time_stop=15          # Mandatory short time-stop to prevent "holding"
+cooldown=1            # FORCED: Immediate re-entry allowed
+time_stop=15          # FORCED: Fast rotation (15-bar max hold)
 
 # 6) Risk constraint
 min_tp2sl=1.10
 
-# 7) SIGNAL REGIME
+# 7) SIGNAL REGIME (LOCKED)
 threshold_mode="fixed"
 threshold_fixed=0.04
 vol_floor_len=50
 vol_floor_mult_fixed=0.55
 
-# 8) Soft trend weighting knobs
-trend_center=0.80
-trend_k=3.0
+# 8) Two-Regime Scoring Knobs
+# Pivot point: 1.2 Return/DD ratio defines a "Trend"
+trend_center=1.20
+trend_k=4.0
 
 CMD=(
   "$PYTHON_BIN" Bayes_opt_adapt_RSI.py
@@ -131,9 +132,9 @@ CMD=(
 )
 
 echo "-------------------------------------------------------"
-echo "PHASE-4: HIGH-DENSITY AGGRESSION (Target: 10+ trades)"
-echo "Target: 10 trades/ticker | Coverage >= 85% | Cooldown: ${cooldown}"
-echo "Python: ${PYTHON_BIN} | Seed: ${seed} | Files: ${nFiles} | Trials: ${nTrials}"
+echo "PHASE-4: TWO-REGIME AGGRESSION (Target: 10+ trades)"
+echo "Baseline: ${trades_baseline} | Cooldown: ${cooldown} | Time-Stop: ${time_stop}"
+echo "Trend Pivot: ${trend_center} | Coverage Target: ${coverage_target}"
 echo "-------------------------------------------------------"
 
 # Execute

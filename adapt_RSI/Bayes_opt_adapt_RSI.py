@@ -974,18 +974,17 @@ def main() -> None:
     # OPTUNA
     # =========================
     def objective(trial: optuna.Trial) -> float:
-        # =========================
-        # 1) Suggest / set parameters
-        # =========================
-        # Aggressive Tightening: lower slMultiplier and atrPeriod to trigger more signals
+        # =========================================================================
+        # 1) Suggest / set parameters (High-Density Aggressive)
+        # =========================================================================
         atrPeriod    = trial.suggest_int("atrPeriod", 10, 25)
         slMultiplier = trial.suggest_float("slMultiplier", 1.2, 2.5) 
         tpMultiplier = trial.suggest_float("tpMultiplier", 2.0, 5.0)
 
         if getattr(args, "opt_adaptive", False):
-            basePeriod = trial.suggest_int("basePeriod", 10, 25) # Aggressive lookback
+            basePeriod = trial.suggest_int("basePeriod", 10, 25) 
             minPeriod  = trial.suggest_int("minPeriod", 2, 5)   
-            maxPeriod  = trial.suggest_int("maxPeriod", 12, 25) # Fast adaptation
+            maxPeriod  = trial.suggest_int("maxPeriod", 12, 25) 
         else:
             basePeriod = int(args.basePeriod_fixed)
             minPeriod  = int(args.minPeriod_fixed)
@@ -998,38 +997,35 @@ def main() -> None:
             fastPeriod = int(args.fastPeriod_fixed)
             slowPeriod = int(args.slowPeriod_fixed)
 
-        smooth_len = trial.suggest_int("smooth_len", 2, 6) # Minimal smoothing for speed
+        smooth_len = trial.suggest_int("smooth_len", 2, 6) 
         vol_floor_mult = float(args.vol_floor_mult_fixed)
 
-        # FORCED: Setting to 1 to allow immediate re-entry and maximize frequency
+        # FORCED: 1-bar cooldown to maximize frequency
         cooldown_bars = 1 
-        
-        # Optional: Fast exit optimization
         time_stop_bars = trial.suggest_int("time_stop", 5, 15) if getattr(args, "opt_time_stop", False) else int(args.time_stop)
 
-        # =========================
+        # =========================================================================
         # 2) Logical constraints
-        # =========================
-        if tpMultiplier < 1.1 * slMultiplier: return -1.0
+        # =========================================================================
+        if tpMultiplier < 1.01 * slMultiplier: return -1.0
         if fastPeriod >= slowPeriod: return -1.0
         if maxPeriod <= minPeriod: return -1.0
 
-        # =========================
+        # =========================================================================
         # 3) Threshold knobs
-        # =========================
+        # =========================================================================
         threshold_mode = str(args.threshold_mode)
         if threshold_mode == "fixed":
             threshold = float(args.threshold_fixed)
-            threshold_floor = 0.0
-            threshold_std_mult = 0.0
+            threshold_floor, threshold_std_mult = 0.0, 0.0
         else:
             threshold = 0.0 
-            threshold_floor = trial.suggest_float("threshold_floor", 0.005, 0.08) # Looser entry
+            threshold_floor = trial.suggest_float("threshold_floor", 0.005, 0.08)
             threshold_std_mult = trial.suggest_float("threshold_std_mult", 0.05, 0.40)
 
-        # =========================
+        # =========================================================================
         # 4) Evaluate
-        # =========================
+        # =========================================================================
         mean_score, overall, per, pf_raw_avg, trades_avg, coverage, eligible_count = evaluate_params_on_files(
             file_paths,
             atrPeriod=int(atrPeriod),
@@ -1076,27 +1072,49 @@ def main() -> None:
         if not per or coverage <= 0.0:
             return -1.0
 
-        # =========================
-        # 5) Aggressive High-Density Scoring
-        # =========================
+        # =========================================================================
+        # 5) Two-Regime Scoring Logic
+        # =========================================================================
         returns = np.array([x["total_return"] for x in per], dtype=float)
+        avg_dd = np.mean([abs(x.get("maxdd", 0.0)) for x in per])
+        portfolio_ret = np.mean(returns)
+        
+        # Stability: Standard Deviation Penalty
         std_dev = float(np.std(returns)) if returns.size > 1 else 1.0
-        stability_mult = 1.0 / (1.0 + std_dev)
+        stability_penalty = 1.0 / (1.0 + std_dev)
 
-        # Trade Density: Using a power of 2 to aggressively penalize low counts
+        # Regime Determination (Return-to-Drawdown Ratio)
+        # High Ratio = Trending | Low Ratio = Choppy
+        trendiness = portfolio_ret / (avg_dd + 0.001)
+        regime_weight = sigmoid(float(args.trend_k) * (trendiness - float(args.trend_center)))
+
+        # Regime A: Trend-Focused Score (Rewards high Profit and absolute returns)
+        score_trend = float(mean_score) * (1.0 + portfolio_ret)
+        
+        # Regime B: Chop-Focused Score (Rewards low variance and drawdown protection)
+        score_chop = float(mean_score) * stability_penalty
+
+        # Blended Base Score
+        blended_score = (regime_weight * score_trend) + ((1.0 - regime_weight) * score_chop)
+
+        # =========================================================================
+        # 6) Multipliers (Trade Density, Coverage, Drawdown)
+        # =========================================================================
+        # Target 10 trades; aggressive power penalty for under-trading
         target_trades = 10.0
         trade_density_mult = (min(1.0, float(trades_avg) / target_trades)) ** 2
 
-        # Drawdown protection
-        max_portfolio_dd = max((abs(x.get("maxdd", 0.0)) for x in per), default=0.0)
-        dd_gate = sigmoid(6.0 * (0.2 - max_portfolio_dd))
+        # Drawdown gate (Punishes any configuration exceeding 20% DD on any ticker)
+        max_ticker_dd = max((abs(x.get("maxdd", 0.0)) for x in per), default=0.0)
+        dd_gate = sigmoid(6.0 * (0.2 - max_ticker_dd))
 
         # Coverage Multiplier
         cov_p = sigmoid(float(args.coverage_k) * (float(coverage) - float(args.coverage_target)))
 
-        # Final Score
-        final_score = float(mean_score) * trade_density_mult * stability_mult * cov_p * dd_gate
+        # Final Composite Score
+        final_score = blended_score * trade_density_mult * cov_p * dd_gate
         return float(final_score)
+
 
     sampler = optuna.samplers.TPESampler(seed=args.seed)
     study = optuna.create_study(direction="maximize", sampler=sampler)
