@@ -977,65 +977,55 @@ def main() -> None:
         # =========================
         # 1) Suggest / set parameters
         # =========================
-        atrPeriod    = trial.suggest_int("atrPeriod", 10, 30)
-        slMultiplier = trial.suggest_float("slMultiplier", 1.5, 4.0)
-        tpMultiplier = trial.suggest_float("tpMultiplier", 1.5, 5.0)
+        # Aggressive Tightening: lower slMultiplier and atrPeriod to trigger more signals
+        atrPeriod    = trial.suggest_int("atrPeriod", 10, 25)
+        slMultiplier = trial.suggest_float("slMultiplier", 1.2, 2.5) 
+        tpMultiplier = trial.suggest_float("tpMultiplier", 2.0, 5.0)
 
-        # Adaptive RSI block: ONLY optimize if --opt-adaptive, else lock to *_fixed
         if getattr(args, "opt_adaptive", False):
-            basePeriod = trial.suggest_int("basePeriod", 10, 50)
-            minPeriod  = trial.suggest_int("minPeriod", 3, 10)
-            maxPeriod  = trial.suggest_int("maxPeriod", 20, 70)
+            basePeriod = trial.suggest_int("basePeriod", 10, 25) # Aggressive lookback
+            minPeriod  = trial.suggest_int("minPeriod", 2, 5)   
+            maxPeriod  = trial.suggest_int("maxPeriod", 12, 25) # Fast adaptation
         else:
             basePeriod = int(args.basePeriod_fixed)
             minPeriod  = int(args.minPeriod_fixed)
             maxPeriod  = int(args.maxPeriod_fixed)
 
-        # Fast/slow EMA block: ONLY optimize if --opt-fastslow, else lock to *_fixed
         if getattr(args, "opt_fastslow", False):
-            fastPeriod = trial.suggest_int("fastPeriod", 3, 15)
-            slowPeriod = trial.suggest_int("slowPeriod", 20, 100)
+            fastPeriod = trial.suggest_int("fastPeriod", 2, 8)  
+            slowPeriod = trial.suggest_int("slowPeriod", 15, 50) 
         else:
             fastPeriod = int(args.fastPeriod_fixed)
             slowPeriod = int(args.slowPeriod_fixed)
 
-        # Smooth len: you currently always optimize it; keep that behavior (or lock if you prefer)
-        smooth_len = trial.suggest_int("smooth_len", 3, 15)
-
-        # Vol floor multiplier: LOCK to --vol-floor-mult-fixed (shell wants this),
-        # unless you later add an --opt-vol-floor flag (not present now).
+        smooth_len = trial.suggest_int("smooth_len", 2, 6) # Minimal smoothing for speed
         vol_floor_mult = float(args.vol_floor_mult_fixed)
 
-        # Cooldown/time-stop
-        cooldown_bars = int(args.cooldown) if not getattr(args, "opt_cooldown", False) else trial.suggest_int("cooldown", 1, 8)
-        time_stop_bars = trial.suggest_int("time_stop", 10, 50) if getattr(args, "opt_time_stop", False) else int(args.time_stop)
+        # FORCED: Setting to 1 to allow immediate re-entry and maximize frequency
+        cooldown_bars = 1 
+        
+        # Optional: Fast exit optimization
+        time_stop_bars = trial.suggest_int("time_stop", 5, 15) if getattr(args, "opt_time_stop", False) else int(args.time_stop)
 
         # =========================
-        # 2) Logical constraints / pruning
+        # 2) Logical constraints
         # =========================
-        # (you can keep 1.1 here, or use min_tp2sl_eff_for(atrPeriod) if you want the CLI constraint)
-        if tpMultiplier < 1.1 * slMultiplier:
-            return -1.0
-        if fastPeriod >= slowPeriod:
-            return -1.0
-        if maxPeriod <= minPeriod:
-            return -1.0
+        if tpMultiplier < 1.1 * slMultiplier: return -1.0
+        if fastPeriod >= slowPeriod: return -1.0
+        if maxPeriod <= minPeriod: return -1.0
 
         # =========================
-        # 3) Threshold knobs (FIXED vs DYNAMIC)
-        #    FIX: if mode=fixed, DO NOT optimize threshold; use --threshold-fixed.
+        # 3) Threshold knobs
         # =========================
         threshold_mode = str(args.threshold_mode)
-
         if threshold_mode == "fixed":
-            threshold = float(args.threshold_fixed)        # LOCKED
-            threshold_floor = float(args.threshold_floor)  # unused in fixed mode
-            threshold_std_mult = float(args.threshold_std_mult)  # unused in fixed mode
+            threshold = float(args.threshold_fixed)
+            threshold_floor = 0.0
+            threshold_std_mult = 0.0
         else:
-            # dynamic mode ignores `threshold`; optimize the knobs it actually uses
-            threshold = float(args.threshold_fixed)  # placeholder
-            threshold_floor = trial.suggest_float("threshold_floor", 0.01, 0.20)
-            threshold_std_mult = trial.suggest_float("threshold_std_mult", 0.10, 0.80)
+            threshold = 0.0 
+            threshold_floor = trial.suggest_float("threshold_floor", 0.005, 0.08) # Looser entry
+            threshold_std_mult = trial.suggest_float("threshold_std_mult", 0.05, 0.40)
 
         # =========================
         # 4) Evaluate
@@ -1049,23 +1039,18 @@ def main() -> None:
             fill_mode=str(args.fill),
             cooldown_bars=int(cooldown_bars),
             time_stop_bars=int(time_stop_bars),
-
             basePeriod=int(basePeriod),
             minPeriod=int(minPeriod),
             maxPeriod=int(maxPeriod),
             fastPeriod=int(fastPeriod),
             slowPeriod=int(slowPeriod),
             smooth_len=int(smooth_len),
-
             threshold=float(threshold),
             threshold_mode=threshold_mode,
             threshold_floor=float(threshold_floor),
             threshold_std_mult=float(threshold_std_mult),
-
             vol_floor_mult=float(vol_floor_mult),
             vol_floor_len=int(args.vol_floor_len),
-
-            # scoring params from args
             min_trades=int(args.min_trades),
             pf_baseline=float(args.pf_baseline),
             pf_k=float(args.pf_k),
@@ -1088,31 +1073,30 @@ def main() -> None:
             trend_k=float(args.trend_k),
         )
 
-        ticker_stats = per
-        avg_trades = float(trades_avg)
-
-        if not ticker_stats:
-            return -1.0
-        if coverage <= 0.0:
+        if not per or coverage <= 0.0:
             return -1.0
 
         # =========================
-        # 5) Portfolio stabilization multipliers
+        # 5) Aggressive High-Density Scoring
         # =========================
-        returns = np.array([x["total_return"] for x in ticker_stats], dtype=float)
+        returns = np.array([x["total_return"] for x in per], dtype=float)
         std_dev = float(np.std(returns)) if returns.size > 1 else 1.0
-        variance_penalty = 1.0 / (1.0 + std_dev)
+        stability_mult = 1.0 / (1.0 + std_dev)
 
-        max_portfolio_dd = max((abs(x.get("maxdd", 0.0)) for x in ticker_stats), default=0.0)
-        dd_limit = 0.2
-        dd_gate = sigmoid(6.0 * (dd_limit - max_portfolio_dd))
+        # Trade Density: Using a power of 2 to aggressively penalize low counts
+        target_trades = 10.0
+        trade_density_mult = (min(1.0, float(trades_avg) / target_trades)) ** 2
 
+        # Drawdown protection
+        max_portfolio_dd = max((abs(x.get("maxdd", 0.0)) for x in per), default=0.0)
+        dd_gate = sigmoid(6.0 * (0.2 - max_portfolio_dd))
+
+        # Coverage Multiplier
         cov_p = sigmoid(float(args.coverage_k) * (float(coverage) - float(args.coverage_target)))
-        trade_p = min(1.0, avg_trades / float(args.trades_baseline))
 
-        final_score = float(mean_score) * float(cov_p) * float(trade_p) * float(variance_penalty) * float(dd_gate)
+        # Final Score
+        final_score = float(mean_score) * trade_density_mult * stability_mult * cov_p * dd_gate
         return float(final_score)
-
 
     sampler = optuna.samplers.TPESampler(seed=args.seed)
     study = optuna.create_study(direction="maximize", sampler=sampler)

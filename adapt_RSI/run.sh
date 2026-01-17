@@ -3,15 +3,15 @@ set -euo pipefail
 set +x   # force-disable xtrace if inherited
 
 ###=================================================================================
-### PHASE-3B (Recovery & Trade Expansion) + Trend-weighted scoring
-### Goal: Recover coverage, lift trades from ~4 -> ~6
+### PHASE-4 (High-Density Aggression & Trade Expansion)
+### Goal: Push trades from ~7 -> ~10+ | Tighten stops | Maximize rotation
 ###=================================================================================
 
 # --- run from script directory (avoids path issues when launched elsewhere) ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# --- python resolver (aliases don't apply in non-interactive shells) ---
+# --- python resolver ---
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [[ -z "${PYTHON_BIN}" ]]; then
   if command -v python3 >/dev/null 2>&1; then
@@ -27,46 +27,46 @@ fi
 # --- reproducibility ---
 seed=7
 
-nTrials=1000
+nTrials=1200      # Increased for tighter search space exploration
 nFiles=160
 fillOpt=next_open
 
-# 1) Trade gating (RECOVERY)
+# 1) Trade gating (AGGRESSIVE TARGETS)
 min_trades=5
-trades_baseline=7
-trades_k=0.2
-max_trades=180
-max_trades_k=0.05
+trades_baseline=10    # Peak score reward only at 10+ trades
+trades_k=0.4          # Steeper penalty for low trade counts
+max_trades=250        # Higher ceiling for high-velocity tickers
+max_trades_k=0.03
 
 # 2) Returns & penalties
-ret_floor=0.02
-ret_floor_k=6.0
-penalty_center=0.0     # avoid "-0.0" in logs
+ret_floor=0.01        # Lowered to allow smaller, frequent winners
+ret_floor_k=8.0       # Sharper protection against "dust" returns
+penalty_center=0.0    
 penalty_k=6.0
 
 # 3) PF shaping
-pf_cap=6.0
-pf_baseline=1.05
-pf_k=0.9
+pf_cap=5.0            # Cap vanity PFs to focus on frequency
+pf_baseline=1.02      # Lowered baseline for high-frequency acceptance
+pf_k=1.2              # Increased sensitivity to quality
 pf_floor=1.0
-pf_floor_k=1.0
+pf_floor_k=1.5
 
 # 4) Scoring balance
-weight_pf=0.45
-score_power=1.0
-coverage_target=0.60
-coverage_k=6.0
+weight_pf=0.40        # Shifted weight toward trade count (trades now ~60%)
+score_power=1.1       # Penalizes mediocre scores more aggressively
+coverage_target=0.85  # Demands high eligibility across tickers
+coverage_k=8.0
 
-# 5) Execution
+# 5) Execution (FORCED ROTATION)
 commission_per_side=0.0006
 loss_floor=0.001
-cooldown=1
-time_stop=40
+cooldown=1            # Mandatory 1-bar cooldown for high frequency
+time_stop=15          # Mandatory short time-stop to prevent "holding"
 
 # 6) Risk constraint
 min_tp2sl=1.10
 
-# 7) LOCKED SIGNAL REGIME
+# 7) SIGNAL REGIME
 threshold_mode="fixed"
 threshold_fixed=0.04
 vol_floor_len=50
@@ -131,15 +131,10 @@ CMD=(
 )
 
 echo "-------------------------------------------------------"
-echo "Phase-3B: Coverage Recovery & Trade Expansion (+ Trend-weighted scoring)"
-echo "Target: ~6 trades/ticker | Coverage >= 60% | min_trades=${min_trades} | pf_cap=${pf_cap}"
-echo "Python: ${PYTHON_BIN} | Seed: ${seed} | Files: ${nFiles} | Trials: ${nTrials} | Fill: ${fillOpt}"
+echo "PHASE-4: HIGH-DENSITY AGGRESSION (Target: 10+ trades)"
+echo "Target: 10 trades/ticker | Coverage >= 85% | Cooldown: ${cooldown}"
+echo "Python: ${PYTHON_BIN} | Seed: ${seed} | Files: ${nFiles} | Trials: ${nTrials}"
 echo "-------------------------------------------------------"
-
-# Optional: print the exact command only if requested
-if [[ "${SHOW_CMD:-0}" == "1" ]]; then
-  printf 'CMD:'; printf ' %q' "${CMD[@]}"; echo
-fi
 
 # Execute
 "${CMD[@]}"
