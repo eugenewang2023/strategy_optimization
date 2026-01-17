@@ -1,3 +1,97 @@
+1/17/2026,adapt_RSI v0.2
+After comparing the two sets of results, the Latest Version (adapt_RSI v0.2) is significantly better for actual trading,
+despite the Earlier Version showing much higher "vanity" numbers (like a Profit Factor of 26.5).
+Here is the breakdown of why the Latest Version is the superior model:
+1. Statistical Reliability vs. "Luck"The biggest danger in the Earlier Version is its extremely low trade count.Earlier Version: Avg Trades/Ticker is 3.47.Latest Version: Avg Trades/Ticker is 6.05.
+Why it matters: A strategy that only takes 3 trades over a backtest period is highly susceptible to "curve fitting." 
+It likely found a few specific bars that worked perfectly. 
+The Latest Version nearly doubles the trade density, which means the results are more likely to repeat in the future.
+2. Profit Factor: Realistic vs. Theoretical
+The Earlier Version shows an Avg Profit Factor of 26.53, 
+but this is an illusion caused by several tickers (STI, SATS, XPEV, IREN, STX) having "inf" (infinite) Profit Factors.
+An "inf" PF occurs when there are zero losing trades.
+While this looks amazing, it usually indicates the model is too restrictive or "over-optimized" for that specific data window.
+Latest Version: Shows an Avg PF of 5.17. While lower, this is a much more "pro" number. 
+It shows the strategy can handle losses and still come out significantly ahead.
+3. The "Eligibility" Gate
+The models used different "min_trades" gates to determine if a ticker was successful:
+Earlier Version: Used a gate of 3 trades.
+Latest Version: Used a gate of 5 trades.
+Winner: The Latest Version is better because it demands more evidence before calling a ticker "eligible." 
+Even with this tougher requirement, it maintained a solid coverage.
+4. Comparison Summary
+Metric	Earlier Version	Latest Version (Winner)
+Robustness	Very Low (Avg 3.4 trades)	Moderate (Avg 6.0 trades)
+Profitability	Theoretical/Fragile (Many "inf" PFs)	Realistic (PF 5.17)
+Min-Trades Gate	3 (Loose)	5 (Better)
+Max Drawdown	Very low (due to few trades)	Normal/Expected
+
+Key Takeaway
+The Earlier Version is what we call a "Ghost Strategy." It looks perfect on paper because it barely traded, effectively "dodging" the market's volatility rather than trading through it.
+The Latest Version is a "Working Strategy." It enters the market more often and maintains a Profit Factor above 5.0 even when things go wrong. In live trading, the Latest Version is far less likely to collapse the moment the market conditions change slightly.
+
+=== OVERALL (ALL FILES) METRICS (BEST PARAMS) ===
+Avg Profit Factor (raw):      5.172241776904312
+Avg Profit Factor (diag):     3.747500
+Avg Trades / Ticker:          6.053
+Mean Ticker Score (eligible): 0.423350
+Coverage (eligible/total):    15/19 = 0.789
+Penalty enabled:              True (soft)
+Soft penalty center/k:        0.0 / 6.0
+Tail-protection ret floor/k:  0.02 / 6.0
+Max-trades penalty:           max_trades=180, k=0.05
+PF-floor penalty:             pf_floor=1.0, k=1.0
+cooldown_bars:                1 (opt=False)  [loss-only]
+time_stop_bars:               32 (0=disabled)  (opt=True)
+num_neg (return<=0):          4/19
+commission_rate_per_side:     0.000600
+PF ROC baseline/k:            1.050 / 0.900
+Trades ROC baseline/k:        7.000 / 0.200
+weight_pf:                    0.450
+score_power:                  1.000
+min_trades gate:              5
+loss_floor (scoring):         0.001
+min_tp2sl_eff (constraint):   1.1000 (fixed)
+threshold_mode:               fixed
+Score (single fill 'next_open'): 0.423350
+
+=== BEST PARAMS ===
+atrPeriod: 30
+basePeriod: 35
+fastPeriod: 3
+maxPeriod: 32
+minPeriod: 8
+slMultiplier: 2.4205183247623805
+slowPeriod: 21
+smooth_len: 3
+time_stop: 32
+tpMultiplier: 3.555808406836294
+best_score (OPTUNA objective): 0.10556608861932634
+fill_mode (final report): next_open
+Saved per-ticker CSV to: output\per_ticker_summary.csv
+
+=== INDIVIDUAL (TICKER) METRICS (w/ BEST PARAMS) ===
+ticker  profit_factor  profit_factor_diag  num_trades  ticker_score  total_return  gross_profit  gross_loss     maxdd  eligible
+  TERN      18.022032            6.000000           7      0.705269      0.842193      0.729898    0.040500 -0.042226      True
+   STI       9.236673            6.000000           6      0.685499      1.119380      1.125793    0.121883 -0.122978      True
+  EOSE       4.710848            4.710848           7      0.660530      0.636080      0.745048    0.158156 -0.099765      True
+  METC      13.770278            6.000000           5      0.643140      0.727889      0.665816    0.048352 -0.050064      True
+  SNDK            inf            6.000000           5      0.578894      0.456955      0.416242    0.000000 -0.001799      True
+  BITF       4.474280            4.474280           6      0.533473      0.378182      0.495777    0.110806 -0.093370      True
+  CIEN       3.856291            3.856291           7      0.524570      0.368532      0.501352    0.130009 -0.103392      True
+  MRNA       4.934014            4.934014           6      0.511139      0.390325      0.475746    0.096422 -0.096602      True
+  BLBX       3.184065            3.184065           9      0.491827      0.328966      0.485608    0.152512 -0.150950      True
+  XPEV       5.425910            5.425910           7      0.439736      0.259575      0.322614    0.059458 -0.062276      True
+  SATS       4.066848            4.066848           6      0.435823      0.269111      0.372367    0.091561 -0.071153      True
+   NEM       1.159914            1.159914          10      0.078432      0.007313      0.313855    0.270585 -0.175121      True
+   CLS       0.830215            0.830215           6      0.031841     -0.062294      0.172406    0.207665 -0.192490      True
+  ASML       0.593099            0.593099           7      0.022901     -0.089304      0.112505    0.189690 -0.115640      True
+  AZTA       0.024456            0.024456           6      0.007176     -0.153695      0.003870    0.158233 -0.156451      True
+  IREN      10.624710            6.000000           3      0.000000      0.206621      0.238639    0.022461 -0.024680     False
+  PRAX       6.244155            6.000000           4      0.000000      0.137206      0.175779    0.028151 -0.029899     False
+   STX       1.942565            1.942565           4      0.000000      0.039115      0.101231    0.052112 -0.055273     False
+  NFLX       0.000000            0.000000           4      0.000000     -0.188873      0.000000    0.193820 -0.188873     False
+
 1/15/2026, adapt_RSI v0.1
 === OVERALL (ALL FILES) METRICS (BEST PARAMS) ===
 Avg Profit Factor (raw):      26.531672156129222

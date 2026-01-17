@@ -52,6 +52,7 @@ time_stop=6
 # Your previous 1.4 was likely too restrictive for NFLX to exit profitably.
 
 CMD="python Bayes_opt_adapt_half_RSI.py \
+  --optimize \
   --trials $nTrails \
   --files $nFiles \
   --penalty \

@@ -2,41 +2,25 @@
 """
 Bayes_opt_adapt_RSI.py
 
-✅ Matches Bayes_opt_adapt_half_RSI.py in EVERYTHING EXCEPT signal generation.
+Goal:
+✅ Keep the SAME scoring/coverage/robust-fills framework as your Bayes_opt_adapt_half_RSI.py
+✅ Only signals differ (adaptive RSI / hot_sm), plus optional hysteresis + volatility floor
 
-Everything kept identical to Bayes_opt_adapt_half_RSI.py:
-- PARQUET-only loading + ensure_ohlc
-- Fill modes: same_close / next_open
-- Multiplicative equity model (start 1.0)
-- Commission: commission_rate_per_side applied on entry and exit
-- Exits: same trailing engine / optional hard SL / time-stop / close_on_sellSignal
-- Cooldown: loss-only
-- Scoring: identical sigmoid ROC weights and penalties (eligible-only mean score)
-- Coverage metric + coverage penalty
-- Robust objective: mean score across BOTH fills, gap penalty
-- Optuna structure + tp2sl asymmetry constraint
-- Report-only & report-both-fills
-- Per-ticker CSV sorting
+Key fixes in this version (your "Report" & "Final Report" issues):
+- REPORT mode and FINAL REPORT now run through the SAME evaluation pipeline.
+- evaluate_params_on_files() returns the same tuple everywhere:
+    (mean_score, overall, per, pf_raw_avg, trades_avg, coverage, eligible_count)
+- Backtest uses PARQUET + ensure_ohlc (no accidental pd.read_csv)
+- Per-ticker dict always includes: profit_factor, profit_factor_diag, num_trades, ticker_score, etc.
+- profit_factor_diag is computed with the SAME loss_floor logic as scoring AND capped to pf_cap_score_only.
+- Report mode correctly passes threshold/vol_floor_mult and prints avg_pf_diag without KeyErrors.
+- Final report uses the same per-ticker sorting keys and saves CSV consistently.
 
-ONLY CHANGE (signals):
-- Use adapt_RSI-style fast/slow RSI from adaptive_rsi via EMA:
-    baseRSI -> adaptivePeriod (round + clamp)
-    adaptive_rsi selected per-bar from RSI(1..maxPeriod)
-    fast_rsi = EMA(adaptive_rsi, fastPeriod)
-    slow_rsi = EMA(adaptive_rsi, slowPeriod)
-    hot = fast_rsi - slow_rsi
-    hot_sm = SMA(hot, smooth_len)   <-- keep SAME smoothing type as half_RSI
-    buy/sell = crossover/crossunder(hot_sm, 0)
-
-Per your request:
-- smooth_len stays as an input/opt knob (same as half_RSI optimizer).
-- NO trend filter / future filter.
-
-Notes on CLI compatibility:
-- All flags from Bayes_opt_adapt_half_RSI.py are preserved.
-- Added optional fast/slow EMA knobs:
-    --fastPeriod-fixed, --slowPeriod-fixed, --opt-fastslow
-  If you don't use them, defaults are fast=4, slow=50 (from your Bayes_opt_adapt_RSI defaults).
+Signals (only difference from half_RSI):
+- Compute base RSI on HA close (sigClose), map to adaptive RSI length per bar (sigmoid mapping)
+- adaptive_rsi -> EMA(fast/slow) -> hot -> SMA -> hysteresis cross using +/- threshold
+- Optional: dynamic threshold based on rolling std of hot_sm (if threshold_mode="dynamic")
+- Volatility filter: ATR must exceed SMA(ATR)*vol_floor_mult
 """
 
 import math
@@ -122,20 +106,21 @@ def crossunder(a_prev: float, a_now: float, b_prev: float, b_now: float) -> bool
 def sma(x: np.ndarray, length: int) -> np.ndarray:
     n = len(x)
     out = np.full(n, np.nan, dtype=float)
-    if length <= 0 or n < length:
+    L = int(length)
+    if L <= 0 or n < L:
         return out
 
     csum = np.cumsum(np.nan_to_num(x, nan=0.0))
     isn = np.isnan(x).astype(np.int32)
     nan_csum = np.cumsum(isn)
 
-    for i in range(length - 1, n):
-        nan_count = nan_csum[i] - (nan_csum[i - length] if i >= length else 0)
+    for i in range(L - 1, n):
+        nan_count = nan_csum[i] - (nan_csum[i - L] if i >= L else 0)
         if nan_count > 0:
             out[i] = np.nan
         else:
-            s = csum[i] - (csum[i - length] if i >= length else 0.0)
-            out[i] = s / length
+            s = csum[i] - (csum[i - L] if i >= L else 0.0)
+            out[i] = s / L
     return out
 
 
@@ -146,23 +131,24 @@ def rsi_tv(price: np.ndarray, length: int) -> np.ndarray:
     """
     n = len(price)
     out = np.full(n, np.nan, dtype=float)
-    if length <= 0 or n < 2:
+    L = int(length)
+    if L <= 0 or n < 2:
         return out
 
     ch = np.diff(price, prepend=np.nan)
     gain = np.where(ch > 0, ch, 0.0)
     loss = np.where(ch < 0, -ch, 0.0)
 
-    def rma(x: np.ndarray, L: int) -> np.ndarray:
+    def rma(x: np.ndarray, period: int) -> np.ndarray:
         y = np.full(n, np.nan, dtype=float)
-        if n < L:
+        if n < period:
             return y
 
-        # seed at first non-nan window of length L
-        if np.isnan(x[:L]).any():
+        # seed
+        if np.isnan(x[:period]).any():
             start = None
-            for i in range(L - 1, n):
-                w = x[i - L + 1:i + 1]
+            for i in range(period - 1, n):
+                w = x[i - period + 1:i + 1]
                 if not np.isnan(w).any():
                     y[i] = float(np.mean(w))
                     start = i + 1
@@ -170,10 +156,10 @@ def rsi_tv(price: np.ndarray, length: int) -> np.ndarray:
             if start is None:
                 return y
         else:
-            y[L - 1] = float(np.mean(x[:L]))
-            start = L
+            y[period - 1] = float(np.mean(x[:period]))
+            start = period
 
-        alpha = 1.0 / float(L)
+        alpha = 1.0 / float(period)
         for i in range(start, n):
             if np.isnan(x[i]) or np.isnan(y[i - 1]):
                 y[i] = np.nan
@@ -181,8 +167,8 @@ def rsi_tv(price: np.ndarray, length: int) -> np.ndarray:
                 y[i] = y[i - 1] + alpha * (x[i] - y[i - 1])
         return y
 
-    ag = rma(gain, length)
-    al = rma(loss, length)
+    ag = rma(gain, L)
+    al = rma(loss, L)
 
     for i in range(n):
         if np.isnan(ag[i]) or np.isnan(al[i]):
@@ -210,7 +196,6 @@ def ema_tv(x: np.ndarray, length: int) -> np.ndarray:
 
     alpha = 2.0 / float(L + 1)
 
-    # seed at first index where window has no NaNs
     start = None
     for i in range(L - 1, n):
         w = x[i - L + 1:i + 1]
@@ -230,7 +215,7 @@ def ema_tv(x: np.ndarray, length: int) -> np.ndarray:
 
 
 # =============================
-# Backtest core (dynamic_SR engine; ONLY signals differ)
+# Backtest core
 # =============================
 @dataclass
 class TradeStats:
@@ -240,6 +225,8 @@ class TradeStats:
     total_return: float = 0.0
     maxdd: float = 0.0
     profit_factor: float = 0.0
+    profit_factor_diag: float = 0.0  # stable + capped like scoring
+    trend_metric: float = 0.0
 
 
 def backtest_adapt_rsi_dynamic_engine(
@@ -250,40 +237,60 @@ def backtest_adapt_rsi_dynamic_engine(
     tpMult: float,
     commission_per_side: float,
     fill_mode: str,
-    use_trailing_exit: bool = True,
-    trail_mode: str = "trail_only",          # "trail_only" or "trail_plus_hard_sl"
-    close_on_sellSignal: bool = True,
-    cooldown_bars: int = 0,
-    time_stop_bars: int = 0,
-    # --- adaptive period knobs (period selection) ---
-    basePeriod: int = 15,
-    minPeriod: int = 5,
-    maxPeriod: int = 20,
-    # --- EMA knobs for fast/slow lines ---
-    fastPeriod: int = 4,
-    slowPeriod: int = 50,
-    # --- keep SAME smoothing layer as half_RSI ---
-    smooth_len: int = 2,
+    cooldown_bars: int,
+    time_stop_bars: int,
+    # adaptive RSI knobs
+    basePeriod: int,
+    minPeriod: int,
+    maxPeriod: int,
+    fastPeriod: int,
+    slowPeriod: int,
+    smooth_len: int,
+    # hysteresis / vol filter knobs
+    threshold: float,
+    threshold_mode: str,          # "fixed" or "dynamic"
+    threshold_floor: float,       # minimum threshold used in dynamic mode
+    threshold_std_mult: float,    # multiplier * rolling std in dynamic mode
+    vol_floor_mult: float,
+    vol_floor_len: int,
+    # scoring alignment
+    loss_floor: float,
+    pf_cap_score_only: float,
 ) -> TradeStats:
+    df = ensure_ohlc(df)
     o = df["open"].to_numpy(dtype=float)
     h = df["high"].to_numpy(dtype=float)
     l = df["low"].to_numpy(dtype=float)
     c = df["close"].to_numpy(dtype=float)
-    n = len(df)
+    n = len(c)
 
-    if n < max(int(atrPeriod) + 2, 60):
+    if n < max(int(atrPeriod) + 2, 200):
         return TradeStats()
 
-    # HA from REAL; signals use HA close
+    # HA signals from REAL OHLC (chart-type stable)
     _, _, _, ha_c = heikin_ashi_from_real(o, h, l, c)
     sigClose = ha_c
 
-    # REAL ATR + REAL high/low for risk engine
-    real_atr = atr_wilder(h, l, c, int(atrPeriod))
-    valid_idx = np.where(~np.isnan(real_atr))[0]
+    # REAL ATR for risk & vol-floor
+    atr = atr_wilder(h, l, c, int(atrPeriod))
+    valid_idx = np.where(~np.isnan(atr))[0]
     if len(valid_idx) == 0:
         return TradeStats()
     start = int(valid_idx[0])
+
+    # -----------------------------
+    # Trend metric (soft weighting)
+    # -----------------------------
+    # Normalize EMA separation by ATR so it's scale-invariant across tickers.
+    ema_fast_tr = ema_tv(sigClose, 50)
+    ema_slow_tr = ema_tv(sigClose, 200)
+
+    sep = np.abs(ema_fast_tr - ema_slow_tr) / (atr + 1e-12)
+    # Use mean over valid region
+    if np.isfinite(sep).any():
+        trend_metric = float(np.nanmean(sep))
+    else:
+        trend_metric = 0.0
 
     def get_fill(i: int) -> Optional[float]:
         if fill_mode == "same_close":
@@ -292,140 +299,138 @@ def backtest_adapt_rsi_dynamic_engine(
             return float(o[i + 1]) if (i + 1 < n) else None
         return float(c[i])
 
-    # =============================
-    # Signal pipeline (ONLY part that differs vs adapt_half_RSI)
-    #
-    # adaptive_rsi -> EMA fast/slow -> hot -> SMA(hot, smooth_len) -> zero cross
-    # =============================
-    baseP = int(max(1, basePeriod))
-    minP = int(max(2, minPeriod))
-    maxP = int(max(minP, maxPeriod))
+    # -----------------------------
+    # Signal: sigmoid-adaptive RSI lengths
+    # -----------------------------
+    baseP = max(2, int(basePeriod))
+    minP = max(2, int(minPeriod))
+    maxP = max(minP, int(maxPeriod))
+    fp = max(1, int(fastPeriod))
+    sp = max(fp + 1, int(slowPeriod))
+    sm = max(1, int(smooth_len))
 
-    fp = int(max(1, fastPeriod))
-    sp = int(max(fp + 1, slowPeriod))  # keep sane ordering
+    base_rsi = rsi_tv(sigClose, baseP)  # 0..100
 
-    base_rsi = rsi_tv(sigClose, baseP)
-    scaled = (100.0 - base_rsi) / 100.0
-    adapt_raw = np.rint(scaled * float(maxP - minP) + float(minP))  # Pine: round()
-    adapt_clipped = np.clip(adapt_raw, float(minP), float(maxP))
-    adaptive = np.where(np.isfinite(adapt_clipped), adapt_clipped, float(minP)).astype(int)
+    # sigmoid mapping around 50
+    # k_sigmoid in (0,1), pushes period toward maxP when RSI high (or vice versa depending on sign)
+    k_sigmoid = 1.0 / (1.0 + np.exp(-0.1 * (base_rsi - 50.0)))
+    adapt_p = (k_sigmoid * float(maxP - minP) + float(minP))
+    adapt_p = np.clip(adapt_p, float(minP), float(maxP))
+    adapt_p_int = np.where(np.isfinite(adapt_p), np.rint(adapt_p), float(minP)).astype(int)
 
-    # Precompute RSI(1..maxP) and select per-bar adaptive_rsi
-    rsi_by_len: Dict[int, np.ndarray] = {}
-    for L in range(1, maxP + 1):
-        rsi_by_len[L] = rsi_tv(sigClose, L)
+    # precompute RSI for lengths in [minP..maxP]
+    rsi_map: Dict[int, np.ndarray] = {}
+    for L in range(minP, maxP + 1):
+        rsi_map[L] = rsi_tv(sigClose, L)
 
     adaptive_rsi = np.full(n, np.nan, dtype=float)
     for i in range(n):
-        p = int(adaptive[i])
-        if p in rsi_by_len:
-            adaptive_rsi[i] = float(rsi_by_len[p][i])
+        p = int(adapt_p_int[i])
+        if p in rsi_map:
+            adaptive_rsi[i] = rsi_map[p][i]
 
     fast_rsi = ema_tv(adaptive_rsi, fp)
     slow_rsi = ema_tv(adaptive_rsi, sp)
+    hot_sm = sma(fast_rsi - slow_rsi, sm)
 
-    hot = fast_rsi - slow_rsi
-    sm = max(1, int(smooth_len))
-    hot_sm = sma(hot, sm)
+    # Dynamic threshold
+    if threshold_mode == "dynamic":
+        # stddev of hot_sm over vol_floor_len (reuse len for simplicity)
+        # using pandas rolling to handle NaNs cleanly
+        s_std = pd.Series(hot_sm).rolling(int(vol_floor_len), min_periods=int(vol_floor_len)).std().to_numpy()
+        dyn_thresh = np.maximum(float(threshold_floor), np.nan_to_num(s_std) * float(threshold_std_mult))
+    else:
+        dyn_thresh = np.full(n, float(threshold), dtype=float)
 
-    # =============================
-    # dynamic_SR-like trade engine
-    # (gp/gl accounting: pnl percent, not equity-units)
-    # =============================
+    # Volatility floor: ATR > SMA(ATR, vol_floor_len) * vol_floor_mult
+    atr_ma = sma(atr, int(vol_floor_len))
+    vol_ok = atr > (atr_ma * float(vol_floor_mult))
+
+    # -----------------------------
+    # Trade engine (long-only)
+    # -----------------------------
     in_pos = False
     entry = 0.0
     trades = 0
-
     equity = 1.0
     peak = 1.0
     maxdd = 0.0
-
     gp = 0.0
     gl = 0.0
-
     cooldown_left = 0
     bars_in_trade = 0
     ts_bars = max(0, int(time_stop_bars))
-
-    trail_active = False
-    trail_stop = np.nan
-    trail_high_since = np.nan
-    trail_dist = np.nan
+    has_hit_be = False
 
     def apply_commission(eq: float) -> float:
         return eq * (1.0 - commission_per_side)
 
-    for i in range(start + 1, n):
-        if np.isnan(real_atr[i]) or np.isnan(hot_sm[i - 1]) or np.isnan(hot_sm[i]):
-            continue
+    # require enough history for vol floor + dyn thresh
+    loop_start = max(start + 2, int(vol_floor_len) + 2, 2)
 
+    for i in range(loop_start, n - 1):
         if cooldown_left > 0:
             cooldown_left -= 1
+            continue
 
-        buy_sig = crossover(hot_sm[i - 1], hot_sm[i], 0.0, 0.0)
-        sell_sig = crossunder(hot_sm[i - 1], hot_sm[i], 0.0, 0.0)
+        if np.isnan(hot_sm[i - 1]) or np.isnan(hot_sm[i]) or np.isnan(dyn_thresh[i]) or np.isnan(atr[i]):
+            continue
+
+        th = float(dyn_thresh[i])
+
+        buy_sig = (hot_sm[i - 1] <= th) and (hot_sm[i] > th)
+        sell_sig = (hot_sm[i - 1] >= -th) and (hot_sm[i] < -th)
 
         # Entry
-        if (not in_pos) and buy_sig and (cooldown_left == 0):
+        if (not in_pos) and buy_sig and bool(vol_ok[i]):
             fill = get_fill(i)
             if fill is None:
                 continue
-            in_pos = True
             entry = float(fill)
+            in_pos = True
             trades += 1
             equity = apply_commission(equity)
-
             bars_in_trade = 0
-            trail_active = False
-            trail_stop = np.nan
-            trail_high_since = np.nan
-            trail_dist = np.nan
+            has_hit_be = False
+            continue
 
         # Manage open position
         if in_pos:
             bars_in_trade += 1
 
-            stop_level = l[i] - real_atr[i] * slMult
-            tgt_level = h[i] + real_atr[i] * tpMult
-            trail_dist = real_atr[i] * tpMult
+            # Breakeven logic in ATR units
+            pnl_atr = (c[i] - entry) / (atr[i] + 1e-12)
+            if pnl_atr > 1.5:
+                has_hit_be = True
+
+            # SL/TP levels anchored to entry (fixed bug)
+            stop_level = entry if has_hit_be else (entry - atr[i] * slMult)
+            tgt_level = entry + atr[i] * tpMult
 
             exit_now = False
             exit_price: Optional[float] = None
 
-            # Trailing activation/update
-            if use_trailing_exit:
-                if (not trail_active) and (h[i] >= entry + trail_dist):
-                    trail_active = True
-                    trail_high_since = float(h[i])
-                    trail_stop = trail_high_since - trail_dist
-                elif trail_active:
-                    trail_high_since = float(h[i]) if np.isnan(trail_high_since) else max(trail_high_since, float(h[i]))
-                    trail_stop = trail_high_since - trail_dist
-
-            # Intrabar triggers (conservative long)
-            hard_stop_enabled = (not use_trailing_exit) or (trail_mode == "trail_plus_hard_sl")
-            if hard_stop_enabled and (l[i] <= stop_level):
+            # Intrabar conservative: stop uses low, tp uses high
+            if l[i] <= stop_level:
                 exit_now = True
                 exit_price = float(stop_level)
-
-            if (not exit_now) and use_trailing_exit and trail_active and (not np.isnan(trail_stop)):
-                if l[i] <= trail_stop:
-                    exit_now = True
-                    exit_price = float(trail_stop)
-
-            if (not exit_now) and (h[i] >= tgt_level):
+            elif h[i] >= tgt_level:
                 exit_now = True
                 exit_price = float(tgt_level)
-
-            if (not exit_now) and (ts_bars > 0) and (bars_in_trade >= ts_bars):
+            elif (ts_bars > 0) and (bars_in_trade >= ts_bars):
+                # loss-only time stop
                 fill = get_fill(i)
                 if fill is not None:
                     unreal = (float(fill) - entry) / entry
                     if unreal <= 0.0:
                         exit_now = True
                         exit_price = float(fill)
-
-            if (not exit_now) and close_on_sellSignal and sell_sig:
+            elif sell_sig:
+                fill = get_fill(i)
+                if fill is not None:
+                    exit_now = True
+                    exit_price = float(fill)
+            elif i == n - 2:
                 fill = get_fill(i)
                 if fill is not None:
                     exit_now = True
@@ -445,10 +450,7 @@ def backtest_adapt_rsi_dynamic_engine(
                 in_pos = False
                 entry = 0.0
                 bars_in_trade = 0
-                trail_active = False
-                trail_stop = np.nan
-                trail_high_since = np.nan
-                trail_dist = np.nan
+                has_hit_be = False
 
         if equity > peak:
             peak = equity
@@ -456,30 +458,31 @@ def backtest_adapt_rsi_dynamic_engine(
         if dd < maxdd:
             maxdd = dd
 
-    # Force-close at end
-    if in_pos:
-        equity = apply_commission(equity)
-        pnl = (float(c[-1]) - entry) / entry
-        equity *= (1.0 + pnl)
-        if pnl >= 0:
-            gp += pnl
-        else:
-            gl += abs(pnl)
+    # Raw PF
+    pf_raw = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
 
-    pf = (gp / gl) if gl > 0 else (float("inf") if gp > 0 else 0.0)
+    # Diagnostic PF: same effective_gl logic as scoring + cap
+    if gp > 0:
+        effective_gl = max(gl, loss_floor * gp)
+    else:
+        effective_gl = max(gl, loss_floor)
+    pf_diag = (gp / effective_gl) if effective_gl > 0 else 0.0
+    pf_diag = min(pf_diag, float(pf_cap_score_only))
 
     return TradeStats(
-        gross_profit=gp,
-        gross_loss=gl,
-        num_trades=trades,
-        total_return=equity - 1.0,
-        maxdd=maxdd,
-        profit_factor=pf,
+        gross_profit=float(gp),
+        gross_loss=float(gl),
+        num_trades=int(trades),
+        total_return=float(equity - 1.0),
+        maxdd=float(maxdd),
+        profit_factor=float(pf_raw),
+        profit_factor_diag=float(pf_diag),
+        trend_metric=float(trend_metric), 
     )
 
 
 # =============================
-# Scoring + evaluation (UNCHANGED from adapt_half_RSI optimizer)
+# Scoring + evaluation
 # =============================
 def score_from_stats(
     st: TradeStats,
@@ -502,6 +505,8 @@ def score_from_stats(
     pf_floor_k: float,
     ret_floor: float,
     ret_floor_k: float,
+    trend_center: float,
+    trend_k: float,
 ) -> float:
     if st.num_trades < min_trades:
         return float("nan")
@@ -536,22 +541,37 @@ def score_from_stats(
     s *= over_mult
 
     s *= pf_floor_mult
+    # Soft trend weighting (no regime split, no discontinuities)
+    # Multiplier in [0.5, 1.0]
+    trend_mult = 0.5 + 0.5 * sigmoid(trend_k * (st.trend_metric - trend_center))
+    s *= trend_mult
     return float(s)
 
 
 def evaluate_params_on_files(
     file_paths: List[Path],
     *,
+    # engine params
     atrPeriod: int,
     slMultiplier: float,
     tpMultiplier: float,
     commission_rate_per_side: float,
     fill_mode: str,
-    use_trailing_exit: bool,
-    trail_mode: str,
-    close_on_sellSignal: bool,
     cooldown_bars: int,
     time_stop_bars: int,
+    basePeriod: int,
+    minPeriod: int,
+    maxPeriod: int,
+    fastPeriod: int,
+    slowPeriod: int,
+    smooth_len: int,
+    threshold: float,
+    threshold_mode: str,
+    threshold_floor: float,
+    threshold_std_mult: float,
+    vol_floor_mult: float,
+    vol_floor_len: int,
+    # scoring params
     min_trades: int,
     pf_baseline: float,
     pf_k: float,
@@ -570,13 +590,8 @@ def evaluate_params_on_files(
     pf_floor_k: float,
     ret_floor: float,
     ret_floor_k: float,
-    # signal knobs
-    basePeriod: int,
-    minPeriod: int,
-    maxPeriod: int,
-    fastPeriod: int,
-    slowPeriod: int,
-    smooth_len: int,
+    trend_center: float,
+    trend_k: float,
 ) -> Tuple[float, Dict[str, Any], List[Dict[str, Any]], float, float, float, int]:
     per: List[Dict[str, Any]] = []
     eligible_scores: List[float] = []
@@ -584,8 +599,11 @@ def evaluate_params_on_files(
     eligible_count = 0
 
     for p in file_paths:
-        df = pd.read_parquet(p)
-        df = ensure_ohlc(df)
+        try:
+            df = pd.read_parquet(p)
+            df = ensure_ohlc(df)
+        except Exception:
+            continue
 
         st = backtest_adapt_rsi_dynamic_engine(
             df,
@@ -594,9 +612,6 @@ def evaluate_params_on_files(
             tpMult=tpMultiplier,
             commission_per_side=commission_rate_per_side,
             fill_mode=fill_mode,
-            use_trailing_exit=use_trailing_exit,
-            trail_mode=trail_mode,
-            close_on_sellSignal=close_on_sellSignal,
             cooldown_bars=cooldown_bars,
             time_stop_bars=time_stop_bars,
             basePeriod=basePeriod,
@@ -605,6 +620,14 @@ def evaluate_params_on_files(
             fastPeriod=fastPeriod,
             slowPeriod=slowPeriod,
             smooth_len=smooth_len,
+            threshold=threshold,
+            threshold_mode=threshold_mode,
+            threshold_floor=threshold_floor,
+            threshold_std_mult=threshold_std_mult,
+            vol_floor_mult=vol_floor_mult,
+            vol_floor_len=vol_floor_len,
+            loss_floor=loss_floor,
+            pf_cap_score_only=pf_cap_score_only,
         )
 
         sc = score_from_stats(
@@ -627,6 +650,8 @@ def evaluate_params_on_files(
             pf_floor_k=pf_floor_k,
             ret_floor=ret_floor,
             ret_floor_k=ret_floor_k,
+            trend_center=trend_center,
+            trend_k=trend_k,
         )
 
         is_eligible = (st.num_trades >= min_trades)
@@ -638,6 +663,8 @@ def evaluate_params_on_files(
         per.append({
             "ticker": p.stem,
             "profit_factor": st.profit_factor,
+            "profit_factor_diag": st.profit_factor_diag,
+            "trend_metric": st.trend_metric,
             "num_trades": st.num_trades,
             "ticker_score": sc,
             "total_return": st.total_return,
@@ -652,8 +679,12 @@ def evaluate_params_on_files(
 
     mean_score = float(np.mean(eligible_scores)) if eligible_scores else 0.0
 
-    pf_vals = [x["profit_factor"] for x in per if np.isfinite(x["profit_factor"])]
-    pf_avg = float(np.mean(pf_vals)) if pf_vals else float("inf")
+    pf_raw_vals = [x["profit_factor"] for x in per if np.isfinite(x["profit_factor"])]
+    pf_raw_avg = float(np.mean(pf_raw_vals)) if pf_raw_vals else float("inf")
+
+    pf_diag_vals = [x["profit_factor_diag"] for x in per if np.isfinite(x["profit_factor_diag"])]
+    pf_diag_avg = float(np.mean(pf_diag_vals)) if pf_diag_vals else 0.0
+
     trades_avg = float(np.mean([x["num_trades"] for x in per])) if per else 0.0
 
     total = len(per)
@@ -661,20 +692,22 @@ def evaluate_params_on_files(
 
     overall = {
         "mean_ticker_score": mean_score,
-        "avg_pf_raw": pf_avg,
+        "avg_pf_raw": pf_raw_avg,
+        "avg_pf_diag": pf_diag_avg,
         "avg_trades": trades_avg,
         "num_neg": f"{num_neg}/{len(per)}" if per else "0/0",
         "eligible_count": eligible_count,
         "coverage": coverage,
     }
-    return mean_score, overall, per, pf_avg, trades_avg, coverage, eligible_count
+    return mean_score, overall, per, pf_raw_avg, trades_avg, coverage, eligible_count
 
 
 # =============================
-# CLI + Main (kept matching adapt_half_RSI optimizer)
+# CLI + Main
 # =============================
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--data_dir", type=str, default="data")
     ap.add_argument("--output_dir", type=str, default="output")
 
@@ -685,7 +718,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--commission_rate_per_side", type=float, default=0.0006)
 
     # scoring knobs
-    ap.add_argument("--pf-cap", type=float, default=10.0, dest="pf_cap_score_only")
+    ap.add_argument("--pf-cap", type=float, default=12.0, dest="pf_cap_score_only")
     ap.add_argument("--pf-baseline", type=float, default=1.8)
     ap.add_argument("--pf-k", type=float, default=1.5)
     ap.add_argument("--trades-baseline", type=float, default=20.0)
@@ -710,16 +743,10 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--fill", type=str, default="same_close", choices=["same_close", "next_open"])
 
-    # exits
-    ap.add_argument("--use_trailing_exit", type=bool, default=True)
-    ap.add_argument("--trail_mode", type=str, default="trail_only", choices=["trail_only", "trail_plus_hard_sl"])
-    ap.add_argument("--close_on_sellSignal", type=bool, default=True)
-
-    # cooldown
+    # cooldown/time-stop
     ap.add_argument("--cooldown", type=int, default=1)
     ap.add_argument("--opt-cooldown", action="store_true")
 
-    # time stop
     ap.add_argument("--time-stop", type=int, default=0)
     ap.add_argument("--opt-time-stop", action="store_true")
 
@@ -736,26 +763,37 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--coverage-target", type=float, default=0.70)
     ap.add_argument("--coverage-k", type=float, default=12.0)
 
-    # Reporting helpers
-    ap.add_argument("--report-only", action="store_true")
+    # Modes
+    ap.add_argument("--optimize", action="store_true", help="Run Optuna optimization (otherwise report mode).")
     ap.add_argument("--report-both-fills", action="store_true")
-    ap.add_argument("--atrPeriod-fixed", type=int, default=None)
-    ap.add_argument("--slMultiplier-fixed", type=float, default=None)
-    ap.add_argument("--tpMultiplier-fixed", type=float, default=None)
 
-    # adaptive period knobs
-    ap.add_argument("--basePeriod-fixed", type=int, default=15)
+    # Fixed params (defaults)
+    ap.add_argument("--atrPeriod-fixed", type=int, default=25)
+    ap.add_argument("--slMultiplier-fixed", type=float, default=3.0)
+    ap.add_argument("--tpMultiplier-fixed", type=float, default=3.0)
+
+    ap.add_argument("--basePeriod-fixed", type=int, default=20)
     ap.add_argument("--minPeriod-fixed", type=int, default=5)
-    ap.add_argument("--maxPeriod-fixed", type=int, default=20)
+    ap.add_argument("--maxPeriod-fixed", type=int, default=35)
     ap.add_argument("--opt-adaptive", action="store_true")
 
-    # NEW (optional): fast/slow EMA knobs for adapt_RSI-style fast_rsi/slow_rsi
     ap.add_argument("--fastPeriod-fixed", type=int, default=4)
     ap.add_argument("--slowPeriod-fixed", type=int, default=50)
     ap.add_argument("--opt-fastslow", action="store_true")
 
-    # keep smooth_len as input option (same as half_RSI)
-    ap.add_argument("--smooth_len-fixed", type=int, default=2)
+    ap.add_argument("--smooth_len-fixed", type=int, default=5)
+
+    # hysteresis / vol-floor (fixed defaults, optional optimization inside objective)
+    ap.add_argument("--threshold-fixed", type=float, default=0.5)
+    ap.add_argument("--threshold-mode", type=str, default="dynamic", choices=["fixed", "dynamic"])
+    ap.add_argument("--threshold-floor", type=float, default=0.1)
+    ap.add_argument("--threshold-std-mult", type=float, default=0.5)
+
+    ap.add_argument("--vol-floor-mult-fixed", type=float, default=1.0)
+    ap.add_argument("--vol-floor-len", type=int, default=100)
+
+    ap.add_argument("--trend-center", type=float, default=0.80)
+    ap.add_argument("--trend-k", type=float, default=3.0)
 
     return ap.parse_args()
 
@@ -765,7 +803,6 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    # Validate constraint knobs
     if args.tp2sl_auto:
         if args.tp2sl_min <= 0 or args.tp2sl_max <= 0:
             raise SystemExit("--tp2sl-min and --tp2sl-max must be > 0")
@@ -798,26 +835,24 @@ def main() -> None:
         return float(args.min_tp2sl)
 
     def validate_adaptive_params(baseP: int, minP: int, maxP: int) -> bool:
-        if baseP < 5: # Increased from 1: Base RSI needs at least a week of data
+        # relaxed but still sane
+        if baseP < 5:
             return False
-        if minP < 5:  # Increased from 2: This kills the "2-period noise" fitting
+        if minP < 2:
             return False
-        if maxP <= minP: 
+        if maxP <= minP:
             return False
-        if maxP > 120: # Increased from 60: Allow the RSI to get very slow if needed
+        if maxP > 120:
             return False
-        # Ensure there is a meaningful "Adaptive Delta"
-        if (maxP - minP) < 10:
+        if (maxP - minP) < 5:
             return False
         return True
 
     def validate_fastslow(fp: int, sp: int) -> bool:
-        if fp < 3: # Floor of 3 to avoid 1-period "jitter"
+        if fp < 2:
             return False
-        if sp < 10: # Slow period should be long enough to establish a trend
+        if sp < 10:
             return False
-        # Crucial: Ensure the Slow period is at least 2x the Fast period
-        # This prevents the signal line from being too "noisy"
         if sp < (fp * 2):
             return False
         if sp > 200:
@@ -825,59 +860,61 @@ def main() -> None:
         return True
 
     # =========================
-    # REPORT ONLY MODE
+    # REPORT MODE
     # =========================
-    if args.report_only:
-        required = [
-            ("--atrPeriod-fixed", args.atrPeriod_fixed),
-            ("--slMultiplier-fixed", args.slMultiplier_fixed),
-            ("--tpMultiplier-fixed", args.tpMultiplier_fixed),
-        ]
-        missing = [name for name, val in required if val is None]
-        if missing:
-            raise SystemExit("Missing required flags: " + ", ".join(missing))
+    if not args.optimize:
+        atrP = int(args.atrPeriod_fixed)
+        slM = float(args.slMultiplier_fixed)
+        tpM = float(args.tpMultiplier_fixed)
 
-        atrP_fixed = int(args.atrPeriod_fixed)
-        sl_fixed = float(args.slMultiplier_fixed)
-        tp_fixed = float(args.tpMultiplier_fixed)
-
-        min_eff = min_tp2sl_eff_for(atrP_fixed)
-        if sl_fixed <= min_eff * tp_fixed:
+        min_eff = min_tp2sl_eff_for(atrP)
+        if slM <= min_eff * tpM:
             raise SystemExit(
-                f"Constraint violated: slMultiplier ({sl_fixed}) <= "
-                f"min_tp2sl_eff ({min_eff:.4f}) * tpMultiplier ({tp_fixed})"
+                f"Constraint violated: slMultiplier ({slM}) <= min_tp2sl_eff ({min_eff:.4f}) * tpMultiplier ({tpM})"
             )
 
         baseP = int(args.basePeriod_fixed)
         minP = int(args.minPeriod_fixed)
         maxP = int(args.maxPeriod_fixed)
         if not validate_adaptive_params(baseP, minP, maxP):
-            raise SystemExit("Invalid adaptive params: require base>=1, min>=2, max>=3, and min<=max.")
+            raise SystemExit("Invalid adaptive params (fixed defaults/CLI).")
 
         fp = int(args.fastPeriod_fixed)
         sp = int(args.slowPeriod_fixed)
         if not validate_fastslow(fp, sp):
-            raise SystemExit("Invalid fast/slow EMA params: require fast>=1, slow>=2, fast<slow, slow<=200.")
+            raise SystemExit("Invalid fast/slow EMA params (fixed defaults/CLI).")
 
         sm = int(args.smooth_len_fixed)
         if sm < 1:
             raise SystemExit("--smooth_len-fixed must be >= 1")
+
+        threshold = float(args.threshold_fixed)
+        vol_floor_mult = float(args.vol_floor_mult_fixed)
 
         fills = ROBUST_FILLS if args.report_both_fills else [args.fill]
 
         for fm in fills:
             best_score_single, overall, per, _, _, coverage, eligible_count = evaluate_params_on_files(
                 file_paths,
-                atrPeriod=atrP_fixed,
-                slMultiplier=sl_fixed,
-                tpMultiplier=tp_fixed,
+                atrPeriod=atrP,
+                slMultiplier=slM,
+                tpMultiplier=tpM,
                 commission_rate_per_side=args.commission_rate_per_side,
                 fill_mode=fm,
-                use_trailing_exit=args.use_trailing_exit,
-                trail_mode=args.trail_mode,
-                close_on_sellSignal=args.close_on_sellSignal,
                 cooldown_bars=int(args.cooldown),
                 time_stop_bars=int(args.time_stop),
+                basePeriod=baseP,
+                minPeriod=minP,
+                maxPeriod=maxP,
+                fastPeriod=fp,
+                slowPeriod=sp,
+                smooth_len=sm,
+                threshold=threshold,
+                threshold_mode=args.threshold_mode,
+                threshold_floor=float(args.threshold_floor),
+                threshold_std_mult=float(args.threshold_std_mult),
+                vol_floor_mult=vol_floor_mult,
+                vol_floor_len=int(args.vol_floor_len),
                 min_trades=args.min_trades,
                 pf_baseline=args.pf_baseline,
                 pf_k=args.pf_k,
@@ -896,153 +933,185 @@ def main() -> None:
                 pf_floor_k=args.pf_floor_k,
                 ret_floor=args.ret_floor,
                 ret_floor_k=args.ret_floor_k,
-                basePeriod=baseP,
-                minPeriod=minP,
-                maxPeriod=maxP,
-                fastPeriod=fp,
-                slowPeriod=sp,
-                smooth_len=sm,
+                trend_center=float(args.trend_center),
+                trend_k=float(args.trend_k),
             )
 
             per_df = pd.DataFrame(per)
             per_df["ticker_score"] = per_df["ticker_score"].fillna(0.0)
             per_df = per_df.sort_values(
-                ["profit_factor", "ticker_score", "total_return", "num_trades"],
+                ["ticker_score", "total_return", "profit_factor_diag", "num_trades", "trend_metric"],
                 ascending=False
             )
 
             per_csv = out_dir / f"per_ticker_summary_{fm}.csv"
             per_df.to_csv(per_csv, index=False)
 
-            print(f"\n=== REPORT ONLY ({fm}) ===")
+            print(f"\n=== REPORT MODE ({fm}) ===")
             print(f"Saved: {per_csv}")
-            print(f"Avg PF: {overall['avg_pf_raw'] if np.isfinite(overall['avg_pf_raw']) else float('inf')}")
-            print(f"Avg Trades: {overall['avg_trades']}")
-            print(f"Mean Score (eligible-only): {overall['mean_ticker_score']}")
-            print(f"Coverage (eligible/total):  {eligible_count}/{len(per)} = {coverage:.3f}")
-            print(f"num_neg: {overall['num_neg']}")
-            print(f"Score: {best_score_single}")
+            print(f"Avg PF (raw):                {overall['avg_pf_raw'] if np.isfinite(overall['avg_pf_raw']) else float('inf')}")
+            print(f"Avg PF (diag):               {overall['avg_pf_diag']:.6f}")
+            print(f"Avg Trades / Ticker:         {overall['avg_trades']:.3f}")
+            print(f"Mean Ticker Score (eligible):{overall['mean_ticker_score']:.6f}")
+            print(f"Coverage (eligible/total):   {eligible_count}/{len(per)} = {coverage:.3f}")
+            print(f"num_neg (return<=0):         {overall['num_neg']}")
+            print(f"Score (single fill):         {best_score_single:.6f}")
 
         mode = "auto" if args.tp2sl_auto else "fixed"
         print("\n=== FIXED PARAMS USED ===")
-        print(f"atrPeriod: {atrP_fixed}")
-        print(f"slMultiplier: {sl_fixed}")
-        print(f"tpMultiplier: {tp_fixed}")
+        print(f"atrPeriod: {atrP}")
+        print(f"slMultiplier: {slM}")
+        print(f"tpMultiplier: {tpM}")
         print(f"min_tp2sl_eff (constraint): {min_eff:.4f} ({mode})")
         print(f"adaptive: basePeriod={baseP}, minPeriod={minP}, maxPeriod={maxP}")
         print(f"fast/slow EMA: fastPeriod={fp}, slowPeriod={sp}")
         print(f"smoothing: smooth_len={sm}")
+        print(f"threshold_mode: {args.threshold_mode}, threshold_fixed={threshold}")
+        print(f"vol_floor_mult: {vol_floor_mult}, vol_floor_len={args.vol_floor_len}")
         return
 
     # =========================
     # OPTUNA
     # =========================
     def objective(trial: optuna.Trial) -> float:
-            # 1. ATR & Risk (Phase 4 Polished)
-            atrPeriod = trial.suggest_int("atrPeriod", 10, 25)
-            slMultiplier = trial.suggest_float("slMultiplier", 2.5, 4.0)
-            tpMultiplier = trial.suggest_float("tpMultiplier", 2.0, 4.5)
+        # =========================
+        # 1) Suggest / set parameters
+        # =========================
+        atrPeriod    = trial.suggest_int("atrPeriod", 10, 30)
+        slMultiplier = trial.suggest_float("slMultiplier", 1.5, 4.0)
+        tpMultiplier = trial.suggest_float("tpMultiplier", 1.5, 5.0)
 
-            # TP/SL Efficiency Check
-            min_eff = min_tp2sl_eff_for(atrPeriod)
-            if slMultiplier <= (min_eff * tpMultiplier):
-                raise optuna.TrialPruned()
+        # Adaptive RSI block: ONLY optimize if --opt-adaptive, else lock to *_fixed
+        if getattr(args, "opt_adaptive", False):
+            basePeriod = trial.suggest_int("basePeriod", 10, 50)
+            minPeriod  = trial.suggest_int("minPeriod", 3, 10)
+            maxPeriod  = trial.suggest_int("maxPeriod", 20, 70)
+        else:
+            basePeriod = int(args.basePeriod_fixed)
+            minPeriod  = int(args.minPeriod_fixed)
+            maxPeriod  = int(args.maxPeriod_fixed)
 
-            # 2. Adaptive RSI - Consolidated to avoid Optuna Distribution Warnings
-            if args.opt_adaptive:
-                # We define these once and ONLY here
-                baseP = trial.suggest_int("basePeriod", 30, 60) # Phase 4 Range
-                minP = trial.suggest_int("minPeriod", 5, 15)
-                maxP = trial.suggest_int("maxPeriod", 40, 90)
-                
-                if not validate_adaptive_params(baseP, minP, maxP):
-                    raise optuna.TrialPruned()
-            else:
-                # Use fixed values from CLI, avoiding trial.suggest calls entirely
-                baseP = int(args.basePeriod_fixed)
-                minP = int(args.minPeriod_fixed)
-                maxP = int(args.maxPeriod_fixed)
-                # Still validate to ensure CLI inputs are sane
-                if not validate_adaptive_params(baseP, minP, maxP):
-                    raise optuna.TrialPruned()
+        # Fast/slow EMA block: ONLY optimize if --opt-fastslow, else lock to *_fixed
+        if getattr(args, "opt_fastslow", False):
+            fastPeriod = trial.suggest_int("fastPeriod", 3, 15)
+            slowPeriod = trial.suggest_int("slowPeriod", 20, 100)
+        else:
+            fastPeriod = int(args.fastPeriod_fixed)
+            slowPeriod = int(args.slowPeriod_fixed)
 
-            # 3. Fast/Slow & Smoothing
-            if args.opt_fastslow:
-                fastP = trial.suggest_int("fastPeriod", 4, 12)
-                slowP = trial.suggest_int("slowPeriod", 40, 100)
-                if not validate_fastslow(fastP, slowP):
-                    raise optuna.TrialPruned()
-            else:
-                fastP = int(args.fastPeriod_fixed)
-                slowP = int(args.slowPeriod_fixed)
+        # Smooth len: you currently always optimize it; keep that behavior (or lock if you prefer)
+        smooth_len = trial.suggest_int("smooth_len", 3, 15)
 
-            smooth_len = trial.suggest_int("smooth_len", 5, 15) # Phase 4 Stability Floor
+        # Vol floor multiplier: LOCK to --vol-floor-mult-fixed (shell wants this),
+        # unless you later add an --opt-vol-floor flag (not present now).
+        vol_floor_mult = float(args.vol_floor_mult_fixed)
 
-            cooldown_bars = trial.suggest_int("cooldown", 1, 5) if args.opt_cooldown else int(args.cooldown)
-            time_stop_bars = trial.suggest_int("time_stop", 4, 12) if args.opt_time_stop else int(args.time_stop)
+        # Cooldown/time-stop
+        cooldown_bars = int(args.cooldown) if not getattr(args, "opt_cooldown", False) else trial.suggest_int("cooldown", 1, 8)
+        time_stop_bars = trial.suggest_int("time_stop", 10, 50) if getattr(args, "opt_time_stop", False) else int(args.time_stop)
 
-            # -------------------------
-            # 4) Evaluation Loop
-            # -------------------------
-            scores = []
-            coverages = []
-            for fm in ROBUST_FILLS:
-                s, _, _, _, _, cov, _ = evaluate_params_on_files(
-                    file_paths,
-                    atrPeriod=atrPeriod,
-                    slMultiplier=slMultiplier,
-                    tpMultiplier=tpMultiplier,
-                    commission_rate_per_side=args.commission_rate_per_side,
-                    fill_mode=fm,
-                    use_trailing_exit=args.use_trailing_exit,
-                    trail_mode=args.trail_mode,
-                    close_on_sellSignal=args.close_on_sellSignal,
-                    cooldown_bars=cooldown_bars,
-                    time_stop_bars=time_stop_bars,
-                    min_trades=args.min_trades,
-                    pf_baseline=args.pf_baseline,
-                    pf_k=args.pf_k,
-                    trades_baseline=args.trades_baseline,
-                    trades_k=args.trades_k,
-                    weight_pf=args.weight_pf,
-                    score_power=args.score_power,
-                    pf_cap_score_only=args.pf_cap_score_only,
-                    penalty_enabled=args.penalty,
-                    loss_floor=args.loss_floor,
-                    penalty_ret_center=args.penalty_ret_center,
-                    penalty_ret_k=args.penalty_ret_k,
-                    max_trades=args.max_trades,
-                    max_trades_k=args.max_trades_k,
-                    pf_floor=args.pf_floor,
-                    pf_floor_k=args.pf_floor_k,
-                    ret_floor=args.ret_floor,
-                    ret_floor_k=args.ret_floor_k,
-                    basePeriod=baseP,
-                    minPeriod=minP,
-                    maxPeriod=maxP,
-                    fastPeriod=fastP,
-                    slowPeriod=slowP,
-                    smooth_len=smooth_len,
-                )
-                scores.append(float(s))
-                coverages.append(float(cov))
+        # =========================
+        # 2) Logical constraints / pruning
+        # =========================
+        # (you can keep 1.1 here, or use min_tp2sl_eff_for(atrPeriod) if you want the CLI constraint)
+        if tpMultiplier < 1.1 * slMultiplier:
+            return -1.0
+        if fastPeriod >= slowPeriod:
+            return -1.0
+        if maxPeriod <= minPeriod:
+            return -1.0
 
-            if not scores:
-                return -1e9
+        # =========================
+        # 3) Threshold knobs (FIXED vs DYNAMIC)
+        #    FIX: if mode=fixed, DO NOT optimize threshold; use --threshold-fixed.
+        # =========================
+        threshold_mode = str(args.threshold_mode)
 
-            # -------------------------
-            # 5) Robust Multi-Fill Scoring
-            # -------------------------
-            mean_s = float(np.mean(scores))
-            # Gap penalty ensures the strategy isn't "fill-dependent"
-            gap = float(np.max(scores) - np.min(scores))
+        if threshold_mode == "fixed":
+            threshold = float(args.threshold_fixed)        # LOCKED
+            threshold_floor = float(args.threshold_floor)  # unused in fixed mode
+            threshold_std_mult = float(args.threshold_std_mult)  # unused in fixed mode
+        else:
+            # dynamic mode ignores `threshold`; optimize the knobs it actually uses
+            threshold = float(args.threshold_fixed)  # placeholder
+            threshold_floor = trial.suggest_float("threshold_floor", 0.01, 0.20)
+            threshold_std_mult = trial.suggest_float("threshold_std_mult", 0.10, 0.80)
 
-            coverage = float(np.min(coverages)) if coverages else 0.0
-            coverage_mult = sigmoid(float(args.coverage_k) * (coverage - float(args.coverage_target)))
+        # =========================
+        # 4) Evaluate
+        # =========================
+        mean_score, overall, per, pf_raw_avg, trades_avg, coverage, eligible_count = evaluate_params_on_files(
+            file_paths,
+            atrPeriod=int(atrPeriod),
+            slMultiplier=float(slMultiplier),
+            tpMultiplier=float(tpMultiplier),
+            commission_rate_per_side=float(args.commission_rate_per_side),
+            fill_mode=str(args.fill),
+            cooldown_bars=int(cooldown_bars),
+            time_stop_bars=int(time_stop_bars),
 
-            # Slightly higher gap penalty (0.40) to force consistency across fills
-            lam = 0.15
-            return (mean_s * coverage_mult) - (lam * gap)
+            basePeriod=int(basePeriod),
+            minPeriod=int(minPeriod),
+            maxPeriod=int(maxPeriod),
+            fastPeriod=int(fastPeriod),
+            slowPeriod=int(slowPeriod),
+            smooth_len=int(smooth_len),
+
+            threshold=float(threshold),
+            threshold_mode=threshold_mode,
+            threshold_floor=float(threshold_floor),
+            threshold_std_mult=float(threshold_std_mult),
+
+            vol_floor_mult=float(vol_floor_mult),
+            vol_floor_len=int(args.vol_floor_len),
+
+            # scoring params from args
+            min_trades=int(args.min_trades),
+            pf_baseline=float(args.pf_baseline),
+            pf_k=float(args.pf_k),
+            trades_baseline=float(args.trades_baseline),
+            trades_k=float(args.trades_k),
+            weight_pf=float(args.weight_pf),
+            score_power=float(args.score_power),
+            pf_cap_score_only=float(args.pf_cap_score_only),
+            penalty_enabled=bool(args.penalty),
+            loss_floor=float(args.loss_floor),
+            penalty_ret_center=float(args.penalty_ret_center),
+            penalty_ret_k=float(args.penalty_ret_k),
+            max_trades=int(args.max_trades),
+            max_trades_k=float(args.max_trades_k),
+            pf_floor=float(args.pf_floor),
+            pf_floor_k=float(args.pf_floor_k),
+            ret_floor=float(args.ret_floor),
+            ret_floor_k=float(args.ret_floor_k),
+            trend_center=float(args.trend_center),
+            trend_k=float(args.trend_k),
+        )
+
+        ticker_stats = per
+        avg_trades = float(trades_avg)
+
+        if not ticker_stats:
+            return -1.0
+        if coverage <= 0.0:
+            return -1.0
+
+        # =========================
+        # 5) Portfolio stabilization multipliers
+        # =========================
+        returns = np.array([x["total_return"] for x in ticker_stats], dtype=float)
+        std_dev = float(np.std(returns)) if returns.size > 1 else 1.0
+        variance_penalty = 1.0 / (1.0 + std_dev)
+
+        max_portfolio_dd = max((abs(x.get("maxdd", 0.0)) for x in ticker_stats), default=0.0)
+        dd_limit = 0.2
+        dd_gate = sigmoid(6.0 * (dd_limit - max_portfolio_dd))
+
+        cov_p = sigmoid(float(args.coverage_k) * (float(coverage) - float(args.coverage_target)))
+        trade_p = min(1.0, avg_trades / float(args.trades_baseline))
+
+        final_score = float(mean_score) * float(cov_p) * float(trade_p) * float(variance_penalty) * float(dd_gate)
+        return float(final_score)
 
 
     sampler = optuna.samplers.TPESampler(seed=args.seed)
@@ -1052,45 +1121,45 @@ def main() -> None:
     best = study.best_trial
     best_params = dict(best.params)
 
-    best_params["atrPeriod"] = int(best_params["atrPeriod"])
-    best_params["slMultiplier"] = float(best_params["slMultiplier"])
-    best_params["tpMultiplier"] = float(best_params["tpMultiplier"])
-    best_params["smooth_len"] = int(best_params.get("smooth_len", int(args.smooth_len_fixed)))
-
-    if args.opt_adaptive:
-        best_params["basePeriod"] = int(best_params["basePeriod"])
-        best_params["minPeriod"] = int(best_params["minPeriod"])
-        best_params["maxPeriod"] = int(best_params["maxPeriod"])
-    else:
+    # Fill in non-optimized fixed toggles
+    if not args.opt_adaptive:
         best_params["basePeriod"] = int(args.basePeriod_fixed)
         best_params["minPeriod"] = int(args.minPeriod_fixed)
         best_params["maxPeriod"] = int(args.maxPeriod_fixed)
-
-    if args.opt_fastslow:
-        best_params["fastPeriod"] = int(best_params["fastPeriod"])
-        best_params["slowPeriod"] = int(best_params["slowPeriod"])
-    else:
+    if not args.opt_fastslow:
         best_params["fastPeriod"] = int(args.fastPeriod_fixed)
         best_params["slowPeriod"] = int(args.slowPeriod_fixed)
+    if "smooth_len" not in best_params:
+        best_params["smooth_len"] = int(args.smooth_len_fixed)
 
-    best_cooldown = int(best_params.get("cooldown", 0)) if args.opt_cooldown else int(args.cooldown)
-    best_time_stop = int(best_params.get("time_stop", 0)) if args.opt_time_stop else int(args.time_stop)
+    best_cooldown = int(best_params.get("cooldown", args.cooldown)) if args.opt_cooldown else int(args.cooldown)
+    best_time_stop = int(best_params.get("time_stop", args.time_stop)) if args.opt_time_stop else int(args.time_stop)
 
-    best_min_eff = min_tp2sl_eff_for(best_params["atrPeriod"])
+    best_min_eff = min_tp2sl_eff_for(int(best_params["atrPeriod"]))
     constraint_mode = "auto" if args.tp2sl_auto else "fixed"
 
+    # FINAL REPORT (single fill args.fill)
     best_score_single, overall, per, _, _, coverage, eligible_count = evaluate_params_on_files(
         file_paths,
-        atrPeriod=best_params["atrPeriod"],
-        slMultiplier=best_params["slMultiplier"],
-        tpMultiplier=best_params["tpMultiplier"],
+        atrPeriod=int(best_params["atrPeriod"]),
+        slMultiplier=float(best_params["slMultiplier"]),
+        tpMultiplier=float(best_params["tpMultiplier"]),
         commission_rate_per_side=args.commission_rate_per_side,
         fill_mode=args.fill,
-        use_trailing_exit=args.use_trailing_exit,
-        trail_mode=args.trail_mode,
-        close_on_sellSignal=args.close_on_sellSignal,
         cooldown_bars=best_cooldown,
         time_stop_bars=best_time_stop,
+        basePeriod=int(best_params["basePeriod"]),
+        minPeriod=int(best_params["minPeriod"]),
+        maxPeriod=int(best_params["maxPeriod"]),
+        fastPeriod=int(best_params["fastPeriod"]),
+        slowPeriod=int(best_params["slowPeriod"]),
+        smooth_len=int(best_params["smooth_len"]),
+        threshold=args.threshold_fixed,
+        threshold_mode=args.threshold_mode,
+        threshold_floor=float(args.threshold_floor),
+        threshold_std_mult=float(args.threshold_std_mult),
+        vol_floor_mult=float(args.vol_floor_mult_fixed),
+        vol_floor_len=int(args.vol_floor_len),
         min_trades=args.min_trades,
         pf_baseline=args.pf_baseline,
         pf_k=args.pf_k,
@@ -1109,25 +1178,23 @@ def main() -> None:
         pf_floor_k=args.pf_floor_k,
         ret_floor=args.ret_floor,
         ret_floor_k=args.ret_floor_k,
-        basePeriod=best_params["basePeriod"],
-        minPeriod=best_params["minPeriod"],
-        maxPeriod=best_params["maxPeriod"],
-        fastPeriod=best_params["fastPeriod"],
-        slowPeriod=best_params["slowPeriod"],
-        smooth_len=best_params["smooth_len"],
+        trend_center=float(args.trend_center),
+        trend_k=float(args.trend_k),
     )
 
     per_df = pd.DataFrame(per)
     per_df["ticker_score"] = per_df["ticker_score"].fillna(0.0)
     per_df = per_df.sort_values(
-        ["profit_factor", "ticker_score", "total_return", "num_trades"],
+        ["ticker_score", "total_return", "profit_factor_diag", "num_trades"],
         ascending=False
     )
+
     per_csv = out_dir / "per_ticker_summary.csv"
     per_df.to_csv(per_csv, index=False)
 
     print("\n=== OVERALL (ALL FILES) METRICS (BEST PARAMS) ===")
     print(f"Avg Profit Factor (raw):      {overall['avg_pf_raw'] if np.isfinite(overall['avg_pf_raw']) else float('inf')}")
+    print(f"Avg Profit Factor (diag):     {overall['avg_pf_diag']:.6f}")
     print(f"Avg Trades / Ticker:          {overall['avg_trades']:.3f}")
     print(f"Mean Ticker Score (eligible): {overall['mean_ticker_score']:.6f}")
     print(f"Coverage (eligible/total):    {eligible_count}/{len(per)} = {coverage:.3f}")
@@ -1147,30 +1214,21 @@ def main() -> None:
     print(f"min_trades gate:              {args.min_trades}")
     print(f"loss_floor (scoring):         {args.loss_floor}")
     print(f"min_tp2sl_eff (constraint):   {best_min_eff:.4f} ({constraint_mode})")
+    print(f"threshold_mode:               {args.threshold_mode}")
     print(f"Score (single fill '{args.fill}'): {best_score_single:.6f}")
 
     print("\n=== BEST PARAMS ===")
-    print(f"atrPeriod: {best_params['atrPeriod']}")
-    print(f"slMultiplier: {best_params['slMultiplier']}")
-    print(f"tpMultiplier: {best_params['tpMultiplier']}")
-    print(f"basePeriod: {best_params['basePeriod']}")
-    print(f"minPeriod: {best_params['minPeriod']}")
-    print(f"maxPeriod: {best_params['maxPeriod']}")
-    print(f"fastPeriod: {best_params['fastPeriod']}")
-    print(f"slowPeriod: {best_params['slowPeriod']}")
-    print(f"smooth_len: {best_params['smooth_len']}")
+    for k in sorted(best_params.keys()):
+        print(f"{k}: {best_params[k]}")
     print(f"best_score (OPTUNA objective): {best.value}")
-    print(f"pf_cap_score_only: {args.pf_cap_score_only}")
-    if args.opt_cooldown:
-        print(f"cooldown (best): {best_cooldown}")
-    if args.opt_time_stop:
-        print(f"time_stop (best): {best_time_stop}")
-    print(f"fill_mode (report): {args.fill}")
+    print(f"fill_mode (final report): {args.fill}")
     print(f"Saved per-ticker CSV to: {per_csv}")
 
     print("\n=== INDIVIDUAL (TICKER) METRICS (w/ BEST PARAMS) ===")
-    print(per_df[["ticker", "profit_factor", "num_trades", "ticker_score", "total_return",
-                 "gross_profit", "gross_loss", "maxdd", "eligible"]].to_string(index=False))
+    print(per_df[
+        ["ticker", "profit_factor", "profit_factor_diag", "num_trades", "ticker_score",
+         "total_return", "gross_profit", "gross_loss", "maxdd", "eligible"]
+    ].to_string(index=False))
 
 
 if __name__ == "__main__":

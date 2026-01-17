@@ -1,95 +1,64 @@
 #!/bin/bash
-set -euo pipefail
+set -e
 
 ###=================================================================================
-### Configuration for Bayes_opt_adapt_RSI.py
-### PHASE 2 RECOVERY: Finding robust signals that survive 'next_open'
+### ULTRA EASY MODE for Bayes_opt_adapt_RSI.py
+### Goal: get NON-ZERO hits fast (remove cliffs + reduce pruning)
+### After you see hits, tighten step-by-step.
 ###=================================================================================
 
-# Core run size
-nTrails=2000
-nFiles=200
-
-# We use next_open to ensure results are tradable. 
-# If results are still '0', we can temporarily go back to same_close.
+# Core Optimization Settings
+nTrials=600
+nFiles=120
 fillOpt=next_open
 
-# -------------------------
-# 1) Trade Volume (Discovery Floor)
-# - Lowered from 10 to 6 to find signals with longer RSI periods.
-# -------------------------
-min_trades=3
-trades_baseline=8
-trades_k=0.40
-max_trades=60
-max_trades_k=0.08
+# 1) Trade Volume (very easy eligibility)
+min_trades=2
+trades_baseline=6
+trades_k=0.15
+max_trades=120
+max_trades_k=0.03
 
-# -------------------------
-# 2) Return & Penalty
-# - Accept break-even or slightly negative results to guide Optuna.
-# -------------------------
-ret_floor=0.00
-ret_floor_k=10
+# 2) Return protection (remove cliffs for exploration)
+# NOTE: keep penalty enabled but soft; remove return floor
+ret_floor=0.0
+ret_floor_k=4.0
+penalty_center=-0.02
+penalty_k=4.0
 
-penalty_center=-0.01
-penalty_k=6.0
+# 3) Profit Factor constraints (soft)
+pf_cap=20.0
+pf_baseline=1.05
+pf_k=0.80
+pf_floor=1.00
+pf_floor_k=1.00
 
-# -------------------------
-# 3) Profit Factor Quality
-# - Lower floor to 1.0 to capture 'early' signal discovery.
-# -------------------------
-pf_cap=5.0
-pf_baseline=1.4
-pf_k=1.1
-pf_floor=1.0
-pf_floor_k=3.0
-
-# -------------------------
-# 4) Coverage & Weighting
-# - Lowered coverage target to 60% to find where the strategy works best.
-# -------------------------
-weight_pf=0.75
+# 4) Scoring weight + coverage (make coverage NOT a cliff)
+weight_pf=0.55
 score_power=1.0
+coverage=0.35
+coverage_k=2.0
 
-coverage=0.85
-coverage_k=7.0
-
-# -------------------------
-# 5) Risk & Execution
-# -------------------------
+# 5) Execution & Risk
 commission_per_side=0.0006
 loss_floor=0.001
 cooldown=1
-time_stop=10
+time_stop=12
 
-# -------------------------
-# 6) TP/SL Constraint (Phase 2 Strictness)
-# - Forcing a healthy Risk/Reward profile.
-# -------------------------
-tp2sl_auto=1
-tp2sl_base=1.2
-tp2sl_sr0=30
-tp2sl_k=0.01
-tp2sl_min=1.1
-tp2sl_max=2.5
-
-# -------------------------
-# 7) Optimization Toggles
-# -------------------------
-opt_adaptive=1
-opt_cooldown=1
-
-###=================================================================================
-### Execution Command
-###=================================================================================
+# 6) TP/SL constraint: DISABLE AUTO + make it permissive to avoid pruning
+# min_tp2sl_eff is used as: prune if sl <= min_tp2sl * tp
+# So set it LOW so trials survive.
+min_tp2sl=0.60
 
 CMD="python Bayes_opt_adapt_RSI.py \
-  --trials $nTrails \
+  --optimize \
+  --trials $nTrials \
   --files $nFiles \
   --fill $fillOpt \
-  --penalty \
-  --penalty-ret-center $penalty_center \
-  --penalty-ret-k $penalty_k \
+  --commission_rate_per_side $commission_per_side \
+  --loss_floor $loss_floor \
+  --cooldown $cooldown \
+  --time-stop $time_stop \
   --min-trades $min_trades \
   --trades-baseline $trades_baseline \
   --trades-k $trades_k \
@@ -106,28 +75,22 @@ CMD="python Bayes_opt_adapt_RSI.py \
   --score-power $score_power \
   --coverage-target $coverage \
   --coverage-k $coverage_k \
-  --commission_rate_per_side $commission_per_side \
-  --loss_floor $loss_floor \
-  --cooldown $cooldown \
-  --time-stop $time_stop"
+  --min-tp2sl $min_tp2sl \
+  --penalty \
+  --penalty-ret-center $penalty_center \
+  --penalty-ret-k $penalty_k \
+  --opt-adaptive \
+  --opt-fastslow \
+  --opt-cooldown \
+  --opt-time-stop"
 
-if [[ "$tp2sl_auto" == "1" ]]; then
-  CMD="$CMD --tp2sl-auto --tp2sl-base $tp2sl_base --tp2sl-sr0 $tp2sl_sr0 --tp2sl-k $tp2sl_k --tp2sl-min $tp2sl_min --tp2sl-max $tp2sl_max"
-else
-  CMD="$CMD --min-tp2sl 1.1"
-fi
-
-if [[ "$opt_adaptive" == "1" ]]; then
-  CMD="$CMD --opt-adaptive"
-fi
-
-if [[ "$opt_cooldown" == "1" ]]; then
-  CMD="$CMD --opt-cooldown"
-fi
-
-echo "================================================================================"
-echo "Starting PHASE 2 DISCOVERY Run"
-echo "Strategy: Adaptive RSI (Robustness Mode)"
-echo "Target Fill: $fillOpt"
-echo "================================================================================"
-eval "$CMD"
+echo "-------------------------------------------------------"
+echo "Starting Optuna Study: Bayes_opt_adapt_RSI.py (ULTRA EASY MODE)"
+echo "Trials: $nTrials | Files: $nFiles | Fill: $fillOpt"
+echo "min_trades=$min_trades | coverage_target=$coverage (k=$coverage_k)"
+echo "ret_floor=$ret_floor | pf_floor=$pf_floor | pf_cap=$pf_cap"
+echo "min_tp2sl=$min_tp2sl (tp2sl-auto disabled to reduce pruning)"
+echo "cooldown=$cooldown | time_stop=$time_stop"
+echo "-------------------------------------------------------"
+echo "Executing: $CMD"
+eval $CMD
