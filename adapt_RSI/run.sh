@@ -27,8 +27,8 @@ fi
 # --- reproducibility ---
 seed=7
 
-nTrials=1200      # Sufficient trials to explore the sensitive search space
-nFiles=160
+nTrials=1500      # Sufficient trials to explore the sensitive search space
+nFiles=300
 fillOpt=next_open
 
 # 1) Trade gating (AGGRESSIVE TARGETS)
