@@ -5,8 +5,8 @@
 ### Final Goal: Balance the high-ATR winners (STI) with the low-ATR winners (NFLX).
 ###=================================================================================
 
-nTrails=2000
-nFiles=200
+nTrails=1500
+nFiles=300
 fillOpt=next_open
 
 # 1. Trade Volume (Higher Quality Gate)

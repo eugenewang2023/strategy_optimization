@@ -1,5 +1,5 @@
-nTrails=2000
-nFiles=200
+nTrails=1500
+nFiles=300
 fillOpt=next_open
 #fillOpt=same_close
 

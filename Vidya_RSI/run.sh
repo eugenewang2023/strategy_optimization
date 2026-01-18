@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 # --- LOCKING IN THE SNIPER SETTINGS ---
 seed=7
 nTrials=1500      # Higher trials to fine-tune the 6/6 reactivity zone
-nFiles=160
+nFiles=300
 fillOpt="next_open"
 
 # 1) Trade gating (REWARDING MULTI-TRADES)

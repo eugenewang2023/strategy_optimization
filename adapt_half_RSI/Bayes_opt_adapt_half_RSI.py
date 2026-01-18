@@ -661,6 +661,8 @@ def evaluate_params_on_files(
 # =============================
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--optimize", action="store_true",
+                    help="No-op flag kept for compatibility; optimization is default unless --report-only is set.")
     ap.add_argument("--data_dir", type=str, default="data")
     ap.add_argument("--output_dir", type=str, default="output")
 
@@ -697,9 +699,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fill", type=str, default="same_close", choices=["same_close", "next_open"])
 
     # exits
-    ap.add_argument("--use_trailing_exit", type=bool, default=True)
+    ap.add_argument("--use_trailing_exit", action="store_true")
+    ap.set_defaults(use_trailing_exit=True)
+    ap.add_argument("--no-use_trailing_exit", dest="use_trailing_exit", action="store_false")
     ap.add_argument("--trail_mode", type=str, default="trail_only", choices=["trail_only", "trail_plus_hard_sl"])
-    ap.add_argument("--close_on_sellSignal", type=bool, default=True)
+    ap.add_argument("--close_on_sellSignal", action="store_true")
+    ap.set_defaults(close_on_sellSignal=True)
+    ap.add_argument("--no-close_on_sellSignal", dest="close_on_sellSignal", action="store_false")
 
     # cooldown
     ap.add_argument("--cooldown", type=int, default=1)
