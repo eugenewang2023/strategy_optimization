@@ -4,29 +4,39 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# --- LOCKING IN THE SNIPER SETTINGS ---
 seed=7
-nTrials=1500      # Higher trials to fine-tune the 6/6 reactivity zone
+nTrials=1500
 nFiles=300
 fillOpt="next_open"
 
-# 1) Trade gating (REWARDING MULTI-TRADES)
-min_trades=1           
-trades_baseline=3.0    # Reward moving from 1 trade to 3 trades
-trades_k=1.2           # STEEP reward for getting that 2nd or 3rd trade
+# Trade gating
+min_trades=1
+trades_baseline=3.0
+trades_k=1.2
 
-# 2) PF & Quality (MAINTAINING THE 5.0 PF)
-pf_baseline=1.15      
-pf_k=2.5               
-weight_pf=0.70         # QUALITY IS PARAMOUNT: 70% weight on PF/Returns
+# PF / scoring
+pf_baseline=1.15
+pf_k=2.5
+weight_pf=0.70
 
-# 3) Signal Settings (The "Aggression" Sweet Spot)
-threshold_fixed=0.012  # Slightly higher to ensure we only take high-conviction moves
-vol_floor_mult_fixed=0.05 
-time_stop=48           # Give the "Sniper" plenty of room to let the trend play out
+# Signal
+threshold_fixed=0.012
+vol_floor_mult_fixed=0.05
+
+# Objective / penalties
+objective_mode="hybrid"
+obj_penalty_mode="both"
+zero_loss_target=0.05
+zero_loss_k=12
+cap_target=0.3
+cap_k=6
+min_glpt=0.003
+min_glpt_k=12
+
+pf_cap=4.0   # keep consistent with your run output (change if desired)
 
 CMD=(
-  "python3" Vidya_RSI.py
+  python3 Vidya_RSI.py
   --optimize
   --seed "$seed"
   --trials "$nTrials"
@@ -41,21 +51,31 @@ CMD=(
   --pf-baseline "$pf_baseline"
   --pf-k "$pf_k"
   --weight-pf "$weight_pf"
-  --score-power 1.5      # High contrast to separate 'good' from 'legendary'
+  --score-power 1.5
 
   --threshold-fixed "$threshold_fixed"
   --vol-floor-mult-fixed "$vol_floor_mult_fixed"
+
+  --pf-cap "$pf_cap"
+
+  --objective-mode "$objective_mode"
+  --obj-penalty-mode "$obj_penalty_mode"
+  --zero-loss-target "$zero_loss_target"
+  --zero-loss-k "$zero_loss_k"
+  --cap-target "$cap_target"
+  --cap-k "$cap_k"
+  --min-glpt "$min_glpt"
+  --min-glpt-k "$min_glpt_k"
+
   --opt-time-stop
   --min-tp2sl 0.8
 
-  # Focus the search space around your successful discovery
-  --opt-vidya           
-  --opt-fastslow        
+  --opt-vidya
+  --opt-fastslow
 )
 
 echo "-------------------------------------------------------"
 echo "PHASE-7: FINAL SNIPER COMPOUNDING"
-echo "Baseline: 3 trades | PF Weight: 70% | High Contrast Scoring"
 echo "-------------------------------------------------------"
 
 "${CMD[@]}"
