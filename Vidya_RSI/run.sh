@@ -4,20 +4,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Use python3 if available; fall back to python (Git Bash + alias-safe)
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+command -v "$PYTHON_BIN" >/dev/null 2>&1 || PYTHON_BIN="python"
+command -v "$PYTHON_BIN" >/dev/null 2>&1 || { echo "ERROR: python not found in PATH"; exit 2; }
+
 seed=7
 nTrials=1500
 nFiles=300
 fillOpt="next_open"
 
-# Trade gating
-min_trades=1
-trades_baseline=3.0
-trades_k=1.2
+# -----------------------------
+# Anti-degeneracy fixes
+# -----------------------------
+# Trade gating (raise this; 1-trade eligibility is PF-gaming heaven)
+min_trades=8
+trades_baseline=8.0
+trades_k=0.5
 
-# PF / scoring
+# PF / scoring (reduce PF dominance and remove score exponent blow-ups)
 pf_baseline=1.15
 pf_k=2.5
-weight_pf=0.70
+weight_pf=0.55
+score_power=1.0
 
 # Signal
 threshold_fixed=0.012
@@ -33,10 +42,14 @@ cap_k=6
 min_glpt=0.003
 min_glpt_k=12
 
-pf_cap=4.0   # keep consistent with your run output (change if desired)
+pf_cap=4.0
+
+# Optional: if your script supports it, increasing loss_floor helps PF degeneracy.
+# Leave commented if Vidya_RSI.py doesn't have this flag.
+loss_floor=0.01
 
 CMD=(
-  python3 Vidya_RSI.py
+  "$PYTHON_BIN" Vidya_RSI.py
   --optimize
   --seed "$seed"
   --trials "$nTrials"
@@ -51,7 +64,7 @@ CMD=(
   --pf-baseline "$pf_baseline"
   --pf-k "$pf_k"
   --weight-pf "$weight_pf"
-  --score-power 1.5
+  --score-power "$score_power"
 
   --threshold-fixed "$threshold_fixed"
   --vol-floor-mult-fixed "$vol_floor_mult_fixed"
@@ -74,8 +87,16 @@ CMD=(
   --opt-fastslow
 )
 
+# If Vidya_RSI.py supports --loss-floor, add it; otherwise skip.
+if "$PYTHON_BIN" Vidya_RSI.py --help 2>/dev/null | grep -q -- "--loss-floor"; then
+  CMD+=( --loss-floor "$loss_floor" )
+fi
+
 echo "-------------------------------------------------------"
 echo "PHASE-7: FINAL SNIPER COMPOUNDING"
+echo "-------------------------------------------------------"
+echo "Python: $PYTHON_BIN"
+echo "Cmd: ${CMD[*]}"
 echo "-------------------------------------------------------"
 
 "${CMD[@]}"
