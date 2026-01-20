@@ -525,6 +525,12 @@ def objective_penalty_multiplier(stats, args) -> dict:
 # =================================================================================
 
 def main():
+    import argparse, random, datetime
+    from pathlib import Path
+    import numpy as np
+    import pandas as pd
+    import optuna
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, default="data")
     ap.add_argument("--optimize", action="store_true")
@@ -539,30 +545,22 @@ def main():
         "--objective-mode",
         type=str,
         default="median_score",
-        choices=["mean_score", "median_score", "median_pf_diag", "mean_pf_eff_excl_zero", "hybrid"],
-        help="How to aggregate per-ticker results into the Optuna objective."
+        choices=["mean_score", "median_score", "median_pf_diag",
+                 "mean_pf_eff_excl_zero", "hybrid"],
     )
 
-    # Objective penalties for degeneracy
+    # Objective degeneracy penalties
     ap.add_argument("--obj-penalty-mode", type=str, default="both",
-                    choices=["none", "zero_loss", "cap", "both"],
-                    help="Apply an objective penalty when zero-loss/capped tickers become too common.")
-    ap.add_argument("--zero-loss-target", type=float, default=0.05,
-                    help="Target maximum fraction of eligible tickers with gl==0 & gp>0.")
-    ap.add_argument("--zero-loss-k", type=float, default=12.0,
-                    help="Steepness of zero-loss penalty; larger = harsher.")
-    ap.add_argument("--cap-target", type=float, default=0.30,
-                    help="Target maximum fraction of eligible tickers whose PF_eff exceeds pf-cap (i.e., capped).")
-    ap.add_argument("--cap-k", type=float, default=6.0,
-                    help="Steepness of PF-cap concentration penalty.")
-    # Degeneracy guardrail: minimum gross_loss per trade (among eligible tickers)
-    ap.add_argument("--min-glpt", type=float, default=0.002,
-                    help="Minimum gross_loss per trade target (median over eligible). "
-                         "Units are return-fraction per trade (same units as pnl).")
-    ap.add_argument("--min-glpt-k", type=float, default=12.0,
-                    help="Steepness of min gross_loss/trade penalty. Larger = harsher.")
+                    choices=["none", "zero_loss", "cap", "both"])
+    ap.add_argument("--zero-loss-target", type=float, default=0.05)
+    ap.add_argument("--zero-loss-k", type=float, default=12.0)
+    ap.add_argument("--cap-target", type=float, default=0.30)
+    ap.add_argument("--cap-k", type=float, default=6.0)
 
-    # Penalty knobs (kept for reporting)
+    ap.add_argument("--min-glpt", type=float, default=0.002)
+    ap.add_argument("--min-glpt-k", type=float, default=12.0)
+
+    # Penalty knobs
     ap.add_argument("--penalty", type=str, default="enabled")
     ap.add_argument("--penalty_ret_center", type=float, default=0.01)
     ap.add_argument("--penalty_ret_k", type=float, default=10.0)
@@ -608,6 +606,9 @@ def main():
     sample_files = random.sample(files, min(len(files), args.files))
     data_list = [(f.stem, ensure_ohlc(pd.read_parquet(f))) for f in sample_files]
 
+    # ======================
+    # OPTUNA OBJECTIVE
+    # ======================
     def objective(trial):
         p = {
             "vidya_len": trial.suggest_int("vl", 5, 25) if args.opt_vidya else 14,
@@ -621,18 +622,14 @@ def main():
             "commission": args.commission_rate_per_side,
             "fill_mode": args.fill,
             "use_regime": args.use_regime,
-
-            # PF unification knobs
             "loss_floor": args.loss_floor,
             "pf_cap_score_only": args.pf_cap,
-
             "cooldown_bars": 1,
         }
 
         stats = [backtest_vidya_engine(df, **p) for _, df in data_list]
-
-        eligible_count = sum(1 for st in stats if st.trades >= args.min_trades)
-        cov = eligible_count / len(stats) if stats else 0.0
+        eligible = sum(st.trades >= args.min_trades for st in stats)
+        cov = eligible / len(stats)
         cov_mult = sigmoid(args.coverage_k * (cov - args.coverage_target))
 
         agg = robust_objective_aggregate(stats, args, args.objective_mode)
@@ -641,12 +638,7 @@ def main():
         return float(agg * cov_mult * pen["penalty_mult"])
 
     study = optuna.create_study(direction="maximize")
-    study.optimize(
-        objective,
-        n_trials=args.trials,
-        show_progress_bar=True,
-        callbacks=[TQDMProgressBarCallback()] if TQDMProgressBarCallback else None,
-    )
+    study.optimize(objective, n_trials=args.trials)
 
     best = dict(study.best_params)
     best_p = {
@@ -655,12 +647,9 @@ def main():
         "commission": args.commission_rate_per_side,
         "fill_mode": args.fill,
         "use_regime": args.use_regime,
-
         "loss_floor": args.loss_floor,
         "pf_cap_score_only": args.pf_cap,
-
         "cooldown_bars": 1,
-
         "time_stop_bars": best.get("ts", 15),
         "fastPeriod": best.get("fp", 10),
         "slowPeriod": best.get("sp", 40),
@@ -669,147 +658,79 @@ def main():
         "regime_ratio": best.get("reg_ratio", 3.0),
     }
 
-    # Per ticker report
-    per_ticker = []
+    # ======================
+    # PER-TICKER REPORT
+    # ======================
+    rows = []
     for name, df in data_list:
         st = backtest_vidya_engine(df, **best_p)
-        per_ticker.append({
+        rows.append({
             "ticker": name,
             "profit_factor_raw": st.profit_factor_raw,
             "profit_factor_eff": st.profit_factor_eff,
             "profit_factor_diag": st.profit_factor_diag,
-            "zero_loss": st.zero_loss,
             "pf_capped": st.pf_capped,
+            "zero_loss": st.zero_loss,
             "num_trades": st.trades,
             "ticker_score": score_trial(st, args),
             "total_return": st.tot_ret,
             "gross_profit": st.gp,
             "gross_loss": st.gl,
+            "gl_per_trade": st.gl_per_trade,
+            "atr_pct_med": st.atr_pct_med,
             "maxdd": st.maxdd,
-            "eligible": 1 if st.trades >= args.min_trades else 0,
+            "eligible": int(st.trades >= args.min_trades),
             "is_neg": int(st.tot_ret <= 0.0),
             "num_neg_trades": st.num_neg_trades,
-            "gl_per_trade": st.gl_per_trade,      # ✅ added to table
-            "atr_pct_med": st.atr_pct_med,        # optional, but useful
         })
 
-    per_df = pd.DataFrame(per_ticker).sort_values(
-        ["ticker_score", "profit_factor_diag", "total_return", "num_trades"],
-        ascending=False,
-        kind="mergesort",
-    )
+    per_df = pd.DataFrame(rows)
 
-    eligible_count = int(per_df["eligible"].sum())
-    coverage = eligible_count / len(per_df) if len(per_df) else 0.0
-
-    zero_loss_count = int(per_df["zero_loss"].sum())
-    zero_loss_pct = float(zero_loss_count / len(per_df)) if len(per_df) else 0.0
-    capped_count = int(per_df["pf_capped"].sum())
-    capped_pct = float(capped_count / len(per_df)) if len(per_df) else 0.0
-
-    pf_raw_finite = per_df["profit_factor_raw"].replace([np.inf, -np.inf], np.nan).dropna()
-    med_pf_raw = float(pf_raw_finite.median()) if len(pf_raw_finite) else 0.0
-    trim_pf_raw = trimmed_mean(pf_raw_finite.to_numpy(), trim_frac=0.05) if len(pf_raw_finite) else 0.0
-
-    avg_pf_eff = safe_mean(per_df["profit_factor_eff"])
-    med_pf_eff = safe_median(per_df["profit_factor_eff"])
-    avg_pf_eff_excl_zero = safe_mean(per_df.loc[per_df["zero_loss"] == 0, "profit_factor_eff"]) if zero_loss_count < len(per_df) else 0.0
-
-    avg_pf_diag = safe_mean(per_df["profit_factor_diag"])
-    med_pf_diag = safe_median(per_df["profit_factor_diag"])
-
-    # recompute penalty diagnostics on best params (eligible only)
+    # ======================
+    # DIAGNOSTICS
+    # ======================
     best_stats = [backtest_vidya_engine(df, **best_p) for _, df in data_list]
     pen_best = objective_penalty_multiplier(best_stats, args)
 
-    print(
-        f"Penalty mult (best eval):        {pen_best['penalty_mult']:.6f}   "
-        f"(zero_loss_mult={pen_best['zero_loss_mult']:.6f}, "
-        f"cap_mult={pen_best['cap_mult']:.6f}, "
-        f"glpt_mult={pen_best['glpt_mult']:.6f})"
-    )
+    eligible_count = int(per_df["eligible"].sum())
+    coverage = eligible_count / len(per_df)
+    zero_loss_count = int(per_df["zero_loss"].sum())
+    capped_count = int(per_df["pf_capped"].sum())
 
-    print("\n=== Objective Degeneracy Diagnostics ===")
-    print(f"Min GL/trade target/k:           {args.min_glpt:.6f} / {args.min_glpt_k:.3f}")
-    print(f"Median GL per trade (eligible):  {pen_best['glpt_med']:.6f}")
-    print(f"GLPT mult (best eval):           {pen_best['glpt_mult']:.6f}")
+    med_pf_diag = safe_median(per_df["profit_factor_diag"])
+    avg_pf_diag = safe_mean(per_df["profit_factor_diag"])
+    med_pf_eff = safe_median(per_df["profit_factor_eff"])
+    avg_pf_eff = safe_mean(per_df["profit_factor_eff"])
 
-    print(f"Median Profit Factor (diag):      {med_pf_diag:.6f}   (cap={args.pf_cap})")
-    print(f"Avg Profit Factor (diag cap):     {avg_pf_diag:.6f}   (cap={args.pf_cap})")
-    print(f"Median Profit Factor (eff):       {med_pf_eff:.6f}   (loss_floor={args.loss_floor})")
-    print(f"Avg Profit Factor (eff):          {avg_pf_eff:.6f}   (loss_floor={args.loss_floor})")
-    print(f"Avg PF (eff, excl zero-loss):     {avg_pf_eff_excl_zero:.6f}")
-
-    print(f"Zero-loss tickers (gl==0,gp>0):   {zero_loss_count}/{len(per_df)} = {zero_loss_pct:.3f}")
-    print(f"PF capped (eff>cap):              {capped_count}/{len(per_df)} = {capped_pct:.3f}")
-
-    print(f"Median PF (raw, finite only):     {med_pf_raw:.6f}")
-    print(f"Trimmed Mean PF (raw, 5% trim):   {trim_pf_raw:.6f}")
-
-    print(f"Avg Trades / Ticker:              {per_df['num_trades'].mean():.3f}")
-    if eligible_count > 0:
-        print(f"Mean Ticker Score (eligible):     {per_df[per_df['eligible']==1]['ticker_score'].mean():.6f}")
-    else:
-        print(f"Mean Ticker Score (eligible):     0.000000")
-    print(f"Coverage (eligible/total):        {eligible_count}/{len(per_df)} = {coverage:.3f}")
-
-    print(f"Penalty enabled:                  {args.penalty} (soft)")
-    print(f"Soft penalty center/k:            {args.penalty_ret_center} / {args.penalty_ret_k}")
-    print(f"Tail-protection ret floor/k:      {args.ret_floor} / {args.ret_floor_k}")
-    print(f"Max-trades penalty:               max_trades={args.max_trades}, k={args.max_trades_k}")
-    print(f"PF-floor penalty:                 pf_floor={args.pf_floor}, k={args.pf_floor_k}")
-    print(f"cooldown_bars:                    1 (opt=False) [loss-only]")
-    print(f"time_stop_bars:                   {best_p['time_stop_bars']} (0=disabled) (opt={args.opt_time_stop})")
-    print(f"num_neg (return<=0):              {int(per_df['is_neg'].sum())}")
-    print(f"commission_rate_per_side:         {args.commission_rate_per_side:.6f}")
-    print(f"PF ROC baseline/k:                {args.pf_baseline:.3f} / {args.pf_k:.3f}")
-    print(f"Trades ROC baseline/k:            {args.trades_baseline:.3f} / {args.trades_k:.3f}")
-    print(f"weight_pf:                        {args.weight_pf:.3f}")
-    print(f"score_power:                      {args.score_power:.3f}")
-    print(f"min_trades gate:                  {args.min_trades}")
-    print(f"loss_floor (scoring):             {args.loss_floor}")
-    print(f"threshold_mode:                   {args.threshold_mode}")
-    print(f"Score (objective):                {study.best_value:.6f}")
-
-    print("\n=== BEST PARAMS ===")
-    for k in sorted(study.best_params.keys()):
-        print(f"{k}: {study.best_params[k]}")
-    print(f"best_score (OPTUNA objective): {study.best_value}")
-    print(f"fill_mode (final report): {args.fill}")
-
-    per_df_print = per_df.copy()
-    per_df_print["profit_factor_raw_print"] = per_df_print["profit_factor_raw"].apply(
-        lambda x: "inf" if not np.isfinite(x) else f"{x:.6f}"
-    )
-
-    print("\n=== INDIVIDUAL (TICKER) METRICS (w/ BEST PARAMS) ===")
-    cols = [
-        "ticker",
-        "profit_factor_raw_print",
-        "profit_factor_eff",
-        "profit_factor_diag",
-        "pf_capped",
-        "zero_loss",
-        "num_trades",
-        "ticker_score",
-        "total_return",
-        "gross_profit",
-        "gross_loss",
-        "gl_per_trade",     # ✅ added
-        "atr_pct_med",      # optional
-        "maxdd",
-        "eligible",
-    ]
-    print(per_df_print[cols].to_string(index=False))
-
+    # ======================
+    # OUTPUT FILES
+    # ======================
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    per_csv = out_dir / f"per_ticker_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M")
 
-    per_df_csv = per_df.copy()
-    per_df_csv["profit_factor_raw_csv"] = per_df_csv["profit_factor_raw"].apply(lambda x: safe_pf_raw_for_csv(x, 1e9))
-    per_df_csv.to_csv(per_csv, index=False)
-    print(f"\nSaved per-ticker CSV to: {per_csv}")
+    per_csv = out_dir / f"per_ticker_{run_ts}.csv"
+    per_df.to_csv(per_csv, index=False)
+
+    txt = []
+    txt.append("=== OBJECTIVE DEGENERACY DIAGNOSTICS ===")
+    txt.append(f"penalty_mult: {pen_best['penalty_mult']:.6f}")
+    txt.append(f"zero_loss_mult: {pen_best['zero_loss_mult']:.6f}")
+    txt.append(f"cap_mult: {pen_best['cap_mult']:.6f}")
+    txt.append(f"glpt_mult: {pen_best['glpt_mult']:.6f}")
+    txt.append("")
+    txt.append("=== BEST PARAMS ===")
+    for k in sorted(study.best_params):
+        txt.append(f"{k}: {study.best_params[k]}")
+    txt.append("")
+    txt.append(f"objective_score: {study.best_value:.6f}")
+
+    best_txt = out_dir / f"best_params_{run_ts}.txt"
+    best_txt.write_text("\n".join(txt))
+
+    print(f"Saved per-ticker CSV: {per_csv}")
+    print(f"Saved best params TXT: {best_txt}")
+    print("\n".join(txt))
 
 if __name__ == "__main__":
     main()
