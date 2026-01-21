@@ -6,33 +6,48 @@ import pandas as pd
 import numpy as np
 
 
+# ============================================================
+# Load all runs containing "per_ticker" anywhere in filename
+# ============================================================
 def load_runs_from_dir(input_dir: Path):
     if not input_dir.exists():
         raise SystemExit(f"Input directory does not exist: {input_dir}")
 
-    files = sorted(input_dir.glob("per_ticker_*.csv"))
+    # Match ANY file containing "per_ticker" anywhere in the name
+    files = sorted(input_dir.glob("*per_ticker*.csv"))
     if not files:
-        raise SystemExit(f"No per_ticker_*.csv files found in: {input_dir}")
+        raise SystemExit(f"No files containing 'per_ticker' found in: {input_dir}")
 
     dfs = []
     for f in files:
         df = pd.read_csv(f)
-        run_id = f.stem.replace("per_ticker_", "")
+
+        # Extract run_id from filename
+        stem = f.stem
+        if "per_ticker" in stem:
+            # Remove everything up to "per_ticker"
+            run_id = stem.split("per_ticker", 1)[1].lstrip("_-")
+        else:
+            run_id = stem  # fallback
+
         df["run_id"] = run_id
         dfs.append(df)
 
     return dfs, files
 
 
+# ============================================================
+# Summaries
+# ============================================================
 def summarize_run(df):
     return {
         "run_id": df["run_id"].iloc[0],
         "avg_total_return": df["total_return"].mean(),
         "median_total_return": df["total_return"].median(),
-        "avg_pf_eff": df["profit_factor_eff"].mean(),
-        "median_pf_eff": df["profit_factor_eff"].median(),
+        "avg_pf_eff": df["profit_factor_eff"].mean() if "profit_factor_eff" in df else np.nan,
+        "median_pf_eff": df["profit_factor_eff"].median() if "profit_factor_eff" in df else np.nan,
         "avg_maxdd": df["maxdd"].mean(),
-        "eligible_rate": df["eligible"].mean(),
+        "eligible_rate": df["eligible"].mean() if "eligible" in df else np.nan,
         "avg_trades": df["num_trades"].mean(),
         "num_tickers": len(df),
     }
@@ -47,6 +62,9 @@ def aggregate_summary(dfs):
     )
 
 
+# ============================================================
+# Best run per ticker
+# ============================================================
 def best_per_ticker(dfs):
     combined = pd.concat(dfs, ignore_index=True)
     idx = combined.groupby("ticker")["total_return"].idxmax()
@@ -60,6 +78,9 @@ def best_per_ticker(dfs):
     )
 
 
+# ============================================================
+# Per-ticker matrix
+# ============================================================
 def per_ticker_matrix(dfs):
     combined = pd.concat(dfs, ignore_index=True)
     return combined.pivot_table(
@@ -70,6 +91,9 @@ def per_ticker_matrix(dfs):
     )
 
 
+# ============================================================
+# Main
+# ============================================================
 def main():
     ap = argparse.ArgumentParser(
         description="Compare per-ticker optimization result CSV files"
@@ -78,7 +102,7 @@ def main():
         "--input_dir",
         type=str,
         default="input",
-        help="Directory containing per_ticker_*.csv files (default: input)",
+        help="Directory containing per_ticker*.csv files (default: input)",
     )
     ap.add_argument(
         "--out_dir",

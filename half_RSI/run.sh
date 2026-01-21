@@ -51,7 +51,7 @@ echo python Bayes_opt_half_RSI.py --trials $nTrails --files $nFiles \
   --pf-cap $pf_cap --pf-baseline $pf_baseline --pf-k $pf_k \
   --pf-floor $pf_floor --pf-floor-k $pf_floor_k \
   --weight-pf $weight_pf --score-power $score_power \
-  --commission_rate_per_side $commission_per_side --loss_floor $loss_floor \
+  --commission_rate_per_side $commission_per_side --loss-floor $loss_floor \
   --fill $fillOpt --cooldown $cooldown --time-stop $time_stop \
   --tp2sl-auto \
   --tp2sl-base 1.20 \

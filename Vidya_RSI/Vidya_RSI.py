@@ -6,20 +6,8 @@ Unified Engine: Kaufman VIDYA + ZLEMA + Regime Slope.
 Unified Reporting: PF_raw vs PF_eff (loss_floor) vs PF_diag_cap (cap on PF_eff),
 plus overall metrics, penalty diagnostics, and sorted ticker tables.
 
-Reporting Fix:
-- Print robust PF summaries so a few gl==0 tickers don't blow up averages.
-- PF is computed exactly once via compute_pf_metrics().
-
-Objective Fix:
-- Robust Optuna objective aggregation via --objective-mode.
-- Optional explicit objective penalties for:
-  * too many zero-loss tickers
-  * too many PF-capped tickers
-
-This version fixes the "always-on shrinkage" smoking gun:
-- zero_loss_mult and cap_mult are now ONE-SIDED (Option A style):
-  -> 1.0 when compliant (<= target), penalize only when violating the threshold.
-- GLPT is already ONE-SIDED hard-floor (as requested).
+With consistent output prefix: vidya_RSI_...
+ASCII-safe console output for Windows compatibility.
 """
 
 import math
@@ -38,6 +26,13 @@ try:
 except Exception:
     TQDMProgressBarCallback = None
 
+
+# =============================
+# Module-specific prefix for output files
+# =============================
+MODULE_PREFIX = "vidya_RSI_"
+
+
 # =================================================================================
 # INDICATORS & ENGINE
 # =================================================================================
@@ -47,6 +42,7 @@ def ensure_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     out = df[[cols["open"], cols["high"], cols["low"], cols["close"]]].copy()
     out.columns = ["open", "high", "low", "close"]
     return out
+
 
 def vidya_ema(price: np.ndarray, length: int, smoothing: int) -> np.ndarray:
     n = len(price)
@@ -65,11 +61,13 @@ def vidya_ema(price: np.ndarray, length: int, smoothing: int) -> np.ndarray:
         vidya[i] = price[i] * k + prev * (1.0 - k)
     return vidya
 
+
 def zlema(series: np.ndarray, period: int) -> np.ndarray:
     pd_s = pd.Series(series)
     lag = (period - 1) // 2
     de_lagged = pd_s + (pd_s - pd_s.shift(lag))
     return de_lagged.ewm(span=period, adjust=False).mean().to_numpy()
+
 
 # =================================================================================
 # PF UNIFICATION (single source of truth)
@@ -122,11 +120,13 @@ def compute_pf_metrics(gp: float, gl: float, loss_floor: float, pf_diag_cap: flo
         "pf_capped": int(capped),
     }
 
+
 def safe_pf_raw_for_csv(pf_raw: float, inf_placeholder: float = 1e9) -> float:
     """Only for CSV export. Never use this for averaging/scoring."""
     if not np.isfinite(pf_raw):
         return float(inf_placeholder)
     return float(pf_raw)
+
 
 # =================================================================================
 # BACKTEST
@@ -155,8 +155,9 @@ class TradeStats:
     # NEW: requested
     gl_per_trade: float = 0.0
 
-    # optional vol proxy (even if you won’t use it now)
+    # optional vol proxy
     atr_pct_med: float = 0.0
+
 
 def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
     o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
@@ -301,6 +302,7 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
         atr_pct_med=float(atr_pct_med),
     )
 
+
 # =================================================================================
 # SCORING & UTILS
 # =================================================================================
@@ -308,12 +310,14 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
 def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x)) if x >= 0 else math.exp(x) / (1.0 + math.exp(x))
 
+
 def score_trial(st: TradeStats, args) -> float:
     if st.trades < args.min_trades:
         return 0.0
     pf_w = 1.0 / (1.0 + math.exp(-args.pf_k * (st.profit_factor_diag - args.pf_baseline)))
-    tr_w = sigmoid(args.trades_k * (st.trades - args.trades_baseline))
+    tr_w = 1.0 / (1.0 + math.exp(-args.trades_k * (st.trades - args.trades_baseline)))
     return float((args.weight_pf * pf_w + (1.0 - args.weight_pf) * tr_w) ** args.score_power)
+
 
 # =================================================================================
 # Robust reporting helpers
@@ -322,13 +326,16 @@ def score_trial(st: TradeStats, args) -> float:
 def safe_series(x: pd.Series) -> pd.Series:
     return pd.to_numeric(x, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
 
+
 def safe_mean(x: pd.Series) -> float:
     s = safe_series(x)
     return float(s.mean()) if len(s) else 0.0
 
+
 def safe_median(x: pd.Series) -> float:
     s = safe_series(x)
     return float(s.median()) if len(s) else 0.0
+
 
 def trimmed_mean(x, trim_frac=0.05):
     x = np.asarray(x, dtype=float)
@@ -340,6 +347,7 @@ def trimmed_mean(x, trim_frac=0.05):
     if 2 * k >= len(x):
         return float(np.mean(x))
     return float(np.mean(x[k:-k]))
+
 
 def robust_objective_aggregate(stats, args, objective_mode: str) -> float:
     eligible = [st for st in stats if st.trades >= args.min_trades]
@@ -374,6 +382,7 @@ def robust_objective_aggregate(stats, args, objective_mode: str) -> float:
 
     return med_score
 
+
 def objective_penalty_multiplier(stats, args) -> dict:
     """
     Returns a dict with:
@@ -383,14 +392,7 @@ def objective_penalty_multiplier(stats, args) -> dict:
       glpt_med, glpt_target, glpt_mult,
       vol_med,
       eligible_count, total_count
-
-    Semantics (ONE-SIDED penalties):
-      - zero_loss_mult: 1.0 when zero_loss_pct <= target, drops when above
-      - cap_mult:       1.0 when cap_pct <= target, drops when above
-      - glpt_mult:      1.0 when glpt_med >= target, drops when below (hard floor option)
     """
-    import numpy as np
-
     eligible = [st for st in stats if getattr(st, "trades", 0) >= getattr(args, "min_trades", 0)]
     total_count = len(stats)
 
@@ -409,20 +411,14 @@ def objective_penalty_multiplier(stats, args) -> dict:
             "total_count": int(total_count),
         }
 
-    # ------------------------------------------------------------
-    # Zero-loss fraction (computed directly from gp/gl)
-    # zero-loss means gl==0 and gp>0 (PF_raw would blow up)
-    # ------------------------------------------------------------
+    # Zero-loss fraction
     z = np.asarray(
         [1.0 if (float(getattr(st, "gl", 0.0)) <= 0.0 and float(getattr(st, "gp", 0.0)) > 0.0) else 0.0 for st in eligible],
         dtype=float,
     )
     zero_loss_pct = float(np.mean(z)) if z.size else 0.0
 
-    # ------------------------------------------------------------
-    # Cap fraction (computed from PF_eff > pf_cap)
-    # NOTE: args.pf_cap == 0/<=0 means "no cap" => cap_pct = 0
-    # ------------------------------------------------------------
+    # Cap fraction
     cap_val = float(getattr(args, "pf_cap", 0.0))
     if cap_val > 0.0:
         c = np.asarray(
@@ -433,9 +429,7 @@ def objective_penalty_multiplier(stats, args) -> dict:
         c = np.zeros(len(eligible), dtype=float)
     cap_pct = float(np.mean(c)) if c.size else 0.0
 
-    # ------------------------------------------------------------
-    # GL per trade (GLPT): fixed absolute target (return units)
-    # ------------------------------------------------------------
+    # GL per trade (GLPT)
     glpt = np.asarray(
         [float(getattr(st, "gl_per_trade", float(getattr(st, "gl", 0.0)) / max(int(getattr(st, "trades", 0)), 1)))
          for st in eligible],
@@ -444,7 +438,7 @@ def objective_penalty_multiplier(stats, args) -> dict:
     glpt = glpt[np.isfinite(glpt)]
     glpt_med = float(np.median(glpt)) if glpt.size else 0.0
 
-    # (Optional) volatility proxy for reporting only
+    # Volatility proxy
     vol = np.asarray([float(getattr(st, "atr_pct_med", 0.0)) for st in eligible], dtype=float)
     vol = vol[np.isfinite(vol)]
     vol_med = float(np.median(vol)) if vol.size else 0.0
@@ -452,45 +446,38 @@ def objective_penalty_multiplier(stats, args) -> dict:
     glpt_target = float(getattr(args, "min_glpt", 0.0))
     min_glpt_k = float(getattr(args, "min_glpt_k", 0.0))
 
-    # GLPT multiplier: HARD FLOOR (Option A)
-    # - If glpt_med >= target => multiplier = 1
-    # - If glpt_med <  target => multiplier drops via sigmoid
+    # GLPT multiplier: HARD FLOOR
     if glpt_target > 0.0 and min_glpt_k > 0.0:
         x = min_glpt_k * (glpt_med - glpt_target)
         glpt_mult = 1.0 if x >= 0.0 else sigmoid(float(x))
     else:
-        glpt_mult = 1.0  # disabled
+        glpt_mult = 1.0
 
-    # ------------------------------------------------------------
-    # ONE-SIDED multipliers for zero-loss and cap (FIXED SIGN)
-    #   - No penalty if actual <= target
-    #   - Penalty only if actual > target
-    # ------------------------------------------------------------
+    # ONE-SIDED zero-loss multiplier
     zero_loss_target = float(getattr(args, "zero_loss_target", 0.0))
     zero_loss_k = float(getattr(args, "zero_loss_k", 0.0))
     if zero_loss_k > 0.0:
         if zero_loss_pct <= zero_loss_target:
             zero_loss_mult = 1.0
         else:
-            xzl = zero_loss_k * (zero_loss_target - zero_loss_pct)  # negative when violating
+            xzl = zero_loss_k * (zero_loss_target - zero_loss_pct)
             zero_loss_mult = sigmoid(float(xzl))
     else:
         zero_loss_mult = 1.0
 
+    # ONE-SIDED cap multiplier
     cap_target = float(getattr(args, "cap_target", 0.0))
     cap_k = float(getattr(args, "cap_k", 0.0))
     if cap_k > 0.0:
         if cap_pct <= cap_target:
             cap_mult = 1.0
         else:
-            xcap = cap_k * (cap_target - cap_pct)  # negative when violating
+            xcap = cap_k * (cap_target - cap_pct)
             cap_mult = sigmoid(float(xcap))
     else:
         cap_mult = 1.0
 
-    # ------------------------------------------------------------
-    # Combine based on obj_penalty_mode
-    # ------------------------------------------------------------
+    # Combine penalties
     mode = str(getattr(args, "obj_penalty_mode", "both")).lower()
     if mode == "none":
         penalty_mult = 1.0
@@ -501,7 +488,6 @@ def objective_penalty_multiplier(stats, args) -> dict:
     else:  # "both"
         penalty_mult = float(zero_loss_mult * cap_mult)
 
-    # Include GLPT guardrail only when enabled
     if glpt_target > 0.0 and min_glpt_k > 0.0:
         penalty_mult *= float(glpt_mult)
 
@@ -525,12 +511,6 @@ def objective_penalty_multiplier(stats, args) -> dict:
 # =================================================================================
 
 def main():
-    import argparse, random, datetime
-    from pathlib import Path
-    import numpy as np
-    import pandas as pd
-    import optuna
-
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, default="data")
     ap.add_argument("--optimize", action="store_true")
@@ -562,14 +542,14 @@ def main():
 
     # Penalty knobs
     ap.add_argument("--penalty", type=str, default="enabled")
-    ap.add_argument("--penalty_ret_center", type=float, default=0.01)
-    ap.add_argument("--penalty_ret_k", type=float, default=10.0)
-    ap.add_argument("--ret_floor", type=float, default=-0.15)
-    ap.add_argument("--ret_floor_k", type=float, default=2.0)
-    ap.add_argument("--max_trades", type=int, default=100)
-    ap.add_argument("--max_trades_k", type=float, default=0.1)
-    ap.add_argument("--pf_floor", type=float, default=1.0)
-    ap.add_argument("--pf_floor_k", type=float, default=5.0)
+    ap.add_argument("--penalty-ret-center", type=float, default=0.01)
+    ap.add_argument("--penalty-ret-k", type=float, default=10.0)
+    ap.add_argument("--ret-floor", type=float, default=-0.15)
+    ap.add_argument("--ret-floor-k", type=float, default=2.0)
+    ap.add_argument("--max-trades", type=int, default=100)
+    ap.add_argument("--max-trades-k", type=float, default=0.1)
+    ap.add_argument("--pf-floor", type=float, default=1.0)
+    ap.add_argument("--pf-floor-k", type=float, default=5.0)
 
     # Scoring knobs
     ap.add_argument("--commission_rate_per_side", type=float, default=0.0006)
@@ -703,34 +683,46 @@ def main():
     avg_pf_eff = safe_mean(per_df["profit_factor_eff"])
 
     # ======================
-    # OUTPUT FILES
+    # OUTPUT FILES with prefix - ASCII safe
     # ======================
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
-    run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    per_csv = out_dir / f"per_ticker_{run_ts}.csv"
+    per_csv = out_dir / f"{MODULE_PREFIX}per_ticker_{run_ts}.csv"
     per_df.to_csv(per_csv, index=False)
 
-    txt = []
-    txt.append("=== OBJECTIVE DEGENERACY DIAGNOSTICS ===")
-    txt.append(f"penalty_mult: {pen_best['penalty_mult']:.6f}")
-    txt.append(f"zero_loss_mult: {pen_best['zero_loss_mult']:.6f}")
-    txt.append(f"cap_mult: {pen_best['cap_mult']:.6f}")
-    txt.append(f"glpt_mult: {pen_best['glpt_mult']:.6f}")
-    txt.append("")
-    txt.append("=== BEST PARAMS ===")
+    txt_lines = []
+    txt_lines.append("=== OBJECTIVE DEGENERACY DIAGNOSTICS ===")
+    txt_lines.append(f"penalty_mult: {pen_best['penalty_mult']:.6f}")
+    txt_lines.append(f"zero_loss_mult: {pen_best['zero_loss_mult']:.6f}")
+    txt_lines.append(f"cap_mult: {pen_best['cap_mult']:.6f}")
+    txt_lines.append(f"glpt_mult: {pen_best['glpt_mult']:.6f}")
+    txt_lines.append("")
+    txt_lines.append("=== BEST PARAMS ===")
     for k in sorted(study.best_params):
-        txt.append(f"{k}: {study.best_params[k]}")
-    txt.append("")
-    txt.append(f"objective_score: {study.best_value:.6f}")
+        txt_lines.append(f"{k}: {study.best_params[k]}")
+    txt_lines.append("")
+    txt_lines.append(f"objective_score: {study.best_value:.6f}")
 
-    best_txt = out_dir / f"best_params_{run_ts}.txt"
-    best_txt.write_text("\n".join(txt))
+    best_txt = out_dir / f"{MODULE_PREFIX}best_{run_ts}.txt"
+    best_txt.write_text("\n".join(txt_lines), encoding="utf-8")
 
-    print(f"Saved per-ticker CSV: {per_csv}")
-    print(f"Saved best params TXT: {best_txt}")
-    print("\n".join(txt))
+    # ── Clean console summary - ASCII only ───────────────────────────────
+    print("\n" + "="*60)
+    print("          BEST RESULT - Vidya RSI")
+    print("="*60)
+    print(f"objective_score: {study.best_value:.6f}")
+    print("")
+    print("Best parameters:")
+    for k in sorted(study.best_params):
+        print(f"  {k:18} : {study.best_params[k]}")
+    print("")
+    print("Saved:")
+    print(f"  CSV -> {per_csv}")
+    print(f"  TXT -> {best_txt}")
+    print("\n".join(txt_lines))
+
 
 if __name__ == "__main__":
     main()

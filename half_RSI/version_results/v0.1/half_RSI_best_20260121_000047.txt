@@ -1,0 +1,21 @@
+=== BEST RESULT - half_RSI ===
+Run timestamp         : 20260121_000047
+Objective value       : 0.511397
+
+Best parameters:
+  atrPeriod          : 52
+  shift              : 3
+  slMultiplier       : 11.977575852045817
+  slow_window        : 17
+  smooth_len         : 3
+  tpMultiplier       : 8.236172503388145
+
+Performance:
+  Mean ticker score   : 0.523746
+  Avg PF (raw)        : 22.32916917608645
+  Avg trades/ticker   : 6.37
+  Negative returns    : 33/147
+
+  Commission/side     : 0.000600
+  Penalty enabled     : True
+  min_tp2sl_eff       : 1.4200

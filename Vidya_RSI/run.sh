@@ -86,16 +86,16 @@ run_phase() {
         --opt-vidya
         --opt-fastslow
         # Tail / return floor penalty
-        --penalty_ret_center "$ret_floor_center"
-        --penalty_ret_k "$ret_floor_k"
+        --penalty-ret-center "$ret_floor_center"
+        --penalty-ret-k "$ret_floor_k"
         # PF floor penalty
-        --pf_floor_k "$pf_floor_k"
+        --pf-floor-k "$pf_floor_k"
         "${extra_args[@]}"
     )
 
     # Optional flags if supported
-    if "$PYTHON_BIN" Vidya_RSI.py --help 2>/dev/null | grep -q -- "--loss_floor"; then
-        CMD+=( --loss_floor "$base_loss_floor" )
+    if "$PYTHON_BIN" Vidya_RSI.py --help 2>/dev/null | grep -q -- "--loss-floor"; then
+        CMD+=( --loss-floor "$base_loss_floor" )
     fi
     # Optional: soft coverage encouragement (if your script has it)
     if "$PYTHON_BIN" Vidya_RSI.py --help 2>/dev/null | grep -q -- "--coverage-target"; then

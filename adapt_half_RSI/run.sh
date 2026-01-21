@@ -73,7 +73,7 @@ CMD="python Bayes_opt_adapt_half_RSI.py \
   --weight-pf $weight_pf \
   --score-power $score_power \
   --commission_rate_per_side $commission_per_side \
-  --loss_floor $loss_floor \
+  --loss-floor $loss_floor \
   --fill $fillOpt \
   --cooldown $cooldown \
   --time-stop $time_stop \

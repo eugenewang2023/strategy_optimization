@@ -1,0 +1,15 @@
+=== OBJECTIVE DEGENERACY DIAGNOSTICS ===
+penalty_mult: 1.000000
+zero_loss_mult: 1.000000
+cap_mult: 1.000000
+glpt_mult: 1.000000
+
+=== BEST PARAMS ===
+fp: 6
+reg_ratio: 2.441422151002332
+sp: 21
+ts: 7
+vl: 5
+vs: 11
+
+objective_score: 0.504445
