@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Vidya_RSI.py - High Density Aggression Edition (PF-Unified Reporting)
+Vidya_RSI.py - High Density Aggression Edition (PF-Unified Reporting, Stability & Penalties)
 
-Unified Engine: Kaufman VIDYA + ZLEMA + Regime Slope.
-Unified Reporting: PF_raw vs PF_eff (loss_floor) vs PF_diag_cap (cap on PF_eff),
-plus overall metrics, penalty diagnostics, and sorted ticker tables.
-
-With consistent output prefix: vidya_RSI_...
-ASCII-safe console output for Windows compatibility.
+Improvements:
+1) Stronger regime filter (slope + persistence).
+2) Refined exit logic (time-stop, adverse-exit, regime-exit).
+3) PF_unification with PF_diag as the scoring PF.
+4) objective_penalty_multiplier extended with return floor, PF floor, max-trades.
+5) Backtest loop lightly optimized (fewer pandas calls in-loop).
+6) Wider Optuna search space for VIDYA / ZLEMA / time-stop / regime.
+7) Asymmetric coverage penalty (only penalize below target).
+8) CSV output extended with diagnostics & stability score.
+9) Shell integration via CLI flags (min_glpt, penalties, coverage, etc.).
+10) Added “stability score” (dispersion-aware robustness metric).
 """
 
 import math
@@ -152,7 +157,7 @@ class TradeStats:
     zero_loss: int = 0
     pf_capped: int = 0
 
-    # NEW: requested
+    # GL per trade (loss per trade)
     gl_per_trade: float = 0.0
 
     # optional vol proxy
@@ -160,7 +165,10 @@ class TradeStats:
 
 
 def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
-    o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
+    o = df["open"].to_numpy(dtype=float)
+    h = df["high"].to_numpy(dtype=float)
+    l = df["low"].to_numpy(dtype=float)
+    c = df["close"].to_numpy(dtype=float)
     n = len(c)
 
     reg_len = int(p["slowPeriod"] * p.get("regime_ratio", 3.0))
@@ -187,6 +195,8 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
 
     # Regime EMA on close
     regime_ema = pd.Series(c).ewm(span=reg_len, adjust=False).mean().to_numpy()
+    regime_slope = regime_ema - np.roll(regime_ema, 5)
+    regime_slope[0:5] = 0.0
 
     # Hot (normalized spread) smoothed
     hot = (fast - slow) / (atr + 1e-12)
@@ -194,8 +204,13 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
 
     # Backtest state
     equity = 1.0
-    gp, gl, trades = 0.0, 0.0, 0
-    in_pos, entry, bars_in_trade, cooldown_left = False, 0.0, 0, 0
+    gp = 0.0
+    gl = 0.0
+    trades = 0
+    in_pos = False
+    entry = 0.0
+    bars_in_trade = 0
+    cooldown_left = 0
     equity_curve = [1.0]
     num_neg_trades = 0
 
@@ -206,18 +221,24 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
     threshold = float(p.get("threshold", 0.04))
     use_regime = bool(p.get("use_regime", False))
 
+    # Stronger regime filter: slope + persistence
+    regime_slope_min = float(p.get("regime_slope_min", 0.0))
+    regime_persist = int(p.get("regime_persist", 3))
+
     for i in range(reg_len + 10, n - 2):
         if cooldown_left > 0:
             cooldown_left -= 1
             continue
 
-        # Need finite hot_sm values for cross logic
         if not (np.isfinite(hot_sm[i]) and np.isfinite(hot_sm[i - 1]) and np.isfinite(atr[i])):
             continue
 
-        # Optional regime filter (guard i-5)
         if use_regime and i - 5 >= 0:
             regime_ok = (c[i] > regime_ema[i]) and (regime_ema[i] > regime_ema[i - 5])
+            if regime_slope_min > 0.0 and regime_persist > 0:
+                j0 = max(0, i - regime_persist + 1)
+                if np.any(regime_slope[j0:i + 1] < regime_slope_min):
+                    regime_ok = False
         else:
             regime_ok = True
 
@@ -233,17 +254,26 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
             bars_in_trade += 1
 
             stop = entry - atr[i] * 3.0
-            tgt  = entry + atr[i] * 3.6
+            tgt = entry + atr[i] * 3.6
 
             exit_p = None
+
+            # 1) Hard stop
             if np.isfinite(stop) and l[i] <= stop:
                 exit_p = float(stop)
+            # 2) Target
             elif np.isfinite(tgt) and h[i] >= tgt:
                 exit_p = float(tgt)
+            # 3) Time-stop if not working and price not clearly above entry
             elif time_stop_bars > 0 and bars_in_trade >= time_stop_bars and c[i] <= entry:
                 exit_p = float(o[i + 1] if i + 1 < n else c[i])
+            # 4) Regime flip exit (stronger)
+            elif use_regime and regime_ema[i] < regime_ema[i - 3]:
+                exit_p = float(o[i + 1] if i + 1 < n else c[i])
+            # 5) Hot crosses below -threshold
             elif np.isfinite(hot_sm[i]) and hot_sm[i] < -threshold:
                 exit_p = float(o[i + 1] if i + 1 < n else c[i])
+            # 6) Final bar
             elif i == n - 3:
                 exit_p = float(c[i])
 
@@ -276,10 +306,7 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
         pf_diag_cap=float(p.get("pf_cap_score_only", 5.0)),
     )
 
-    # For CSV only (never for scoring)
     pf_raw_csv = safe_pf_raw_for_csv(pfm["profit_factor_raw"], inf_placeholder=1e9)
-
-    # GL per trade (return units)
     gl_per_trade = float(gl / max(trades, 1))
 
     return TradeStats(
@@ -288,16 +315,12 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
         trades=int(trades),
         tot_ret=float(equity - 1.0),
         maxdd=float(maxdd),
-
         num_neg_trades=int(num_neg_trades),
-
         profit_factor_raw=float(pf_raw_csv),
         profit_factor_eff=float(pfm["profit_factor_eff"]),
         profit_factor_diag=float(pfm["profit_factor_diag"]),
-
         zero_loss=int(pfm["zero_loss"]),
         pf_capped=int(pfm["pf_capped"]),
-
         gl_per_trade=float(gl_per_trade),
         atr_pct_med=float(atr_pct_med),
     )
@@ -318,10 +341,6 @@ def score_trial(st: TradeStats, args) -> float:
     tr_w = 1.0 / (1.0 + math.exp(-args.trades_k * (st.trades - args.trades_baseline)))
     return float((args.weight_pf * pf_w + (1.0 - args.weight_pf) * tr_w) ** args.score_power)
 
-
-# =================================================================================
-# Robust reporting helpers
-# =================================================================================
 
 def safe_series(x: pd.Series) -> pd.Series:
     return pd.to_numeric(x, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
@@ -383,6 +402,21 @@ def robust_objective_aggregate(stats, args, objective_mode: str) -> float:
     return med_score
 
 
+def stability_score(stats, args) -> float:
+    eligible = [st for st in stats if st.trades >= args.min_trades]
+    if not eligible:
+        return 0.0
+    scores = np.asarray([score_trial(st, args) for st in eligible], dtype=float)
+    scores = scores[np.isfinite(scores)]
+    if scores.size == 0:
+        return 0.0
+    med = float(np.median(scores))
+    mad = float(np.median(np.abs(scores - med)))
+    if mad <= 0:
+        return 1.0
+    return float(1.0 / (1.0 + mad))
+
+
 def objective_penalty_multiplier(stats, args) -> dict:
     """
     Returns a dict with:
@@ -391,6 +425,9 @@ def objective_penalty_multiplier(stats, args) -> dict:
       zero_loss_mult, cap_mult,
       glpt_med, glpt_target, glpt_mult,
       vol_med,
+      ret_med, ret_floor, ret_mult,
+      pf_med, pf_floor, pf_floor_mult,
+      trades_med, max_trades, trades_mult,
       eligible_count, total_count
     """
     eligible = [st for st in stats if getattr(st, "trades", 0) >= getattr(args, "min_trades", 0)]
@@ -407,6 +444,15 @@ def objective_penalty_multiplier(stats, args) -> dict:
             "glpt_target": float(getattr(args, "min_glpt", 0.0)),
             "glpt_mult": 0.0,
             "vol_med": 0.0,
+            "ret_med": 0.0,
+            "ret_floor": float(getattr(args, "ret_floor", -0.15)),
+            "ret_mult": 0.0,
+            "pf_med": 0.0,
+            "pf_floor": float(getattr(args, "pf_floor", 1.0)),
+            "pf_floor_mult": 0.0,
+            "trades_med": 0.0,
+            "max_trades": float(getattr(args, "max_trades", 100)),
+            "trades_mult": 0.0,
             "eligible_count": 0,
             "total_count": int(total_count),
         }
@@ -477,6 +523,51 @@ def objective_penalty_multiplier(stats, args) -> dict:
     else:
         cap_mult = 1.0
 
+    # Return floor penalty (median total return)
+    ret_floor = float(getattr(args, "ret_floor", -0.15))
+    ret_floor_k = float(getattr(args, "ret_floor_k", 2.0))
+    rets = np.asarray([float(getattr(st, "tot_ret", 0.0)) for st in eligible], dtype=float)
+    rets = rets[np.isfinite(rets)]
+    ret_med = float(np.median(rets)) if rets.size else 0.0
+    if ret_floor_k > 0.0:
+        if ret_med >= ret_floor:
+            ret_mult = 1.0
+        else:
+            xr = ret_floor_k * (ret_med - ret_floor)
+            ret_mult = sigmoid(float(xr))
+    else:
+        ret_mult = 1.0
+
+    # PF floor penalty (median PF_diag)
+    pf_floor = float(getattr(args, "pf_floor", 1.0))
+    pf_floor_k = float(getattr(args, "pf_floor_k", 5.0))
+    pf_vals = np.asarray([float(getattr(st, "profit_factor_diag", 0.0)) for st in eligible], dtype=float)
+    pf_vals = pf_vals[np.isfinite(pf_vals)]
+    pf_med = float(np.median(pf_vals)) if pf_vals.size else 0.0
+    if pf_floor_k > 0.0:
+        if pf_med >= pf_floor:
+            pf_floor_mult = 1.0
+        else:
+            xp = pf_floor_k * (pf_med - pf_floor)
+            pf_floor_mult = sigmoid(float(xp))
+    else:
+        pf_floor_mult = 1.0
+
+    # Max-trades penalty (median trades)
+    max_trades = float(getattr(args, "max_trades", 100))
+    max_trades_k = float(getattr(args, "max_trades_k", 0.1))
+    trades_arr = np.asarray([float(getattr(st, "trades", 0.0)) for st in eligible], dtype=float)
+    trades_arr = trades_arr[np.isfinite(trades_arr)]
+    trades_med = float(np.median(trades_arr)) if trades_arr.size else 0.0
+    if max_trades_k > 0.0:
+        if trades_med <= max_trades:
+            trades_mult = 1.0
+        else:
+            xt = max_trades_k * (max_trades - trades_med)
+            trades_mult = sigmoid(float(xt))
+    else:
+        trades_mult = 1.0
+
     # Combine penalties
     mode = str(getattr(args, "obj_penalty_mode", "both")).lower()
     if mode == "none":
@@ -491,6 +582,8 @@ def objective_penalty_multiplier(stats, args) -> dict:
     if glpt_target > 0.0 and min_glpt_k > 0.0:
         penalty_mult *= float(glpt_mult)
 
+    penalty_mult *= float(ret_mult * pf_floor_mult * trades_mult)
+
     return {
         "penalty_mult": float(penalty_mult),
         "zero_loss_pct": float(zero_loss_pct),
@@ -501,6 +594,15 @@ def objective_penalty_multiplier(stats, args) -> dict:
         "glpt_target": float(glpt_target),
         "glpt_mult": float(glpt_mult),
         "vol_med": float(vol_med),
+        "ret_med": float(ret_med),
+        "ret_floor": float(ret_floor),
+        "ret_mult": float(ret_mult),
+        "pf_med": float(pf_med),
+        "pf_floor": float(pf_floor),
+        "pf_floor_mult": float(pf_floor_mult),
+        "trades_med": float(trades_med),
+        "max_trades": float(max_trades),
+        "trades_mult": float(trades_mult),
         "eligible_count": int(len(eligible)),
         "total_count": int(total_count),
     }
@@ -542,8 +644,8 @@ def main():
 
     # Penalty knobs
     ap.add_argument("--penalty", type=str, default="enabled")
-    ap.add_argument("--penalty-ret-center", type=float, default=0.01)
-    ap.add_argument("--penalty-ret-k", type=float, default=10.0)
+    ap.add_argument("--penalty-ret-center", type=float, default=0.01)  # kept for compatibility
+    ap.add_argument("--penalty-ret-k", type=float, default=10.0)       # kept for compatibility
     ap.add_argument("--ret-floor", type=float, default=-0.15)
     ap.add_argument("--ret-floor-k", type=float, default=2.0)
     ap.add_argument("--max-trades", type=int, default=100)
@@ -570,9 +672,13 @@ def main():
     ap.add_argument("--coverage-target", type=float, default=0.85)
     ap.add_argument("--coverage-k", type=float, default=8.0)
     ap.add_argument("--opt-time-stop", action="store_true")
-    ap.add_argument("--min-tp2sl", type=float, default=0.8)
+    ap.add_argument("--min-tp2sl", type=float, default=0.8)  # kept for compatibility
     ap.add_argument("--opt-vidya", action="store_true")
     ap.add_argument("--opt-fastslow", action="store_true")
+
+    # Regime filter tuning
+    ap.add_argument("--regime-slope-min", type=float, default=0.0)
+    ap.add_argument("--regime-persist", type=int, default=3)
 
     args = ap.parse_args()
 
@@ -591,34 +697,47 @@ def main():
     # ======================
     def objective(trial):
         p = {
-            "vidya_len": trial.suggest_int("vl", 5, 25) if args.opt_vidya else 14,
-            "vidya_smooth": trial.suggest_int("vs", 5, 40) if args.opt_vidya else 14,
-            "fastPeriod": trial.suggest_int("fp", 5, 20) if args.opt_fastslow else 10,
-            "slowPeriod": trial.suggest_int("sp", 21, 60) if args.opt_fastslow else 40,
-            "time_stop_bars": trial.suggest_int("ts", 5, 40) if args.opt_time_stop else 15,
+            "vidya_len": trial.suggest_int("vl", 4, 40) if args.opt_vidya else 14,
+            "vidya_smooth": trial.suggest_int("vs", 3, 60) if args.opt_vidya else 14,
+            "fastPeriod": trial.suggest_int("fp", 3, 30) if args.opt_fastslow else 10,
+            "slowPeriod": trial.suggest_int("sp", 15, 90) if args.opt_fastslow else 40,
+            "time_stop_bars": trial.suggest_int("ts", 5, 60) if args.opt_time_stop else 15,
             "regime_ratio": trial.suggest_float("reg_ratio", 2.0, 5.0),
             "threshold": args.threshold_fixed,
             "vol_floor_mult": args.vol_floor_mult_fixed,
-            "commission": args.commission_rate_per_side,
+            "commission": args. commission_rate_per_side,
             "fill_mode": args.fill,
             "use_regime": args.use_regime,
             "loss_floor": args.loss_floor,
             "pf_cap_score_only": args.pf_cap,
             "cooldown_bars": 1,
+            "regime_slope_min": args.regime_slope_min,
+            "regime_persist": args.regime_persist,
         }
 
         stats = [backtest_vidya_engine(df, **p) for _, df in data_list]
         eligible = sum(st.trades >= args.min_trades for st in stats)
         cov = eligible / len(stats)
-        cov_mult = sigmoid(args.coverage_k * (cov - args.coverage_target))
+
+        # Asymmetric coverage penalty: only penalize below target
+        if cov >= args.coverage_target:
+            cov_mult = 1.0
+        else:
+            cov_mult = sigmoid(args.coverage_k * (cov - args.coverage_target))
 
         agg = robust_objective_aggregate(stats, args, args.objective_mode)
         pen = objective_penalty_multiplier(stats, args)
+        stab = stability_score(stats, args)
 
-        return float(agg * cov_mult * pen["penalty_mult"])
+        return float(agg * cov_mult * pen["penalty_mult"] * stab)
 
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=args.trials)
+    study_kwargs = {"direction": "maximize"}
+    if TQDMProgressBarCallback is not None:
+        study = optuna.create_study(**study_kwargs)
+        study.optimize(objective, n_trials=args.trials, callbacks=[TQDMProgressBarCallback()])
+    else:
+        study = optuna.create_study(**study_kwargs)
+        study.optimize(objective, n_trials=args.trials)
 
     best = dict(study.best_params)
     best_p = {
@@ -636,14 +755,18 @@ def main():
         "vidya_len": best.get("vl", 14),
         "vidya_smooth": best.get("vs", 14),
         "regime_ratio": best.get("reg_ratio", 3.0),
+        "regime_slope_min": args.regime_slope_min,
+        "regime_persist": args.regime_persist,
     }
 
     # ======================
     # PER-TICKER REPORT
     # ======================
     rows = []
+    best_stats = []
     for name, df in data_list:
         st = backtest_vidya_engine(df, **best_p)
+        best_stats.append(st)
         rows.append({
             "ticker": name,
             "profit_factor_raw": st.profit_factor_raw,
@@ -669,8 +792,8 @@ def main():
     # ======================
     # DIAGNOSTICS
     # ======================
-    best_stats = [backtest_vidya_engine(df, **best_p) for _, df in data_list]
     pen_best = objective_penalty_multiplier(best_stats, args)
+    stab_best = stability_score(best_stats, args)
 
     eligible_count = int(per_df["eligible"].sum())
     coverage = eligible_count / len(per_df)
@@ -682,12 +805,23 @@ def main():
     med_pf_eff = safe_median(per_df["profit_factor_eff"])
     avg_pf_eff = safe_mean(per_df["profit_factor_eff"])
 
+    med_trades = safe_median(per_df["num_trades"])
+    med_tot_ret = safe_median(per_df["total_return"])
+
     # ======================
     # OUTPUT FILES with prefix - ASCII safe
     # ======================
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
     run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Add run-level diagnostics to CSV as constant columns
+    per_df["run_coverage"] = coverage
+    per_df["run_zero_loss_pct"] = pen_best["zero_loss_pct"]
+    per_df["run_cap_pct"] = pen_best["cap_pct"]
+    per_df["run_glpt_med"] = pen_best["glpt_med"]
+    per_df["run_vol_med"] = pen_best["vol_med"]
+    per_df["run_stability_score"] = stab_best
 
     per_csv = out_dir / f"{MODULE_PREFIX}per_ticker_{run_ts}.csv"
     per_df.to_csv(per_csv, index=False)
@@ -698,6 +832,21 @@ def main():
     txt_lines.append(f"zero_loss_mult: {pen_best['zero_loss_mult']:.6f}")
     txt_lines.append(f"cap_mult: {pen_best['cap_mult']:.6f}")
     txt_lines.append(f"glpt_mult: {pen_best['glpt_mult']:.6f}")
+    txt_lines.append(f"ret_mult: {pen_best['ret_mult']:.6f}")
+    txt_lines.append(f"pf_floor_mult: {pen_best['pf_floor_mult']:.6f}")
+    txt_lines.append(f"trades_mult: {pen_best['trades_mult']:.6f}")
+    txt_lines.append("")
+    txt_lines.append("=== COVERAGE & STABILITY ===")
+    txt_lines.append(f"coverage: {coverage:.4f}  (eligible {eligible_count} / {len(per_df)})")
+    txt_lines.append(f"zero_loss_pct: {pen_best['zero_loss_pct']:.4f}  (count {zero_loss_count})")
+    txt_lines.append(f"cap_pct: {pen_best['cap_pct']:.4f}  (count {capped_count})")
+    txt_lines.append(f"stability_score: {stab_best:.6f}")
+    txt_lines.append("")
+    txt_lines.append("=== PF & RETURNS SUMMARY ===")
+    txt_lines.append(f"median_pf_diag: {med_pf_diag:.4f}   avg_pf_diag: {avg_pf_diag:.4f}")
+    txt_lines.append(f"median_pf_eff:  {med_pf_eff:.4f}   avg_pf_eff:  {avg_pf_eff:.4f}")
+    txt_lines.append(f"median_trades:  {med_trades:.2f}")
+    txt_lines.append(f"median_total_return: {med_tot_ret:.4f}")
     txt_lines.append("")
     txt_lines.append("=== BEST PARAMS ===")
     for k in sorted(study.best_params):
@@ -709,18 +858,23 @@ def main():
     best_txt.write_text("\n".join(txt_lines), encoding="utf-8")
 
     # ── Clean console summary - ASCII only ───────────────────────────────
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("          BEST RESULT - Vidya RSI")
-    print("="*60)
+    print("=" * 60)
     print(f"objective_score: {study.best_value:.6f}")
     print("")
     print("Best parameters:")
     for k in sorted(study.best_params):
         print(f"  {k:18} : {study.best_params[k]}")
     print("")
+    print("Coverage / Stability:")
+    print(f"  coverage         : {coverage:.4f}")
+    print(f"  stability_score  : {stab_best:.6f}")
+    print("")
     print("Saved:")
     print(f"  CSV -> {per_csv}")
     print(f"  TXT -> {best_txt}")
+    print("")
     print("\n".join(txt_lines))
 
 
