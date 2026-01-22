@@ -1,0 +1,30 @@
+=== OBJECTIVE DEGENERACY DIAGNOSTICS ===
+penalty_mult: 1.000000
+zero_loss_mult: 1.000000
+cap_mult: 1.000000
+glpt_mult: 1.000000
+ret_mult: 1.000000
+pf_floor_mult: 1.000000
+trades_mult: 1.000000
+
+=== COVERAGE & STABILITY ===
+coverage: 1.0000  (eligible 147 / 147)
+zero_loss_pct: 0.0000
+cap_pct: 0.2857
+stability_score: 0.956053
+
+=== PF & RETURNS SUMMARY ===
+median_pf_diag: 2.6343   avg_pf_diag: 2.4654
+median_pf_eff:  2.6343   avg_pf_eff:  8.8893
+median_trades:  7.00
+median_total_return: 0.1050
+
+=== BEST PARAMS ===
+fp: 3
+reg_ratio: 2.3307770653780633
+sp: 19
+ts: 27
+vl: 6
+vs: 24
+
+objective_score: 0.888208

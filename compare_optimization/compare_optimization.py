@@ -22,11 +22,14 @@ def load_runs_from_dir(input_dir: Path):
     for f in files:
         df = pd.read_csv(f)
 
-        # Extract run_id from filename
         stem = f.stem
+
+        # Robust run_id extraction:
+        # Take everything AFTER the last "per_ticker"
         if "per_ticker" in stem:
-            # Remove everything up to "per_ticker"
-            run_id = stem.split("per_ticker", 1)[1].lstrip("_-")
+            parts = stem.split("per_ticker")
+            tail = parts[-1].lstrip("_-")
+            run_id = tail if tail else stem
         else:
             run_id = stem  # fallback
 
