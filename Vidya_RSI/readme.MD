@@ -4,6 +4,19 @@ fp – Fast ZLEMA period applied to VIDYA
 sp – Slow ZLEMA period applied to VIDYA
 ts – Time-stop in bars (max hold if trade does not move favorably)
 
+1/21/2026
+Vidya_RSI_v0.2 with many improvements suggested by CoPilot
+1. Your VIDYA/ZLEMA pipeline is good — but the regime filter is too weak
+2. Your exit logic is the biggest bottleneck
+3. Your PF_unification is excellent — but you’re not using PF_diag in scoring
+4. Your objective_penalty_multiplier is powerful — but missing a key penalty
+5. Your backtest loop is Python‑slow
+6. Your Optuna search space is too narrow
+7. Coverage penalty is good — but should be asymmetric
+8. Your CSV output is excellent — but missing key diagnostics
+9. Shell script + Python script integration
+10. Add a “stability score”
+
 1/19/2026
 Vidya_RSI_v0.2
 Using GMM low-vol data:
