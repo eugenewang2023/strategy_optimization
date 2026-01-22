@@ -368,6 +368,64 @@ def sigmoid(x: float) -> float:
 # CHUNK 4 / 6 — Adaptive Backtest Engine + TradeStats
 # ============================================================
 
+def rsi_tv(price: np.ndarray, length: int) -> np.ndarray:
+    """
+    TradingView-style RSI using RMA (Wilder's smoothing).
+    Fully NaN-safe and identical to half_RSI implementation.
+    """
+    n = len(price)
+    out = np.full(n, np.nan, dtype=float)
+    if length <= 0 or n < 2:
+        return out
+
+    # Price change
+    ch = np.diff(price, prepend=np.nan)
+    gain = np.where(ch > 0, ch, 0.0)
+    loss = np.where(ch < 0, -ch, 0.0)
+
+    def rma(x, L):
+        y = np.full(n, np.nan, dtype=float)
+        if n < L:
+            return y
+
+        # Find first non-NaN window
+        if np.isnan(x[:L]).any():
+            start = None
+            for i in range(L - 1, n):
+                w = x[i - L + 1:i + 1]
+                if not np.isnan(w).any():
+                    y[i] = float(np.mean(w))
+                    start = i + 1
+                    break
+            if start is None:
+                return y
+        else:
+            y[L - 1] = float(np.mean(x[:L]))
+            start = L
+
+        alpha = 1.0 / float(L)
+        for i in range(start, n):
+            if np.isnan(x[i]) or np.isnan(y[i - 1]):
+                y[i] = np.nan
+            else:
+                y[i] = y[i - 1] + alpha * (x[i] - y[i - 1])
+        return y
+
+    ag = rma(gain, length)
+    al = rma(loss, length)
+
+    for i in range(n):
+        if np.isnan(ag[i]) or np.isnan(al[i]):
+            out[i] = np.nan
+        else:
+            if al[i] == 0.0:
+                out[i] = 100.0 if ag[i] > 0 else 0.0
+            else:
+                rs = ag[i] / al[i]
+                out[i] = 100.0 - (100.0 / (1.0 + rs))
+
+    return out
+
 @dataclass
 class TradeStats:
     gp: float = 0.0
@@ -433,24 +491,66 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
     finite_atr_pct = atr_pct[np.isfinite(atr_pct)]
     atr_pct_med = float(np.nanmedian(finite_atr_pct)) if finite_atr_pct.size else 0.0
 
-    # --------------------------------------------------------
-    # Indicators: VIDYA + ZLEMA
-    # --------------------------------------------------------
-    v_main = vidya_ema(ha_c, p["vidya_len"], p["vidya_smooth"])
-    fast = zlema(v_main, int(p["fastPeriod"]))
-    slow = zlema(v_main, int(p["slowPeriod"]))
+    # # --------------------------------------------------------
+    # # Indicators: VIDYA + ZLEMA
+    # # --------------------------------------------------------
+    # v_main = vidya_ema(ha_c, p["vidya_len"], p["vidya_smooth"])
+    # fast = zlema(v_main, int(p["fastPeriod"]))
+    # slow = zlema(v_main, int(p["slowPeriod"]))
+
+    # # --------------------------------------------------------
+    # # Regime EMA + slope
+    # # --------------------------------------------------------
+    # reg_ema = regime_ema_series(c, reg_len)
+    # reg_slope = momentum_slope(reg_ema, window=5)
+
+    # # --------------------------------------------------------
+    # # Hot spread (normalized)
+    # # --------------------------------------------------------
+    # hot = (fast - slow) / (atr + 1e-12)
+    # hot_sm = pd.Series(hot).rolling(5).mean().to_numpy()
 
     # --------------------------------------------------------
-    # Regime EMA + slope
+    # Indicators: VIDYA (for regime only) + half_RSI fast/slow
+    # --------------------------------------------------------
+
+    # VIDYA still used for regime classification
+    v_main = vidya_ema(ha_c, p["vidya_len"], p["vidya_smooth"])
+
+    # --- half_RSI-style fast/slow RSI lengths ---
+    slow_len = int(p["slowPeriod"])
+    fast_len = max(1, int(round(slow_len / 2)))
+
+    # --- Compute RSI on Heikin-Ashi close (same as half_RSI) ---
+    fast_rsi_raw = rsi_tv(ha_c, fast_len)
+    slow_rsi_raw = rsi_tv(ha_c, slow_len)
+
+    # --- Apply shift if provided ---
+    shift = int(p.get("shift", 0))
+    if shift > 0:
+        fast_rsi = np.roll(fast_rsi_raw, shift)
+        slow_rsi = np.roll(slow_rsi_raw, shift)
+        fast_rsi[:shift] = np.nan
+        slow_rsi[:shift] = np.nan
+    else:
+        fast_rsi = fast_rsi_raw
+        slow_rsi = slow_rsi_raw
+
+    # --- Invert slow RSI (half_RSI logic) ---
+    slow_rsi_inv = 100.0 - slow_rsi
+
+    # --- Hot spread identical to half_RSI ---
+    hot = fast_rsi - slow_rsi_inv
+
+    # --- Smooth hot spread (half_RSI SMA smoothing) ---
+    smooth_len = int(p.get("smooth_len", 5))
+    hot_sm = pd.Series(hot).rolling(smooth_len).mean().to_numpy()
+
+    # --------------------------------------------------------
+    # Regime EMA + slope (must come BEFORE regime classification)
     # --------------------------------------------------------
     reg_ema = regime_ema_series(c, reg_len)
     reg_slope = momentum_slope(reg_ema, window=5)
-
-    # --------------------------------------------------------
-    # Hot spread (normalized)
-    # --------------------------------------------------------
-    hot = (fast - slow) / (atr + 1e-12)
-    hot_sm = pd.Series(hot).rolling(5).mean().to_numpy()
 
     # --------------------------------------------------------
     # Adaptive regime classification
@@ -1000,7 +1100,15 @@ def main():
     ap.add_argument("--regime-slope-min", type=float, default=0.0)
     ap.add_argument("--regime-persist", type=int, default=3)
 
+    ap.add_argument("--output_dir", type=str, default="output",
+                    help="Directory to save per-ticker CSV and summary TXT")
+    ap.add_argument("--report-both-fills", action="store_true",
+                    help="Run evaluation for both fill modes: same_close and next_open")
+
     args = ap.parse_args()
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # --------------------------------------------------------
     # Load data
