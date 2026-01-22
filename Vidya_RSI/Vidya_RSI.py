@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Vidya_RSI.py - High Density Aggression Edition (PF-Unified Reporting, Stability & Penalties)
+Vidya_RSI.py — Hybrid Adaptive Edition
+(Chunk 1 / 6 — Imports, Constants, Adaptive Helpers)
 
-Improvements:
-1) Stronger regime filter (slope + persistence).
-2) Refined exit logic (time-stop, adverse-exit, regime-exit).
-3) PF_unification with PF_diag as the scoring PF.
-4) objective_penalty_multiplier extended with return floor, PF floor, max-trades.
-5) Backtest loop lightly optimized (fewer pandas calls in-loop).
-6) Wider Optuna search space for VIDYA / ZLEMA / time-stop / regime.
-7) Asymmetric coverage penalty (only penalize below target).
-8) CSV output extended with diagnostics & stability score.
-9) Shell integration via CLI flags (min_glpt, penalties, coverage, etc.).
-10) Added “stability score” (dispersion-aware robustness metric).
+This file has been reorganized for clarity and extended with:
+- Hybrid adaptive thresholding
+- Adaptive ATR multipliers
+- Volatility regime classification
+- Trend regime classification
+- Clean modular structure
+- Full compatibility with your shell script + comparison tools
 """
+
+# ============================================================
+# Imports
+# ============================================================
 
 import math
 import random
@@ -32,59 +33,237 @@ except Exception:
     TQDMProgressBarCallback = None
 
 
-# =============================
-# Module-specific prefix for output files
-# =============================
+# ============================================================
+# Module prefix for output files
+# ============================================================
+
 MODULE_PREFIX = "vidya_RSI_"
 
 
-# =================================================================================
-# INDICATORS & ENGINE
-# =================================================================================
+# ============================================================
+# Adaptive Helper Functions
+# ============================================================
+
+def rolling_slope(series: np.ndarray, window: int = 5) -> np.ndarray:
+    """
+    Computes a simple rolling slope using linear regression over a window.
+    Used for trend persistence and momentum fade detection.
+    """
+    n = len(series)
+    out = np.full(n, np.nan)
+    if window < 2:
+        return out
+
+    x = np.arange(window)
+    denom = float(np.sum((x - x.mean()) ** 2))
+
+    for i in range(window, n):
+        y = series[i - window:i]
+        if np.any(~np.isfinite(y)):
+            continue
+        num = np.sum((x - x.mean()) * (y - y.mean()))
+        out[i] = num / denom
+
+    return out
+
+
+def classify_volatility_regime(atr_pct: np.ndarray) -> float:
+    """
+    Returns a volatility regime score in [0, 1].
+    0 = low volatility
+    1 = high volatility
+    """
+    finite_vals = atr_pct[np.isfinite(atr_pct)]
+    if finite_vals.size == 0:
+        return 0.5
+
+    med = np.median(finite_vals)
+    # Normalize using a soft logistic transform
+    return float(1.0 / (1.0 + math.exp(-20 * (med - 0.02))))
+
+
+def classify_trend_regime(regime_ema: np.ndarray, slope_window: int = 5) -> float:
+    """
+    Computes a trend regime score in [0, 1].
+    0 = no trend / chop
+    1 = strong trend
+    """
+    slope = rolling_slope(regime_ema, slope_window)
+    finite_slopes = slope[np.isfinite(slope)]
+    if finite_slopes.size == 0:
+        return 0.5
+
+    med_slope = np.median(finite_slopes)
+    # Normalize slope into [0,1]
+    return float(1.0 / (1.0 + math.exp(-50 * med_slope)))
+
+
+def adaptive_threshold(base_threshold: float,
+                       vol_regime: float,
+                       trend_regime: float) -> float:
+    """
+    Computes an adaptive entry threshold.
+
+    - In high volatility: threshold increases (avoid noise)
+    - In strong trends: threshold decreases (enter earlier)
+    - In mixed regimes: threshold stays near base
+    """
+    # Volatility pushes threshold UP
+    vol_adj = 1.0 + 0.8 * vol_regime
+
+    # Trend pushes threshold DOWN
+    trend_adj = 1.0 - 0.6 * trend_regime
+
+    # Combine multiplicatively
+    thr = base_threshold * vol_adj * trend_adj
+
+    # Clamp to reasonable bounds
+    return float(max(0.001, min(thr, 0.20)))
+
+
+def adaptive_atr_multipliers(vol_regime: float,
+                             trend_regime: float,
+                             base_stop_mult: float = 3.0,
+                             base_tgt_mult: float = 3.6):
+    """
+    Computes adaptive ATR multipliers for stop and target.
+
+    - In high volatility: widen stops/targets
+    - In strong trends: widen targets, tighten stops slightly
+    - In chop: tighten both
+    """
+    # Volatility widens both
+    vol_factor = 1.0 + 0.5 * vol_regime
+
+    # Trend widens target but tightens stop
+    stop_factor = 1.0 - 0.3 * trend_regime
+    tgt_factor = 1.0 + 0.6 * trend_regime
+
+    stop_mult = base_stop_mult * vol_factor * stop_factor
+    tgt_mult = base_tgt_mult * vol_factor * tgt_factor
+
+    # Clamp to avoid extreme values
+    stop_mult = float(max(1.0, min(stop_mult, 8.0)))
+    tgt_mult = float(max(1.0, min(tgt_mult, 12.0)))
+
+    return stop_mult, tgt_mult
+
+# ============================================================
+# CHUNK 2 / 6 — Indicators (VIDYA, ZLEMA, Regime EMA, Momentum Slope)
+# ============================================================
 
 def ensure_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures the DataFrame has open/high/low/close columns
+    in lowercase and in the correct order.
+    """
     cols = {c.lower(): c for c in df.columns}
     out = df[[cols["open"], cols["high"], cols["low"], cols["close"]]].copy()
     out.columns = ["open", "high", "low", "close"]
     return out
 
 
+# ------------------------------------------------------------
+# VIDYA (Variable Index Dynamic Average)
+# ------------------------------------------------------------
+
 def vidya_ema(price: np.ndarray, length: int, smoothing: int) -> np.ndarray:
+    """
+    Kaufman-style VIDYA with adaptive smoothing.
+    Uses volatility ratio (signal/noise) to modulate alpha.
+    """
     n = len(price)
-    vidya = np.full(n, np.nan)
-    L, S = max(2, int(length)), max(1, int(smoothing))
+    vid = np.full(n, np.nan)
+
+    L = max(2, int(length))
+    S = max(1, int(smoothing))
+
     if n < L:
-        return vidya
+        return vid
+
     alpha_base = 2.0 / (S + 1.0)
+
+    # Signal = |price - price[L bars ago]|
     signal = np.abs(pd.Series(price).diff(L).to_numpy())
+
+    # Noise = rolling sum of absolute differences
     noise = pd.Series(np.abs(np.diff(price, prepend=price[0]))).rolling(L).sum().to_numpy()
+
     vi = signal / (noise + 1e-12)
-    vidya[L - 1] = price[L - 1]
+
+    # Initialize
+    vid[L - 1] = price[L - 1]
+
     for i in range(L, n):
         k = alpha_base * vi[i]
-        prev = vidya[i - 1] if np.isfinite(vidya[i - 1]) else price[i - 1]
-        vidya[i] = price[i] * k + prev * (1.0 - k)
-    return vidya
+        prev = vid[i - 1] if np.isfinite(vid[i - 1]) else price[i - 1]
+        vid[i] = price[i] * k + prev * (1.0 - k)
 
+    return vid
+
+
+# ------------------------------------------------------------
+# ZLEMA (Zero-Lag Exponential Moving Average)
+# ------------------------------------------------------------
 
 def zlema(series: np.ndarray, period: int) -> np.ndarray:
+    """
+    Zero-lag EMA using de-lagged price series.
+    """
     pd_s = pd.Series(series)
     lag = (period - 1) // 2
     de_lagged = pd_s + (pd_s - pd_s.shift(lag))
     return de_lagged.ewm(span=period, adjust=False).mean().to_numpy()
 
 
-# =================================================================================
-# PF UNIFICATION (single source of truth)
-# =================================================================================
+# ------------------------------------------------------------
+# Regime EMA (long-term trend filter)
+# ------------------------------------------------------------
 
-def compute_pf_metrics(gp: float, gl: float, loss_floor: float, pf_diag_cap: float):
+def regime_ema_series(close: np.ndarray, span: int) -> np.ndarray:
+    """
+    Computes a long-term EMA used for trend regime classification.
+    """
+    return pd.Series(close).ewm(span=span, adjust=False).mean().to_numpy()
+
+
+# ------------------------------------------------------------
+# Momentum Slope (for fade exits and trend persistence)
+# ------------------------------------------------------------
+
+def momentum_slope(series: np.ndarray, window: int = 5) -> np.ndarray:
+    """
+    Computes a rolling slope of a series to detect momentum fade.
+    """
+    return rolling_slope(series, window)
+
+# ============================================================
+# CHUNK 3 / 6 — PF Unification + Utility Functions
+# ============================================================
+
+# ------------------------------------------------------------
+# Profit Factor Unification (single source of truth)
+# ------------------------------------------------------------
+
+def compute_pf_metrics(gp: float,
+                       gl: float,
+                       loss_floor: float,
+                       pf_diag_cap: float):
     """
     Canonical PF pipeline.
 
-    PF_raw: gp/gl (inf if gl==0,gp>0) [debug only]
-    PF_eff: gp / max(gl, loss_floor*gp)
-    PF_diag: min(PF_eff, pf_diag_cap) [headline + scoring]
+    PF_raw:
+        - gp / gl  (if gl > 0)
+        - +inf     (if gl == 0 and gp > 0)
+        - 1.0      (if gp <= 0 and gl <= 0)
+
+    PF_eff:
+        - gp / max(gl, loss_floor * gp)
+        - 0 if gp <= 0
+
+    PF_diag:
+        - min(PF_eff, pf_diag_cap)
+        - used for scoring and reporting
     """
     gp = float(gp)
     gl = float(gl)
@@ -92,11 +271,11 @@ def compute_pf_metrics(gp: float, gl: float, loss_floor: float, pf_diag_cap: flo
     pf_diag_cap = float(pf_diag_cap)
 
     # PF_raw (debug only)
-    if gl > 0:
+    if gl > 0.0:
         pf_raw = gp / gl
         pf_raw_is_inf = False
     else:
-        if gp > 0:
+        if gp > 0.0:
             pf_raw = float("inf")
             pf_raw_is_inf = True
         else:
@@ -104,11 +283,11 @@ def compute_pf_metrics(gp: float, gl: float, loss_floor: float, pf_diag_cap: flo
             pf_raw_is_inf = False
 
     # PF_eff
-    if gp <= 0:
+    if gp <= 0.0:
         pf_eff = 0.0
     else:
         denom = max(gl, loss_floor * gp)
-        pf_eff = gp / denom if denom > 0 else 0.0
+        pf_eff = gp / denom if denom > 0.0 else 0.0
 
     # PF_diag
     pf_diag = min(pf_eff, pf_diag_cap)
@@ -127,15 +306,67 @@ def compute_pf_metrics(gp: float, gl: float, loss_floor: float, pf_diag_cap: flo
 
 
 def safe_pf_raw_for_csv(pf_raw: float, inf_placeholder: float = 1e9) -> float:
-    """Only for CSV export. Never use this for averaging/scoring."""
+    """
+    Only for CSV export. Never use this for averaging/scoring.
+    """
     if not np.isfinite(pf_raw):
         return float(inf_placeholder)
     return float(pf_raw)
 
 
-# =================================================================================
-# BACKTEST
-# =================================================================================
+# ------------------------------------------------------------
+# Robust Series Utilities
+# ------------------------------------------------------------
+
+def safe_series(x: pd.Series) -> pd.Series:
+    """
+    Coerces to numeric, removes infs and NaNs.
+    """
+    return pd.to_numeric(x, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def safe_mean(x: pd.Series) -> float:
+    s = safe_series(x)
+    return float(s.mean()) if len(s) else 0.0
+
+
+def safe_median(x: pd.Series) -> float:
+    s = safe_series(x)
+    return float(s.median()) if len(s) else 0.0
+
+
+def trimmed_mean(x, trim_frac: float = 0.05) -> float:
+    """
+    Computes a trimmed mean, dropping trim_frac from each tail.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return float("nan")
+    x = np.sort(x)
+    k = int(len(x) * trim_frac)
+    if 2 * k >= len(x):
+        return float(np.mean(x))
+    return float(np.mean(x[k:-k]))
+
+
+# ------------------------------------------------------------
+# Sigmoid Helper
+# ------------------------------------------------------------
+
+def sigmoid(x: float) -> float:
+    """
+    Numerically stable sigmoid.
+    """
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    else:
+        ex = math.exp(x)
+        return ex / (1.0 + ex)
+
+# ============================================================
+# CHUNK 4 / 6 — Adaptive Backtest Engine + TradeStats
+# ============================================================
 
 @dataclass
 class TradeStats:
@@ -145,64 +376,107 @@ class TradeStats:
     tot_ret: float = 0.0
     maxdd: float = 0.0
 
-    # trade-level diagnostics
+    # Diagnostics
     num_neg_trades: int = 0
-
-    # unified PFs
     profit_factor_raw: float = 0.0
     profit_factor_eff: float = 0.0
     profit_factor_diag: float = 0.0
-
-    # objective / penalty diagnostics
     zero_loss: int = 0
     pf_capped: int = 0
 
-    # GL per trade (loss per trade)
     gl_per_trade: float = 0.0
-
-    # optional vol proxy
     atr_pct_med: float = 0.0
 
 
 def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
+    """
+    Hybrid-adaptive backtest engine.
+    Integrates:
+    - Adaptive thresholds
+    - Adaptive ATR multipliers
+    - Adaptive regime filter
+    - Momentum fade exits
+    - Time-stop logic
+    - PF unification
+    """
+
+    # --------------------------------------------------------
+    # Extract OHLC
+    # --------------------------------------------------------
     o = df["open"].to_numpy(dtype=float)
     h = df["high"].to_numpy(dtype=float)
     l = df["low"].to_numpy(dtype=float)
     c = df["close"].to_numpy(dtype=float)
     n = len(c)
 
+    # --------------------------------------------------------
+    # Regime length
+    # --------------------------------------------------------
     reg_len = int(p["slowPeriod"] * p.get("regime_ratio", 3.0))
     if n < max(200, reg_len + 50):
         return TradeStats()
 
+    # --------------------------------------------------------
+    # Heikin-Ashi close proxy
+    # --------------------------------------------------------
     ha_c = (o + h + l + c) / 4.0
 
-    # True range + ATR
+    # --------------------------------------------------------
+    # ATR and ATR%
+    # --------------------------------------------------------
     prev_c = np.roll(c, 1)
     prev_c[0] = c[0]
     tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
     atr = pd.Series(tr).rolling(25).mean().to_numpy()
 
-    # ATR% proxy for volatility scaling (median over valid points)
     atr_pct = atr / (c + 1e-12)
     finite_atr_pct = atr_pct[np.isfinite(atr_pct)]
     atr_pct_med = float(np.nanmedian(finite_atr_pct)) if finite_atr_pct.size else 0.0
 
-    # VIDYA + ZLEMA fast/slow
+    # --------------------------------------------------------
+    # Indicators: VIDYA + ZLEMA
+    # --------------------------------------------------------
     v_main = vidya_ema(ha_c, p["vidya_len"], p["vidya_smooth"])
     fast = zlema(v_main, int(p["fastPeriod"]))
     slow = zlema(v_main, int(p["slowPeriod"]))
 
-    # Regime EMA on close
-    regime_ema = pd.Series(c).ewm(span=reg_len, adjust=False).mean().to_numpy()
-    regime_slope = regime_ema - np.roll(regime_ema, 5)
-    regime_slope[0:5] = 0.0
+    # --------------------------------------------------------
+    # Regime EMA + slope
+    # --------------------------------------------------------
+    reg_ema = regime_ema_series(c, reg_len)
+    reg_slope = momentum_slope(reg_ema, window=5)
 
-    # Hot (normalized spread) smoothed
+    # --------------------------------------------------------
+    # Hot spread (normalized)
+    # --------------------------------------------------------
     hot = (fast - slow) / (atr + 1e-12)
     hot_sm = pd.Series(hot).rolling(5).mean().to_numpy()
 
+    # --------------------------------------------------------
+    # Adaptive regime classification
+    # --------------------------------------------------------
+    vol_regime = classify_volatility_regime(atr_pct)
+    trend_regime = classify_trend_regime(reg_ema, slope_window=5)
+
+    # --------------------------------------------------------
+    # Adaptive threshold
+    # --------------------------------------------------------
+    base_thr = float(p.get("threshold", 0.04))
+    thr = adaptive_threshold(base_thr, vol_regime, trend_regime)
+
+    # --------------------------------------------------------
+    # Adaptive ATR multipliers
+    # --------------------------------------------------------
+    stop_mult, tgt_mult = adaptive_atr_multipliers(
+        vol_regime,
+        trend_regime,
+        base_stop_mult=3.0,
+        base_tgt_mult=3.6
+    )
+
+    # --------------------------------------------------------
     # Backtest state
+    # --------------------------------------------------------
     equity = 1.0
     gp = 0.0
     gl = 0.0
@@ -218,65 +492,84 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
     commission = float(p.get("commission", 0.0))
     cooldown_bars = int(p.get("cooldown_bars", 1))
     time_stop_bars = int(p.get("time_stop_bars", 15))
-    threshold = float(p.get("threshold", 0.04))
     use_regime = bool(p.get("use_regime", False))
 
-    # Stronger regime filter: slope + persistence
-    regime_slope_min = float(p.get("regime_slope_min", 0.0))
-    regime_persist = int(p.get("regime_persist", 3))
-
+    # --------------------------------------------------------
+    # Main loop
+    # --------------------------------------------------------
     for i in range(reg_len + 10, n - 2):
+
+        # Cooldown after losing trades
         if cooldown_left > 0:
             cooldown_left -= 1
             continue
 
+        # Need valid hot_sm and ATR
         if not (np.isfinite(hot_sm[i]) and np.isfinite(hot_sm[i - 1]) and np.isfinite(atr[i])):
             continue
 
+        # ----------------------------------------------------
+        # Regime filter (adaptive)
+        # ----------------------------------------------------
         if use_regime and i - 5 >= 0:
-            regime_ok = (c[i] > regime_ema[i]) and (regime_ema[i] > regime_ema[i - 5])
-            if regime_slope_min > 0.0 and regime_persist > 0:
-                j0 = max(0, i - regime_persist + 1)
-                if np.any(regime_slope[j0:i + 1] < regime_slope_min):
-                    regime_ok = False
+            regime_ok = (
+                c[i] > reg_ema[i] and
+                reg_ema[i] > reg_ema[i - 5] and
+                reg_slope[i] > 0
+            )
         else:
             regime_ok = True
 
-        # Entry: hot crosses above +threshold
-        if (not in_pos) and (hot_sm[i - 1] <= threshold) and (hot_sm[i] > threshold) and regime_ok:
+        # ----------------------------------------------------
+        # ENTRY LOGIC — hot crosses above threshold
+        # ----------------------------------------------------
+        if (not in_pos) and (hot_sm[i - 1] <= thr) and (hot_sm[i] > thr) and regime_ok:
             entry = float(o[i + 1]) if fill_mode == "next_open" else float(c[i])
             if entry > 0 and np.isfinite(entry):
                 in_pos = True
                 trades += 1
                 bars_in_trade = 0
+            continue
 
-        elif in_pos:
+        # ----------------------------------------------------
+        # EXIT LOGIC
+        # ----------------------------------------------------
+        if in_pos:
             bars_in_trade += 1
 
-            stop = entry - atr[i] * 3.0
-            tgt = entry + atr[i] * 3.6
+            # Adaptive stop/target
+            stop = entry - atr[i] * stop_mult
+            tgt = entry + atr[i] * tgt_mult
 
             exit_p = None
 
             # 1) Hard stop
             if np.isfinite(stop) and l[i] <= stop:
                 exit_p = float(stop)
+
             # 2) Target
             elif np.isfinite(tgt) and h[i] >= tgt:
                 exit_p = float(tgt)
-            # 3) Time-stop if not working and price not clearly above entry
-            elif time_stop_bars > 0 and bars_in_trade >= time_stop_bars and c[i] <= entry:
+
+            # 3) Time-stop (adaptive)
+            elif time_stop_bars > 0 and bars_in_trade >= time_stop_bars:
                 exit_p = float(o[i + 1] if i + 1 < n else c[i])
-            # 4) Regime flip exit (stronger)
-            elif use_regime and regime_ema[i] < regime_ema[i - 3]:
+
+            # 4) Momentum fade exit
+            elif hot_sm[i] < hot_sm[i - 3] if i - 3 >= 0 else False:
                 exit_p = float(o[i + 1] if i + 1 < n else c[i])
-            # 5) Hot crosses below -threshold
-            elif np.isfinite(hot_sm[i]) and hot_sm[i] < -threshold:
+
+            # 5) Regime flip exit
+            elif use_regime and reg_ema[i] < reg_ema[i - 3]:
                 exit_p = float(o[i + 1] if i + 1 < n else c[i])
+
             # 6) Final bar
             elif i == n - 3:
                 exit_p = float(c[i])
 
+            # ------------------------------------------------
+            # EXECUTE EXIT
+            # ------------------------------------------------
             if exit_p is not None and np.isfinite(exit_p) and entry > 0:
                 pnl = ((exit_p - entry) / entry) - (commission * 2.0)
                 equity *= (1.0 + pnl)
@@ -291,7 +584,9 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
 
                 in_pos = False
 
-    # MaxDD from equity curve
+    # --------------------------------------------------------
+    # Max Drawdown
+    # --------------------------------------------------------
     eq = np.asarray(equity_curve, dtype=float)
     if len(eq) >= 2:
         peak = np.maximum.accumulate(eq)
@@ -300,6 +595,9 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
     else:
         maxdd = 0.0
 
+    # --------------------------------------------------------
+    # PF metrics
+    # --------------------------------------------------------
     pfm = compute_pf_metrics(
         gp, gl,
         loss_floor=float(p.get("loss_floor", 0.001)),
@@ -325,50 +623,75 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
         atr_pct_med=float(atr_pct_med),
     )
 
+# ============================================================
+# CHUNK 5 / 6 — Scoring, Penalties, Stability, Objective Aggregation
+# ============================================================
 
-# =================================================================================
-# SCORING & UTILS
-# =================================================================================
-
-def sigmoid(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x)) if x >= 0 else math.exp(x) / (1.0 + math.exp(x))
-
+# ------------------------------------------------------------
+# Scoring Function (PF_diag + Trades)
+# ------------------------------------------------------------
 
 def score_trial(st: TradeStats, args) -> float:
+    """
+    Core scoring function used inside Optuna.
+    Uses PF_diag (capped PF) and trade count.
+    """
     if st.trades < args.min_trades:
         return 0.0
+
+    # PF weight
     pf_w = 1.0 / (1.0 + math.exp(-args.pf_k * (st.profit_factor_diag - args.pf_baseline)))
+
+    # Trades weight
     tr_w = 1.0 / (1.0 + math.exp(-args.trades_k * (st.trades - args.trades_baseline)))
-    return float((args.weight_pf * pf_w + (1.0 - args.weight_pf) * tr_w) ** args.score_power)
+
+    # Combined score
+    base_score = args.weight_pf * pf_w + (1.0 - args.weight_pf) * tr_w
+
+    return float(base_score ** args.score_power)
 
 
-def safe_series(x: pd.Series) -> pd.Series:
-    return pd.to_numeric(x, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+# ------------------------------------------------------------
+# Stability Score (MAD-based)
+# ------------------------------------------------------------
+
+def stability_score(stats, args) -> float:
+    """
+    Computes a robustness score based on the dispersion of per-ticker scores.
+    Uses median absolute deviation (MAD).
+    """
+    eligible = [st for st in stats if st.trades >= args.min_trades]
+    if not eligible:
+        return 0.0
+
+    scores = np.asarray([score_trial(st, args) for st in eligible], dtype=float)
+    scores = scores[np.isfinite(scores)]
+    if scores.size == 0:
+        return 0.0
+
+    med = float(np.median(scores))
+    mad = float(np.median(np.abs(scores - med)))
+
+    if mad <= 0:
+        return 1.0
+
+    return float(1.0 / (1.0 + mad))
 
 
-def safe_mean(x: pd.Series) -> float:
-    s = safe_series(x)
-    return float(s.mean()) if len(s) else 0.0
-
-
-def safe_median(x: pd.Series) -> float:
-    s = safe_series(x)
-    return float(s.median()) if len(s) else 0.0
-
-
-def trimmed_mean(x, trim_frac=0.05):
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    if len(x) == 0:
-        return float("nan")
-    x = np.sort(x)
-    k = int(len(x) * trim_frac)
-    if 2 * k >= len(x):
-        return float(np.mean(x))
-    return float(np.mean(x[k:-k]))
-
+# ------------------------------------------------------------
+# Objective Aggregation (mean/median/hybrid)
+# ------------------------------------------------------------
 
 def robust_objective_aggregate(stats, args, objective_mode: str) -> float:
+    """
+    Aggregates per-ticker scores into a single objective value.
+    Supports:
+        - mean_score
+        - median_score
+        - median_pf_diag
+        - mean_pf_eff_excl_zero
+        - hybrid
+    """
     eligible = [st for st in stats if st.trades >= args.min_trades]
     if not eligible:
         return 0.0
@@ -378,9 +701,9 @@ def robust_objective_aggregate(stats, args, objective_mode: str) -> float:
     pf_eff = np.asarray([st.profit_factor_eff for st in eligible], dtype=float)
     zero_loss = np.asarray([st.zero_loss for st in eligible], dtype=int)
 
-    med_score = float(np.median(scores)) if len(scores) else 0.0
-    mean_score = float(np.mean(scores)) if len(scores) else 0.0
-    med_pf_diag = float(np.median(pf_diag)) if len(pf_diag) else 0.0
+    med_score = float(np.median(scores)) if scores.size else 0.0
+    mean_score = float(np.mean(scores)) if scores.size else 0.0
+    med_pf_diag = float(np.median(pf_diag)) if pf_diag.size else 0.0
 
     mask_non_zero = (zero_loss == 0)
     mean_pf_eff_excl_zero = float(np.mean(pf_eff[mask_non_zero])) if np.any(mask_non_zero) else 0.0
@@ -402,35 +725,24 @@ def robust_objective_aggregate(stats, args, objective_mode: str) -> float:
     return med_score
 
 
-def stability_score(stats, args) -> float:
-    eligible = [st for st in stats if st.trades >= args.min_trades]
-    if not eligible:
-        return 0.0
-    scores = np.asarray([score_trial(st, args) for st in eligible], dtype=float)
-    scores = scores[np.isfinite(scores)]
-    if scores.size == 0:
-        return 0.0
-    med = float(np.median(scores))
-    mad = float(np.median(np.abs(scores - med)))
-    if mad <= 0:
-        return 1.0
-    return float(1.0 / (1.0 + mad))
-
+# ------------------------------------------------------------
+# Degeneracy Penalties (Zero-loss, PF-cap, GLPT, Return Floor, PF Floor, Max Trades)
+# ------------------------------------------------------------
 
 def objective_penalty_multiplier(stats, args) -> dict:
     """
-    Returns a dict with:
-      penalty_mult (overall),
-      zero_loss_pct, cap_pct,
-      zero_loss_mult, cap_mult,
-      glpt_med, glpt_target, glpt_mult,
-      vol_med,
-      ret_med, ret_floor, ret_mult,
-      pf_med, pf_floor, pf_floor_mult,
-      trades_med, max_trades, trades_mult,
-      eligible_count, total_count
+    Computes all degeneracy penalties and returns a dict containing:
+        - penalty_mult
+        - zero_loss_pct, cap_pct
+        - zero_loss_mult, cap_mult
+        - glpt_med, glpt_target, glpt_mult
+        - ret_med, ret_floor, ret_mult
+        - pf_med, pf_floor, pf_floor_mult
+        - trades_med, max_trades, trades_mult
+        - vol_med
+        - eligible_count, total_count
     """
-    eligible = [st for st in stats if getattr(st, "trades", 0) >= getattr(args, "min_trades", 0)]
+    eligible = [st for st in stats if st.trades >= args.min_trades]
     total_count = len(stats)
 
     if not eligible:
@@ -441,148 +753,151 @@ def objective_penalty_multiplier(stats, args) -> dict:
             "zero_loss_mult": 0.0,
             "cap_mult": 0.0,
             "glpt_med": 0.0,
-            "glpt_target": float(getattr(args, "min_glpt", 0.0)),
+            "glpt_target": float(args.min_glpt),
             "glpt_mult": 0.0,
             "vol_med": 0.0,
             "ret_med": 0.0,
-            "ret_floor": float(getattr(args, "ret_floor", -0.15)),
+            "ret_floor": float(args.ret_floor),
             "ret_mult": 0.0,
             "pf_med": 0.0,
-            "pf_floor": float(getattr(args, "pf_floor", 1.0)),
+            "pf_floor": float(args.pf_floor),
             "pf_floor_mult": 0.0,
             "trades_med": 0.0,
-            "max_trades": float(getattr(args, "max_trades", 100)),
+            "max_trades": float(args.max_trades),
             "trades_mult": 0.0,
             "eligible_count": 0,
-            "total_count": int(total_count),
+            "total_count": total_count,
         }
 
+    # ------------------------------
     # Zero-loss fraction
+    # ------------------------------
     z = np.asarray(
-        [1.0 if (float(getattr(st, "gl", 0.0)) <= 0.0 and float(getattr(st, "gp", 0.0)) > 0.0) else 0.0 for st in eligible],
+        [1.0 if (st.gl <= 0.0 and st.gp > 0.0) else 0.0 for st in eligible],
         dtype=float,
     )
     zero_loss_pct = float(np.mean(z)) if z.size else 0.0
 
-    # Cap fraction
-    cap_val = float(getattr(args, "pf_cap", 0.0))
+    # ------------------------------
+    # PF-cap fraction
+    # ------------------------------
+    cap_val = float(args.pf_cap)
     if cap_val > 0.0:
         c = np.asarray(
-            [1.0 if float(getattr(st, "profit_factor_eff", 0.0)) > cap_val else 0.0 for st in eligible],
+            [1.0 if st.profit_factor_eff > cap_val else 0.0 for st in eligible],
             dtype=float,
         )
     else:
         c = np.zeros(len(eligible), dtype=float)
     cap_pct = float(np.mean(c)) if c.size else 0.0
 
+    # ------------------------------
     # GL per trade (GLPT)
+    # ------------------------------
     glpt = np.asarray(
-        [float(getattr(st, "gl_per_trade", float(getattr(st, "gl", 0.0)) / max(int(getattr(st, "trades", 0)), 1)))
-         for st in eligible],
+        [st.gl_per_trade for st in eligible],
         dtype=float,
     )
     glpt = glpt[np.isfinite(glpt)]
     glpt_med = float(np.median(glpt)) if glpt.size else 0.0
 
-    # Volatility proxy
-    vol = np.asarray([float(getattr(st, "atr_pct_med", 0.0)) for st in eligible], dtype=float)
-    vol = vol[np.isfinite(vol)]
-    vol_med = float(np.median(vol)) if vol.size else 0.0
+    glpt_target = float(args.min_glpt)
+    min_glpt_k = float(args.min_glpt_k)
 
-    glpt_target = float(getattr(args, "min_glpt", 0.0))
-    min_glpt_k = float(getattr(args, "min_glpt_k", 0.0))
-
-    # GLPT multiplier: HARD FLOOR
     if glpt_target > 0.0 and min_glpt_k > 0.0:
         x = min_glpt_k * (glpt_med - glpt_target)
-        glpt_mult = 1.0 if x >= 0.0 else sigmoid(float(x))
+        glpt_mult = 1.0 if x >= 0.0 else sigmoid(x)
     else:
         glpt_mult = 1.0
 
-    # ONE-SIDED zero-loss multiplier
-    zero_loss_target = float(getattr(args, "zero_loss_target", 0.0))
-    zero_loss_k = float(getattr(args, "zero_loss_k", 0.0))
-    if zero_loss_k > 0.0:
-        if zero_loss_pct <= zero_loss_target:
-            zero_loss_mult = 1.0
-        else:
-            xzl = zero_loss_k * (zero_loss_target - zero_loss_pct)
-            zero_loss_mult = sigmoid(float(xzl))
-    else:
-        zero_loss_mult = 1.0
-
-    # ONE-SIDED cap multiplier
-    cap_target = float(getattr(args, "cap_target", 0.0))
-    cap_k = float(getattr(args, "cap_k", 0.0))
-    if cap_k > 0.0:
-        if cap_pct <= cap_target:
-            cap_mult = 1.0
-        else:
-            xcap = cap_k * (cap_target - cap_pct)
-            cap_mult = sigmoid(float(xcap))
-    else:
-        cap_mult = 1.0
-
-    # Return floor penalty (median total return)
-    ret_floor = float(getattr(args, "ret_floor", -0.15))
-    ret_floor_k = float(getattr(args, "ret_floor_k", 2.0))
-    rets = np.asarray([float(getattr(st, "tot_ret", 0.0)) for st in eligible], dtype=float)
+    # ------------------------------
+    # Return floor penalty
+    # ------------------------------
+    rets = np.asarray([st.tot_ret for st in eligible], dtype=float)
     rets = rets[np.isfinite(rets)]
     ret_med = float(np.median(rets)) if rets.size else 0.0
+
+    ret_floor = float(args.ret_floor)
+    ret_floor_k = float(args.ret_floor_k)
+
     if ret_floor_k > 0.0:
         if ret_med >= ret_floor:
             ret_mult = 1.0
         else:
             xr = ret_floor_k * (ret_med - ret_floor)
-            ret_mult = sigmoid(float(xr))
+            ret_mult = sigmoid(xr)
     else:
         ret_mult = 1.0
 
-    # PF floor penalty (median PF_diag)
-    pf_floor = float(getattr(args, "pf_floor", 1.0))
-    pf_floor_k = float(getattr(args, "pf_floor_k", 5.0))
-    pf_vals = np.asarray([float(getattr(st, "profit_factor_diag", 0.0)) for st in eligible], dtype=float)
+    # ------------------------------
+    # PF floor penalty
+    # ------------------------------
+    pf_vals = np.asarray([st.profit_factor_diag for st in eligible], dtype=float)
     pf_vals = pf_vals[np.isfinite(pf_vals)]
     pf_med = float(np.median(pf_vals)) if pf_vals.size else 0.0
+
+    pf_floor = float(args.pf_floor)
+    pf_floor_k = float(args.pf_floor_k)
+
     if pf_floor_k > 0.0:
         if pf_med >= pf_floor:
             pf_floor_mult = 1.0
         else:
             xp = pf_floor_k * (pf_med - pf_floor)
-            pf_floor_mult = sigmoid(float(xp))
+            pf_floor_mult = sigmoid(xp)
     else:
         pf_floor_mult = 1.0
 
-    # Max-trades penalty (median trades)
-    max_trades = float(getattr(args, "max_trades", 100))
-    max_trades_k = float(getattr(args, "max_trades_k", 0.1))
-    trades_arr = np.asarray([float(getattr(st, "trades", 0.0)) for st in eligible], dtype=float)
+    # ------------------------------
+    # Max-trades penalty
+    # ------------------------------
+    trades_arr = np.asarray([st.trades for st in eligible], dtype=float)
     trades_arr = trades_arr[np.isfinite(trades_arr)]
     trades_med = float(np.median(trades_arr)) if trades_arr.size else 0.0
+
+    max_trades = float(args.max_trades)
+    max_trades_k = float(args.max_trades_k)
+
     if max_trades_k > 0.0:
         if trades_med <= max_trades:
             trades_mult = 1.0
         else:
             xt = max_trades_k * (max_trades - trades_med)
-            trades_mult = sigmoid(float(xt))
+            trades_mult = sigmoid(xt)
     else:
         trades_mult = 1.0
 
+    # ------------------------------
+    # Volatility median
+    # ------------------------------
+    vol_vals = np.asarray([st.atr_pct_med for st in eligible], dtype=float)
+    vol_vals = vol_vals[np.isfinite(vol_vals)]
+    vol_med = float(np.median(vol_vals)) if vol_vals.size else 0.0
+
+    # ------------------------------
     # Combine penalties
-    mode = str(getattr(args, "obj_penalty_mode", "both")).lower()
+    # ------------------------------
+    mode = str(args.obj_penalty_mode).lower()
     if mode == "none":
         penalty_mult = 1.0
     elif mode == "zero_loss":
-        penalty_mult = float(zero_loss_mult)
+        penalty_mult = zero_loss_mult
     elif mode == "cap":
-        penalty_mult = float(cap_mult)
+        penalty_mult = cap_mult
     else:  # "both"
-        penalty_mult = float(zero_loss_mult * cap_mult)
+        zero_loss_mult = 1.0 if zero_loss_pct <= args.zero_loss_target else sigmoid(
+            args.zero_loss_k * (args.zero_loss_target - zero_loss_pct)
+        )
+        cap_mult = 1.0 if cap_pct <= args.cap_target else sigmoid(
+            args.cap_k * (args.cap_target - cap_pct)
+        )
+        penalty_mult = zero_loss_mult * cap_mult
 
-    if glpt_target > 0.0 and min_glpt_k > 0.0:
-        penalty_mult *= float(glpt_mult)
-
-    penalty_mult *= float(ret_mult * pf_floor_mult * trades_mult)
+    # Add GLPT, return floor, PF floor, max trades
+    penalty_mult *= glpt_mult
+    penalty_mult *= ret_mult
+    penalty_mult *= pf_floor_mult
+    penalty_mult *= trades_mult
 
     return {
         "penalty_mult": float(penalty_mult),
@@ -603,35 +918,35 @@ def objective_penalty_multiplier(stats, args) -> dict:
         "trades_med": float(trades_med),
         "max_trades": float(max_trades),
         "trades_mult": float(trades_mult),
-        "eligible_count": int(len(eligible)),
-        "total_count": int(total_count),
+        "eligible_count": len(eligible),
+        "total_count": total_count,
     }
 
-
-# =================================================================================
-# MAIN
-# =================================================================================
+# ============================================================
+# CHUNK 6 / 6 — Optuna Objective + Reporting + CLI + main()
+# ============================================================
 
 def main():
+    # --------------------------------------------------------
+    # CLI Arguments
+    # --------------------------------------------------------
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--data_dir", type=str, default="data")
     ap.add_argument("--optimize", action="store_true")
     ap.add_argument("--trials", type=int, default=100)
     ap.add_argument("--files", type=int, default=50)
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--fill", type=str, default="next_open", choices=["next_open", "same_close"])
+    ap.add_argument("--fill", type=str, default="next_open",
+                    choices=["next_open", "same_close"])
     ap.add_argument("--use-regime", action="store_true")
 
-    # Objective robustness
-    ap.add_argument(
-        "--objective-mode",
-        type=str,
-        default="median_score",
-        choices=["mean_score", "median_score", "median_pf_diag",
-                 "mean_pf_eff_excl_zero", "hybrid"],
-    )
+    # Objective modes
+    ap.add_argument("--objective-mode", type=str, default="median_score",
+                    choices=["mean_score", "median_score", "median_pf_diag",
+                             "mean_pf_eff_excl_zero", "hybrid"])
 
-    # Objective degeneracy penalties
+    # Degeneracy penalties
     ap.add_argument("--obj-penalty-mode", type=str, default="both",
                     choices=["none", "zero_loss", "cap", "both"])
     ap.add_argument("--zero-loss-target", type=float, default=0.05)
@@ -642,16 +957,17 @@ def main():
     ap.add_argument("--min-glpt", type=float, default=0.002)
     ap.add_argument("--min-glpt-k", type=float, default=12.0)
 
-    # Penalty knobs
-    ap.add_argument("--penalty", type=str, default="enabled")
-    ap.add_argument("--penalty-ret-center", type=float, default=0.01)  # kept for compatibility
-    ap.add_argument("--penalty-ret-k", type=float, default=10.0)       # kept for compatibility
+    # Return floor penalty
     ap.add_argument("--ret-floor", type=float, default=-0.15)
     ap.add_argument("--ret-floor-k", type=float, default=2.0)
-    ap.add_argument("--max-trades", type=int, default=100)
-    ap.add_argument("--max-trades-k", type=float, default=0.1)
+
+    # PF floor penalty
     ap.add_argument("--pf-floor", type=float, default=1.0)
     ap.add_argument("--pf-floor-k", type=float, default=5.0)
+
+    # Max trades penalty
+    ap.add_argument("--max-trades", type=int, default=100)
+    ap.add_argument("--max-trades-k", type=float, default=0.1)
 
     # Scoring knobs
     ap.add_argument("--commission_rate_per_side", type=float, default=0.0006)
@@ -664,15 +980,19 @@ def main():
     ap.add_argument("--min-trades", type=int, default=5)
     ap.add_argument("--loss_floor", type=float, default=0.001)
 
+    # Threshold + volatility floor
     ap.add_argument("--threshold-fixed", type=float, default=0.04)
     ap.add_argument("--vol-floor-mult-fixed", type=float, default=0.55)
-    ap.add_argument("--threshold_mode", type=str, default="fixed")
 
+    # PF cap
     ap.add_argument("--pf-cap", type=float, default=5.0)
+
+    # Coverage penalty
     ap.add_argument("--coverage-target", type=float, default=0.85)
     ap.add_argument("--coverage-k", type=float, default=8.0)
+
+    # Optimization toggles
     ap.add_argument("--opt-time-stop", action="store_true")
-    ap.add_argument("--min-tp2sl", type=float, default=0.8)  # kept for compatibility
     ap.add_argument("--opt-vidya", action="store_true")
     ap.add_argument("--opt-fastslow", action="store_true")
 
@@ -682,6 +1002,9 @@ def main():
 
     args = ap.parse_args()
 
+    # --------------------------------------------------------
+    # Load data
+    # --------------------------------------------------------
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -692,9 +1015,9 @@ def main():
     sample_files = random.sample(files, min(len(files), args.files))
     data_list = [(f.stem, ensure_ohlc(pd.read_parquet(f))) for f in sample_files]
 
-    # ======================
-    # OPTUNA OBJECTIVE
-    # ======================
+    # --------------------------------------------------------
+    # Optuna Objective
+    # --------------------------------------------------------
     def objective(trial):
         p = {
             "vidya_len": trial.suggest_int("vl", 4, 40) if args.opt_vidya else 14,
@@ -705,7 +1028,7 @@ def main():
             "regime_ratio": trial.suggest_float("reg_ratio", 2.0, 5.0),
             "threshold": args.threshold_fixed,
             "vol_floor_mult": args.vol_floor_mult_fixed,
-            "commission": args. commission_rate_per_side,
+            "commission": args.commission_rate_per_side,
             "fill_mode": args.fill,
             "use_regime": args.use_regime,
             "loss_floor": args.loss_floor,
@@ -716,30 +1039,41 @@ def main():
         }
 
         stats = [backtest_vidya_engine(df, **p) for _, df in data_list]
+
+        # Coverage
         eligible = sum(st.trades >= args.min_trades for st in stats)
         cov = eligible / len(stats)
 
-        # Asymmetric coverage penalty: only penalize below target
         if cov >= args.coverage_target:
             cov_mult = 1.0
         else:
             cov_mult = sigmoid(args.coverage_k * (cov - args.coverage_target))
 
+        # Aggregate objective
         agg = robust_objective_aggregate(stats, args, args.objective_mode)
         pen = objective_penalty_multiplier(stats, args)
         stab = stability_score(stats, args)
 
         return float(agg * cov_mult * pen["penalty_mult"] * stab)
 
+    # --------------------------------------------------------
+    # Run Optuna
+    # --------------------------------------------------------
     study_kwargs = {"direction": "maximize"}
+
     if TQDMProgressBarCallback is not None:
         study = optuna.create_study(**study_kwargs)
-        study.optimize(objective, n_trials=args.trials, callbacks=[TQDMProgressBarCallback()])
+        study.optimize(objective, n_trials=args.trials,
+                       callbacks=[TQDMProgressBarCallback()])
     else:
         study = optuna.create_study(**study_kwargs)
         study.optimize(objective, n_trials=args.trials)
 
     best = dict(study.best_params)
+
+    # --------------------------------------------------------
+    # Build best parameter set
+    # --------------------------------------------------------
     best_p = {
         "threshold": args.threshold_fixed,
         "vol_floor_mult": args.vol_floor_mult_fixed,
@@ -759,11 +1093,12 @@ def main():
         "regime_persist": args.regime_persist,
     }
 
-    # ======================
-    # PER-TICKER REPORT
-    # ======================
+    # --------------------------------------------------------
+    # Per-ticker evaluation
+    # --------------------------------------------------------
     rows = []
     best_stats = []
+
     for name, df in data_list:
         st = backtest_vidya_engine(df, **best_p)
         best_stats.append(st)
@@ -789,33 +1124,30 @@ def main():
 
     per_df = pd.DataFrame(rows)
 
-    # ======================
-    # DIAGNOSTICS
-    # ======================
+    # --------------------------------------------------------
+    # Diagnostics
+    # --------------------------------------------------------
     pen_best = objective_penalty_multiplier(best_stats, args)
     stab_best = stability_score(best_stats, args)
 
     eligible_count = int(per_df["eligible"].sum())
     coverage = eligible_count / len(per_df)
-    zero_loss_count = int(per_df["zero_loss"].sum())
-    capped_count = int(per_df["pf_capped"].sum())
 
     med_pf_diag = safe_median(per_df["profit_factor_diag"])
     avg_pf_diag = safe_mean(per_df["profit_factor_diag"])
     med_pf_eff = safe_median(per_df["profit_factor_eff"])
     avg_pf_eff = safe_mean(per_df["profit_factor_eff"])
-
     med_trades = safe_median(per_df["num_trades"])
     med_tot_ret = safe_median(per_df["total_return"])
 
-    # ======================
-    # OUTPUT FILES with prefix - ASCII safe
-    # ======================
+    # --------------------------------------------------------
+    # Output files
+    # --------------------------------------------------------
     out_dir = Path("output")
     out_dir.mkdir(exist_ok=True)
     run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Add run-level diagnostics to CSV as constant columns
+    # Add run-level diagnostics to CSV
     per_df["run_coverage"] = coverage
     per_df["run_zero_loss_pct"] = pen_best["zero_loss_pct"]
     per_df["run_cap_pct"] = pen_best["cap_pct"]
@@ -826,6 +1158,7 @@ def main():
     per_csv = out_dir / f"{MODULE_PREFIX}per_ticker_{run_ts}.csv"
     per_df.to_csv(per_csv, index=False)
 
+    # Summary TXT
     txt_lines = []
     txt_lines.append("=== OBJECTIVE DEGENERACY DIAGNOSTICS ===")
     txt_lines.append(f"penalty_mult: {pen_best['penalty_mult']:.6f}")
@@ -838,8 +1171,8 @@ def main():
     txt_lines.append("")
     txt_lines.append("=== COVERAGE & STABILITY ===")
     txt_lines.append(f"coverage: {coverage:.4f}  (eligible {eligible_count} / {len(per_df)})")
-    txt_lines.append(f"zero_loss_pct: {pen_best['zero_loss_pct']:.4f}  (count {zero_loss_count})")
-    txt_lines.append(f"cap_pct: {pen_best['cap_pct']:.4f}  (count {capped_count})")
+    txt_lines.append(f"zero_loss_pct: {pen_best['zero_loss_pct']:.4f}")
+    txt_lines.append(f"cap_pct: {pen_best['cap_pct']:.4f}")
     txt_lines.append(f"stability_score: {stab_best:.6f}")
     txt_lines.append("")
     txt_lines.append("=== PF & RETURNS SUMMARY ===")
@@ -857,26 +1190,28 @@ def main():
     best_txt = out_dir / f"{MODULE_PREFIX}best_{run_ts}.txt"
     best_txt.write_text("\n".join(txt_lines), encoding="utf-8")
 
-    # ── Clean console summary - ASCII only ───────────────────────────────
+    # --------------------------------------------------------
+    # Console summary
+    # --------------------------------------------------------
     print("\n" + "=" * 60)
-    print("          BEST RESULT - Vidya RSI")
+    print("          BEST RESULT — Vidya RSI (Hybrid Adaptive)")
     print("=" * 60)
-    print(f"objective_score: {study.best_value:.6f}")
-    print("")
+    print(f"objective_score: {study.best_value:.6f}\n")
     print("Best parameters:")
     for k in sorted(study.best_params):
         print(f"  {k:18} : {study.best_params[k]}")
-    print("")
-    print("Coverage / Stability:")
+    print("\nCoverage / Stability:")
     print(f"  coverage         : {coverage:.4f}")
-    print(f"  stability_score  : {stab_best:.6f}")
-    print("")
+    print(f"  stability_score  : {stab_best:.6f}\n")
     print("Saved:")
     print(f"  CSV -> {per_csv}")
-    print(f"  TXT -> {best_txt}")
-    print("")
+    print(f"  TXT -> {best_txt}\n")
     print("\n".join(txt_lines))
 
+
+# ============================================================
+# End of CHUNK 6 / 6 — Full Vidya_RSI.py Complete
+# ============================================================
 
 if __name__ == "__main__":
     main()
