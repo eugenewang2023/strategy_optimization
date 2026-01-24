@@ -1,154 +1,201 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+# ───────────────────────────────────────────────────────────────
+# Configuration & Defaults
+# ───────────────────────────────────────────────────────────────
 
-# Use python3 if available; fall back to python
+SCRIPT_NAME="$(basename "$0")"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || PYTHON_BIN="python"
-command -v "$PYTHON_BIN" >/dev/null 2>&1 || { echo "ERROR: python not found in PATH"; exit 2; }
 
-seed=7
-nTrials=2000
-nFiles=300
-fillOpt="next_open"
+# Default hardware/execution settings
+SEED=7
+TRIALS=1000
+FILES=300
+FILL_MODE="next_open"
+DATA_DIR="data"
+LOG_DIR="logs"
+N_JOBS=4                  # Parallel trial execution
+N_STARTUP_TRIALS=200      # Initial random exploration count
 
-echo ""
-echo "Starting multi-phase optimization sweep..."
-echo "Seed: $seed   |   Trials: $nTrials   |   Files: $nFiles"
-echo ""
+# Global Strategy Baselines
+TRADES_BASELINE=5.0       # Targets ~5 trades per ticker for stability
+COMMISSION=0.0006         # 0.06% per side (adjust to your broker)
+REGIME_SLOPE_MIN=0.0
+REGIME_PERSIST=3
 
-# ───────────────────────────────────────────────────────────────
-# BASE PARAMETERS (shared across phases)
-# ───────────────────────────────────────────────────────────────
-base_trades_baseline=3.0
-base_trades_k=1.2
-base_pf_baseline=1.15
-base_pf_k=2.5
-base_threshold_fixed=0.012
-base_vol_floor_mult_fixed=0.05
-base_pf_cap=4.0
-base_loss_floor=0.001
-
-# GLPT
-base_min_glpt=0.003
-base_min_glpt_k=12
-
-# Regime filter tuning (adaptive engine)
-base_regime_slope_min=0.0
-base_regime_persist=3
-
-# Coverage penalty (asymmetric)
-coverage_target=0.98
-coverage_k=8
+DRY_RUN=false
+SELECTED_PHASES=()
 
 # ───────────────────────────────────────────────────────────────
-# PHASE RUNNER
+# Usage / Help
 # ───────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+Usage: $SCRIPT_NAME [OPTIONS] [phase_code ...]
+
+Multi-phase Vidya_RSI optimization runner.
+
+Options:
+  --seed INT           Random seed (default: $SEED)
+  --trials INT         Trials per phase (default: $TRIALS)
+  --files INT          Number of data files (default: $FILES)
+  --fill MODE          Fill mode: next_open | same_close (default: $FILL_MODE)
+  --n-jobs INT         Parallel trials (default: $N_JOBS)
+  --dry-run            Show commands without executing
+  --help               Show this help message
+
+Phases (runs all if none specified):
+  A   Discovery: Escape the zero-plateau (wide search)
+  B   Robustness: Filter for consistency and regime stability
+  C   Quality: Tighten for high expectancy and low drawdown
+
+Examples:
+  $SCRIPT_NAME --trials 2000 A
+  $SCRIPT_NAME B C
+EOF
+    exit "${1:-0}"
+}
+
+# ───────────────────────────────────────────────────────────────
+# Parse Arguments
+# ───────────────────────────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --seed)             SEED="$2"; shift 2 ;;
+        --trials)           TRIALS="$2"; shift 2 ;;
+        --files)            FILES="$2"; shift 2 ;;
+        --fill)             FILL_MODE="$2"; shift 2 ;;
+        --n-jobs)           N_JOBS="$2"; shift 2 ;;
+        --dry-run)          DRY_RUN=true; shift ;;
+        --help|-h)          usage 0 ;;
+        A|B|C)              SELECTED_PHASES+=("$1"); shift ;;
+        *)                  echo "Unknown option: $1"; usage 1 ;;
+    esac
+done
+
+# Run all phases if none selected
+[[ ${#SELECTED_PHASES[@]} -eq 0 ]] && SELECTED_PHASES=(A B C)
+
+mkdir -p "$LOG_DIR"
+
+# ───────────────────────────────────────────────────────────────
+# Phase Definitions
+# ───────────────────────────────────────────────────────────────
+# Format: "min_tr weight_pf pwr ret_fl ret_k pf_k glpt glpt_k cov_t cov_k reg_ratio pf_cap loss_fl # Comment"
+declare -A PHASE_PARAMS
+
+# PHASE A: Discovery — Finds signal in the noise. Low requirements to prevent zero scores.
+#PHASE_PARAMS["A"]="1 0.30 1.0 -0.50 0.5 0.0 0.000 1 0.10 1.0 1.5 8.0 0.0005 # PHASE A: Signal Discovery (Wide Search)"
+
+# PHASE B: Robustness — Enforces trade density and regime filtering.
+#PHASE_PARAMS["B"]="4 0.60 1.5 -0.15 1.5 5.0 0.001 8 0.35 2.5 3.0 5.0 0.0010 # PHASE B: Robustness & Regime Filtering"
+
+# PHASE C: Refinement — Targets institutional-grade expectancy and tighter risk.
+# The "Robustness Wall"
+#PHASE_PARAMS["C"]="6 0.85 2.0 -0.05 3.0 10.0 0.002 15 0.45 4.0 3.5 3.5 0.0015 # PHASE C: High-Expectancy Refinement"
+
+# PHASE D: "The Realist" 
+# We drop min_trades to 3 and lower the GLPT target to find a middle ground.
+PHASE_PARAMS["A"]="3 0.70 1.5 -0.10 2.0 5.0 0.0008 10 0.40 2.0 2.5 4.5 0.0010 # PHASE C: Sensitivity Calibration"
+# ───────────────────────────────────────────────────────────────
+# Runner Function
+# ───────────────────────────────────────────────────────────────
+
 run_phase() {
-    local phase_name="$1"
-    local min_trades="$2"
-    local weight_pf="$3"
-    local score_power="$4"
-    local ret_floor="$5"
-    local ret_floor_k="$6"
-    local pf_floor_k="$7"
-    local min_glpt="$8"
-    local min_glpt_k="$9"
-    shift 9
-    local extra_args=("$@")
+    local phase_code="$1"
+    
+    # Extract values from PHASE_PARAMS
+    IFS=' ' read -r \
+        min_trades weight_pf score_power \
+        ret_floor ret_floor_k pf_floor_k \
+        min_glpt min_glpt_k \
+        coverage_target coverage_k \
+        regime_ratio_val pf_cap_val loss_floor_val \
+        comment <<< "${PHASE_PARAMS[$phase_code]}"
+        
+    local phase_name="${comment#*# }"
+    local log_file="$LOG_DIR/phase_${phase_code}.log"
 
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
-    echo "               PHASE: $phase_name"
+    echo " PHASE $phase_code : $phase_name"
+    echo " Expectancy: $min_glpt | Coverage: $coverage_target"
     echo "═══════════════════════════════════════════════════════════════"
-    echo "min_trades     = $min_trades"
-    echo "weight_pf      = $weight_pf"
-    echo "score_power    = $score_power"
-    echo "ret_floor/k    = $ret_floor / $ret_floor_k"
-    echo "pf_floor_k     = $pf_floor_k"
-    echo "min_glpt / k   = $min_glpt / $min_glpt_k"
-    echo "extra args     = ${extra_args[*]}"
-    echo ""
 
     local CMD=(
         "$PYTHON_BIN" Vidya_RSI.py
         --optimize
-        --seed "$seed"
-        --trials "$nTrials"
-        --files "$nFiles"
-        --fill "$fillOpt"
-        --data_dir "data"
-
-        # Core scoring
+        --seed "$SEED"
+        --trials "$TRIALS"
+        --n-jobs "$N_JOBS"
+        --n-startup-trials "$N_STARTUP_TRIALS"
+        --files "$FILES"
+        --fill "$FILL_MODE"
+        --data_dir "$DATA_DIR"
+        
+        # Scoring Parameters
         --min-trades "$min_trades"
-        --trades-baseline "$base_trades_baseline"
-        --trades-k "$base_trades_k"
-        --pf-baseline "$base_pf_baseline"
-        --pf-k "$base_pf_k"
+        --trades-baseline "$TRADES_BASELINE"
         --weight-pf "$weight_pf"
         --score-power "$score_power"
-
-        # Threshold & volatility
-        --threshold-fixed "$base_threshold_fixed"
-        --vol-floor-mult-fixed "$base_vol_floor_mult_fixed"
-
-        # PF cap
-        --pf-cap "$base_pf_cap"
-
-        # Objective mode
-        --objective-mode "hybrid"
-        --obj-penalty-mode "both"
-
-        # GLPT
+        --pf-cap "$pf_cap_val"
         --min-glpt "$min_glpt"
         --min-glpt-k "$min_glpt_k"
-
-        # Penalties
+        
+        # Penalty/Risk Gradients
+        --loss_floor "$loss_floor_val"
         --ret-floor "$ret_floor"
         --ret-floor-k "$ret_floor_k"
         --pf-floor-k "$pf_floor_k"
-
-        # Regime filter (adaptive)
-        --regime-slope-min "$base_regime_slope_min"
-        --regime-persist "$base_regime_persist"
-
-        # Coverage penalty (asymmetric)
+        
+        # Coverage & Regime Config
         --coverage-target "$coverage_target"
         --coverage-k "$coverage_k"
-
-        # Optimization toggles
+        --regime-slope-min "$REGIME_SLOPE_MIN"
+        --regime-persist "$REGIME_PERSIST"
+        
+        # Search Range Limits
+        --fast-min 8 --fast-max 25
+        --slow-min 30 --slow-max 100
+        --regime-ratio-min 1.5 --regime-ratio-max 5.0
+        
+        # Execution Toggles
         --opt-time-stop
         --opt-vidya
         --opt-fastslow
-
-        # Commission & loss floor
-        --commission_rate_per_side 0.0006
-        --loss_floor "$base_loss_floor"
+        --commission_rate_per_side "$COMMISSION"
+        --objective-mode "hybrid"
     )
 
-    CMD+=( "${extra_args[@]}" )
-
-    echo "Command:"
-    printf '  %q' "${CMD[@]}"
-    echo -e "\n"
-
-    "${CMD[@]}"
+    if $DRY_RUN; then
+        echo "DRY RUN COMMAND:"
+        printf '  %q' "${CMD[@]}"
+        echo ""
+    else
+        # Execute and pipe to both console and log
+        "${CMD[@]}" 2>&1 | tee "$log_file"
+    fi
 }
 
 # ───────────────────────────────────────────────────────────────
-# PHASES (A + B recommended)
+# Main Loop
 # ───────────────────────────────────────────────────────────────
 
-# A — Balanced Aggressive + Safety
-run_phase "A - Balanced Aggressive + Safety" \
-    3       0.80    2.0     -0.105   2.4     7     0.003   13
+echo "Starting Vidya_RSI Optimization Sweep..."
+echo "Seed: $SEED | Trials: $TRIALS | Jobs: $N_JOBS | Files: $FILES"
 
-# B — Higher Edge Target
-run_phase "B - Higher Edge Target" \
-    2       0.80    2.1     -0.11    2.4     7     0.0035  14
+for phase in "${SELECTED_PHASES[@]}"; do
+    if [[ -n "${PHASE_PARAMS[$phase]:-}" ]]; then
+        run_phase "$phase"
+    else
+        echo "ERROR: Phase '$phase' is not defined."
+        exit 1
+    fi
+done
 
 echo ""
-echo "All phases completed."
-echo "Check output/*.csv and logs for objective_score, coverage, stability_score, PF_diag, etc."
+echo "Multi-phase optimization complete. Logs saved in $LOG_DIR."
