@@ -24,6 +24,7 @@ TRADES_BASELINE=5.0       # Targets ~5 trades per ticker for stability
 COMMISSION=0.0006         # 0.06% per side (adjust to your broker)
 REGIME_SLOPE_MIN=0.0
 REGIME_PERSIST=3
+MAX_PENALTY_MULT=3.0      # Cap on total penalty multiplier (matches Python)
 
 DRY_RUN=false
 SELECTED_PHASES=()
@@ -51,10 +52,10 @@ Phases (runs all if none specified):
   A   Discovery: Escape the zero-plateau (wide search)
   B   Robustness: Filter for consistency and regime stability
   C   Quality: Tighten for high expectancy and low drawdown
+  D   Realist
+  E   Quality Tightening
+  F   Institutional Final
 
-Examples:
-  $SCRIPT_NAME --trials 2000 A
-  $SCRIPT_NAME B C
 EOF
     exit "${1:-0}"
 }
@@ -72,35 +73,66 @@ while [[ $# -gt 0 ]]; do
         --n-jobs)           N_JOBS="$2"; shift 2 ;;
         --dry-run)          DRY_RUN=true; shift ;;
         --help|-h)          usage 0 ;;
-        A|B|C)              SELECTED_PHASES+=("$1"); shift ;;
+        A|B|C|D|E|F)        SELECTED_PHASES+=("$1"); shift ;;
         *)                  echo "Unknown option: $1"; usage 1 ;;
     esac
 done
 
 # Run all phases if none selected
-[[ ${#SELECTED_PHASES[@]} -eq 0 ]] && SELECTED_PHASES=(A B C)
+# [[ ${#SELECTED_PHASES[@]} -eq 0 ]] && SELECTED_PHASES=(A B C D E F)
+[[ ${#SELECTED_PHASES[@]} -eq 0 ]] && SELECTED_PHASES=(F)
 
 mkdir -p "$LOG_DIR"
 
 # ───────────────────────────────────────────────────────────────
 # Phase Definitions
+# Format:
+#   "min_tr weight_pf pwr ret_fl ret_k pf_k min_glpt min_glpt_k cov_t cov_k reg_ratio pf_cap loss_fl # Comment"
 # ───────────────────────────────────────────────────────────────
-# Format: "min_tr weight_pf pwr ret_fl ret_k pf_k glpt glpt_k cov_t cov_k reg_ratio pf_cap loss_fl # Comment"
+
 declare -A PHASE_PARAMS
 
-# PHASE A: Discovery — Finds signal in the noise. Low requirements to prevent zero scores.
-#PHASE_PARAMS["A"]="1 0.30 1.0 -0.50 0.5 0.0 0.000 1 0.10 1.0 1.5 8.0 0.0005 # PHASE A: Signal Discovery (Wide Search)"
+# PHASE A — Exploration / Zero‑Plateau Escape
+# Loose floors, shallow steepness, generous coverage.
+#PHASE_PARAMS["A"]="2 0.40 1.1 -0.40 1.0 0.0 0.0012 4 0.40 2.0 1.8 6.0 0.0010 # Phase A: Exploration"
+#PHASE_PARAMS["A"]="2 0.40 1.10 -0.40 1.00 0.0008 0.0010 6 0.40 3.0 1.6 6.0 0.0010 # Phase A: Exploration"
+PHASE_PARAMS["A"]="2 0.40 1.10 -0.40 1.00 0.0008 0.0010 6 0.40 3.0 6.0 0.0010 # A"
 
-# PHASE B: Robustness — Enforces trade density and regime filtering.
-#PHASE_PARAMS["B"]="4 0.60 1.5 -0.15 1.5 5.0 0.001 8 0.35 2.5 3.0 5.0 0.0010 # PHASE B: Robustness & Regime Filtering"
+# PHASE B — Robustness Formation
+# Slightly tighter returns, more PF weight, higher coverage.
+#PHASE_PARAMS["B"]="3 0.55 1.4 -0.25 1.5 2.0 0.0013 6 0.45 2.5 1.9 6.0 0.0010 # Phase B: Robustness Formation"
+#PHASE_PARAMS["B"]="3 0.55 1.30 -0.28 1.40 0.0010 0.00115 8 0.48 3.4 1.8 6.0 0.0010 # Phase B: Robustness"
+PHASE_PARAMS["B"]="3 0.55 1.30 -0.28 1.40 0.0010 0.00115 8 0.48 3.4 6.0 0.0010 # B"
 
-# PHASE C: Refinement — Targets institutional-grade expectancy and tighter risk.
-# The "Robustness Wall"
-#PHASE_PARAMS["C"]="6 0.85 2.0 -0.05 3.0 10.0 0.002 15 0.45 4.0 3.5 3.5 0.0015 # PHASE C: High-Expectancy Refinement"
+# PHASE C — Expectancy + PF Tightening
+# Better floors, steeper GLPT and coverage.
+#PHASE_PARAMS["C"]="4 0.70 1.7 -0.18 1.8 4.0 0.00145 8 0.50 3.0 2.1 6.0 0.00105 # Phase C: Quality Tightening"
+#PHASE_PARAMS["C"]="4 0.68 1.55 -0.18 1.80 0.00125 0.00130 10 0.55 3.8 2.1 6.0 0.00105 # Phase C: Quality Tightening"
+#PHASE_PARAMS["C"]="4 0.68 1.55 -0.18 1.80 0.00125 0.00130 10 0.55 3.8 6.0 0.00105"
+PHASE_PARAMS["C"]="4 0.68 1.55 -0.18 1.80 0.00125 0.00130 10 0.55 3.8 6.0 0.00105 # C"
 
-# PHASE D: "The Realist" 
-# We drop min_trades to 3 and lower the GLPT target to find a middle ground.
-PHASE_PARAMS["A"]="3 0.70 1.5 -0.10 2.0 5.0 0.0008 10 0.40 2.0 2.5 4.5 0.0010 # PHASE C: Sensitivity Calibration"
+# PHASE D — Institutional Stability
+# Focus on stability and DD, still moderate coverage.
+#PHASE_PARAMS["D"]="4 0.78 1.9 -0.14 2.1 6.0 0.00155 10 0.55 3.5 2.3 6.0 0.00108 # Phase D: Stability Consolidation"
+#PHASE_PARAMS["D"]="4 0.75 1.75 -0.12 2.20 0.00140 0.00145 12 0.60 4.1 2.3 6.0 0.00105 # Phase D: Stability"
+#PHASE_PARAMS["D"]="4 0.75 1.75 -0.12 2.20 0.00140 0.00145 12 0.60 4.1 6.0 0.00105"
+PHASE_PARAMS["D"]="4 0.75 1.75 -0.12 2.20 0.00140 0.00145 12 0.60 4.1 6.0 0.00105 # D"
+
+# PHASE E — High‑Expectancy Tightening
+# Stronger floors, higher GLPT and coverage.
+#PHASE_PARAMS["E"]="5 0.80 2.0 -0.10 2.4 8.0 0.00160 12 0.58 4.0 2.6 6.0 0.00110 # Phase E: High-Expectancy Tightening"
+#PHASE_PARAMS["E"]="5 0.80 1.90 -0.08 2.50 0.00155 0.00160 14 0.65 4.3 2.5 6.0 0.00105 # Phase E: Expectancy Tightening"
+#PHASE_PARAMS["E"]="5 0.80 1.90 -0.08 2.50 0.00155 0.00160 14 0.65 4.3 6.0 0.00105"
+PHASE_PARAMS["E"]="5 0.80 1.90 -0.08 2.50 0.00155 0.00160 14 0.65 4.3 6.0 0.00105 # E"
+
+# PHASE F — Final Institutional‑Grade Filter
+# Matches the Phase‑F suite above: GLPT ~0.0018, coverage 0.60, steeper k.
+#PHASE_PARAMS["F"]="6 0.85 2.2 -0.08 2.8 9.0 0.00180 14 0.60 4.5 3.0 6.0 0.00100 # Phase F: Institutional Final"
+#PHASE_PARAMS["F"]="6 0.85 2.2 -0.05 2.2 7.0 0.0018 12 0.60 3.2 1.5 6.0 0.0010 # Phase F: Institutional Final (Corrected)"
+#PHASE_PARAMS["F"]="6 0.85 2.10 -0.05 3.00 0.00170 0.00180 16 0.60 4.0 3.0 6.0 0.00100 # Phase F: Institutional Final"
+#PHASE_PARAMS["F"]="6 0.85 2.10 -0.05 3.00 0.00170 0.00180 16 0.60 4.0 6.0 0.00100"
+PHASE_PARAMS["F"]="6 0.85 2.10 -0.05 3.00 0.00170 0.00180 16 0.60 4.0 6.0 0.00100 # F"
+
 # ───────────────────────────────────────────────────────────────
 # Runner Function
 # ───────────────────────────────────────────────────────────────
@@ -151,6 +183,7 @@ run_phase() {
         --ret-floor "$ret_floor"
         --ret-floor-k "$ret_floor_k"
         --pf-floor-k "$pf_floor_k"
+        --max-penalty-mult "$MAX_PENALTY_MULT"
         
         # Coverage & Regime Config
         --coverage-target "$coverage_target"
@@ -176,7 +209,6 @@ run_phase() {
         printf '  %q' "${CMD[@]}"
         echo ""
     else
-        # Execute and pipe to both console and log
         "${CMD[@]}" 2>&1 | tee "$log_file"
     fi
 }

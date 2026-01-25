@@ -33,6 +33,33 @@ except Exception:
     TQDMProgressBarCallback = None
 
 
+def penalty_sigmoid(x, floor, k):
+    """
+    Smooth penalty: 1.0 when x >= floor, decays smoothly below.
+    """
+    if x >= floor:
+        return 1.0
+    return 1.0 / (1.0 + math.exp(k * (floor - x)))
+
+
+def smooth_penalty(value, center, steepness, low=0.1, high=1.0):
+    """
+    Generic smooth penalty curve using a sigmoid.
+    
+    Parameters:
+        value      : metric value (e.g., trades_med, coverage)
+        center     : midpoint where penalty ≈ (low+high)/2
+        steepness  : how sharp the transition is
+        low        : minimum penalty multiplier
+        high       : maximum penalty multiplier
+        
+    Returns:
+        penalty factor in [low, high]
+    """
+    curve = 1 / (1 + math.exp(-steepness * (value - center)))
+    return low + (high - low) * curve
+
+
 # ============================================================
 # handle interrupt gracefully
 # ============================================================
@@ -934,16 +961,6 @@ ZERO_LOSS_HARD = 0.22
 CAP_SOFT = 0.30
 CAP_HARD = 0.50
 
-
-def penalty_sigmoid(x, floor, k):
-    """
-    Smooth penalty: 1.0 when x >= floor, decays smoothly below.
-    """
-    if x >= floor:
-        return 1.0
-    return 1.0 / (1.0 + math.exp(k * (floor - x)))
-
-
 def penalty_trades(trades: float, cfg: ObjectiveConfig) -> float:
     """
     Soft penalty if trades are below baseline; no extra reward above.
@@ -1178,30 +1195,196 @@ def objective_penalty_multiplier(stats, args):
 # CHUNK 6 / 6 — Optuna Objective + Reporting + CLI + main()
 # ============================================================
 
+def objective(trial, all_data, args):
+    """
+    Full Phase‑F objective function with unified smooth penalties.
+    """
+    # ============================================================
+    # 1. SAMPLE PARAMETERS (with regime_ratio override support)
+    # ============================================================
+
+    # If user supplied --regime-ratio, use it.
+    # Otherwise, search between min/max.
+    if getattr(args, "regime_ratio", None) is not None:
+        regime_ratio_val = float(args.regime_ratio)
+    else:
+        regime_ratio_val = trial.suggest_float(
+            "regime_ratio",
+            args.regime_ratio_min,
+            args.regime_ratio_max
+        )
+
+    p = {
+        "vidya_len": trial.suggest_int("vidya_len", 8, 24),
+        "vidya_smooth": trial.suggest_int("vidya_smooth", 20, 60),
+        "fastPeriod": trial.suggest_int("fastPeriod", 6, 18),
+        "slowPeriod": trial.suggest_int("slowPeriod", 14, 28),
+        "time_stop_bars": trial.suggest_int("time_stop_bars", 6, 18),
+
+        "regime_ratio": regime_ratio_val,
+
+        "threshold": trial.suggest_float("threshold", 0.0015, 0.008),
+        "vol_floor_mult": trial.suggest_float("vol_floor_mult", 0.02, 0.20),
+        "commission": args.commission_rate_per_side,
+        "fill_mode": "next_open",
+        "use_regime": args.use_regime,
+        "loss_floor": trial.suggest_float("loss_floor", 0.0008, 0.0025),
+        "pf_cap_score_only": args.pf_cap,
+        "cooldown_bars": trial.suggest_int("cooldown_bars", 1, 3),
+        "shift": 0,
+        "smooth_len": 5,
+    }
+
+    # ============================================================
+    # 2. RUN BACKTEST ON ALL TICKERS
+    # ============================================================
+    stats = []
+    for ticker, df in all_data.items():
+        st = backtest_vidya_engine(df, **p)
+        stats.append(st)
+
+    df_stats = pd.DataFrame([s.__dict__ for s in stats])
+    total_tickers = len(df_stats)
+
+    # ============================================================
+    # 3. COVERAGE + ELIGIBLE FILTER
+    # ============================================================
+    eligible_df = df_stats[df_stats["trades"] >= args.min_trades]
+    eligible_count = len(eligible_df)
+    coverage = eligible_count / total_tickers if total_tickers > 0 else 0.0
+
+    # ============================================================
+    # 4. METRIC CALCULATION (Phase F unified)
+    # ============================================================
+    trades_med = eligible_df["trades"].median() if eligible_count > 0 else 0.0
+    pf_med = eligible_df["profit_factor_diag"].median() if eligible_count > 0 else 0.0
+    glpt_med = eligible_df["gl_per_trade"].median() if eligible_count > 0 else 0.0
+    maxdd_med = eligible_df["maxdd"].median() if eligible_count > 0 else 0.0
+    zero_loss_pct = eligible_df["zero_loss"].mean() if eligible_count > 0 else 1.0
+
+    # Spacing metric (fallback)
+    if "spacing_score" in eligible_df.columns:
+        spacing_score = eligible_df["spacing_score"].median()
+    else:
+        spacing_score = trades_med / (eligible_df["trades"].max() + 1e-9)
+
+    # ============================================================
+    # 5. STABILITY (MAD‑based)
+    # ============================================================
+    if eligible_count > 0:
+        indiv_scores = np.asarray([score_trial(st, args) for st in stats])
+        med = np.median(indiv_scores)
+        mad = np.median(np.abs(indiv_scores - med))
+        stability = float(1.0 / (1.0 + mad))
+    else:
+        stability = 0.0
+
+    # ============================================================
+    # 6. UNIFIED SMOOTH PENALTIES — PHASE F
+    # ============================================================
+
+    penalty_mult = 1.0
+
+    # --- Coverage ---
+    penalty_mult *= smooth_penalty(
+        value=coverage,
+        center=args.coverage_target,      # e.g. 0.85
+        steepness=args.coverage_k,        # e.g. 8.0
+        low=0.20,
+        high=1.00
+    )
+
+    # --- Trades (median) ---
+    penalty_mult *= smooth_penalty(
+        value=trades_med,
+        center=2.0,                       # 2 trades = acceptable
+        steepness=1.0,
+        low=0.2,
+        high=1.00
+    )
+
+    # --- GLPT (median) ---
+    penalty_mult *= smooth_penalty(
+        value=glpt_med,
+        center=args.min_glpt,          # e.g. 0.003
+        steepness=args.min_glpt_k,
+        low=0.20,
+        high=1.00
+    )
+
+    # --- Profit Factor (diagnostic PF) ---
+    penalty_mult *= smooth_penalty(
+        value=pf_med,
+        center=args.pf_baseline,
+        steepness=args.pf_k,
+        low=0.20,
+        high=1.00
+    )
+
+    # --- Spacing (median spacing_score) ---
+    penalty_mult *= smooth_penalty(
+        value=spacing_score,
+        center=args.spacing_center,       # e.g. 0.50
+        steepness=args.spacing_steepness, # e.g. 5.0
+        low=0.40,
+        high=1.00
+    )
+
+    # --- Stability (MAD-based) ---
+    penalty_mult *= smooth_penalty(
+        value=stability,
+        center=0.75,
+        steepness=8.0,
+        low=0.40,
+        high=1.00
+    )
+
+    # --- Max Drawdown (invert sign so higher = better) ---
+    penalty_mult *= smooth_penalty(
+        value=-maxdd_med,
+        center=args.dd_center,            # e.g. 0.10
+        steepness=args.dd_steepness,      # e.g. 8.0
+        low=0.40,
+        high=1.00
+    )
+
+    # --- Zero-loss realism (1 - zero_loss_pct) ---
+    penalty_mult *= smooth_penalty(
+        value=1 - zero_loss_pct,
+        center=args.zero_loss_center,     # e.g. 0.70
+        steepness=args.zero_loss_steepness,
+        low=0.40,
+        high=1.00
+    )
+
+    # --- Cap the multiplier ---
+    penalty_mult = min(args.max_penalty_mult, penalty_mult)
+
+    # ============================================================
+    # 7. FINAL SCORE
+    # ============================================================
+    base_score = float(np.mean([score_trial(st, args) for st in stats]))
+    final_score = base_score * penalty_mult
+    return final_score
+
 def main():
     global loaded_data
 
     # --------------------------------------------------------
-    # CLI Arguments# In the argument parser block, after other flags
-
+    # CLI Arguments
     # --------------------------------------------------------
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--n-jobs", type=int, default=1,
-                    help="Number of parallel trial evaluations (default: 1)")
-    ap.add_argument("--n-startup-trials", type=int, default=10,
-                    help="Number of random trials before TPE starts (default: 10)")
+    ap.add_argument("--n-jobs", type=int, default=1)
+    ap.add_argument("--n-startup-trials", type=int, default=10)
     ap.add_argument("--data_dir", type=str, default="data")
     ap.add_argument("--optimize", action="store_true")
     ap.add_argument("--trials", type=int, default=100)
     ap.add_argument("--files", type=int, default=50)
     ap.add_argument("--seed", type=int, default=7)
 
-    # Fill mode: optimization is always done on next_open;
-    # this flag only matters for evaluation/reporting.
     ap.add_argument("--fill", type=str, default="next_open",
                     choices=["next_open", "same_close"])
-
     ap.add_argument("--use-regime", action="store_true")
 
     # Objective modes
@@ -1220,15 +1403,12 @@ def main():
     ap.add_argument("--min-glpt", type=float, default=0.002)
     ap.add_argument("--min-glpt-k", type=float, default=12.0)
 
-    # Return floor penalty
     ap.add_argument("--ret-floor", type=float, default=-0.15)
     ap.add_argument("--ret-floor-k", type=float, default=2.0)
 
-    # PF floor penalty
     ap.add_argument("--pf-floor", type=float, default=1.0)
     ap.add_argument("--pf-floor-k", type=float, default=5.0)
 
-    # Max trades penalty
     ap.add_argument("--max-trades", type=int, default=100)
     ap.add_argument("--max-trades-k", type=float, default=0.1)
 
@@ -1243,52 +1423,62 @@ def main():
     ap.add_argument("--min-trades", type=int, default=5)
     ap.add_argument("--loss_floor", type=float, default=0.001)
 
-    # Threshold + volatility floor
+    # Smooth penalty parameters
+    ap.add_argument("--glpt_target", type=float, default=0.003)
+    ap.add_argument("--spacing_center", type=float, default=0.50)
+    ap.add_argument("--spacing_steepness", type=float, default=5.0)
+    ap.add_argument("--dd_center", type=float, default=0.10)
+    ap.add_argument("--dd_steepness", type=float, default=8.0)
+    ap.add_argument("--zero_loss_center", type=float, default=0.70)
+    ap.add_argument("--zero_loss_steepness", type=float, default=6.0)
+
     ap.add_argument("--threshold-fixed", type=float, default=0.04)
     ap.add_argument("--vol-floor-mult-fixed", type=float, default=0.55)
-
-    # PF cap
     ap.add_argument("--pf-cap", type=float, default=5.0)
 
-    # Coverage penalty
     ap.add_argument("--coverage-target", type=float, default=0.85)
     ap.add_argument("--coverage-k", type=float, default=8.0)
+
+    ap.add_argument("--max-penalty-mult", type=float, default=1.0,
+                    help="Upper bound for the unified smooth penalty multiplier")
 
     # Optimization toggles
     ap.add_argument("--opt-time-stop", action="store_true")
     ap.add_argument("--opt-vidya", action="store_true")
     ap.add_argument("--opt-fastslow", action="store_true")
-    ap.add_argument("--fast-min", type=int, default=5,
-                    help="Minimum value for fastPeriod (fp)")
-    ap.add_argument("--fast-max", type=int, default=18,
-                    help="Maximum value for fastPeriod (fp)")
-    ap.add_argument("--slow-min", type=int, default=20,
-                    help="Minimum value for slowPeriod (sp)")
-    ap.add_argument("--slow-max", type=int, default=90,
-                    help="Maximum value for slowPeriod (sp)")
+    ap.add_argument("--fast-min", type=int, default=5)
+    ap.add_argument("--fast-max", type=int, default=18)
+    ap.add_argument("--slow-min", type=int, default=20)
+    ap.add_argument("--slow-max", type=int, default=90)
     ap.add_argument("--vidya-len-fixed", type=int, default=None)
     ap.add_argument("--vidya-smooth-fixed", type=int, default=None)
     ap.add_argument("--time-stop-fixed", type=int, default=None)
-    
-    # Regime filter tuning (currently not used inside engine, kept for compatibility)
-    ap.add_argument("--regime-min", type=float, default=20)
-    ap.add_argument("--regime-max", type=float, default=4.5)
-    ap.add_argument("--regime-slope-min", type=float, default=0.0)
-    ap.add_argument("--regime-persist", type=int, default=3)
-    ap.add_argument("--regime-ratio-min", type=float, default=2.0)
-    ap.add_argument("--regime-ratio-max", type=float, default=4.0)
 
-    ap.add_argument("--output_dir", type=str, default="output",
-                    help="Directory to save per-ticker CSV and summary TXT")
+# Regime filter arguments
+    ap.add_argument("--regime-min", type=float, default=0.0,
+                    help="Minimum regime slope threshold.")
+    ap.add_argument("--regime-max", type=float, default=5.0,
+                    help="Maximum regime slope threshold.")
 
-    # When True, produce TWO separate CSV files (next_open and same_close).
-    ap.add_argument("--report-both-fills", action="store_true",
-                    help="If set, run evaluation for both fill modes and write two CSVs")
+    ap.add_argument("--regime-slope-min", type=float, default=0.0,
+                    help="Minimum slope for regime filter.")
+    ap.add_argument("--regime-persist", type=int, default=3,
+                    help="Bars required for regime confirmation.")
+
+    # Search range for regime_ratio
+    ap.add_argument("--regime-ratio-min", type=float, default=1.5,
+                    help="Lower bound for regime_ratio search.")
+    ap.add_argument("--regime-ratio-max", type=float, default=5.0,
+                    help="Upper bound for regime_ratio search.")
+
+    # Optional fixed override
+    ap.add_argument("--regime-ratio", type=float, default=None,
+                    help="If provided, overrides Optuna search and fixes regime_ratio.")
+
+    ap.add_argument("--output_dir", type=str, default="output")
+    ap.add_argument("--report-both-fills", action="store_true")
 
     args = ap.parse_args()
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     # --------------------------------------------------------
     # Load data
@@ -1303,156 +1493,65 @@ def main():
     sample_files = random.sample(files, min(len(files), args.files))
     data_list = [(f.stem, ensure_ohlc(pd.read_parquet(f))) for f in sample_files]
     loaded_data = dict(data_list)
-    
-    # --------------------------------------------------------
-    # Optuna Objective (always optimized on next_open fill)
-    # --------------------------------------------------------
-    def objective(trial, args):
-        global loaded_data
-        
-        # 1. PARAMETER SELECTION (Fixed Overrides vs. Optuna Suggestions)
-        params = {
-            "vidya_len": args.vidya_len_fixed if args.vidya_len_fixed is not None 
-                        else trial.suggest_int("vidya_len", 10, 30),
-            
-            "vidya_smooth": args.vidya_smooth_fixed if args.vidya_smooth_fixed is not None 
-                            else trial.suggest_int("vidya_smooth", 30, 60),
-            
-            "fastPeriod": trial.suggest_int("fastPeriod", args.fast_min, args.fast_max),
-            "slowPeriod": trial.suggest_int("slowPeriod", args.slow_min, args.slow_max),
-            
-            "time_stop_bars": args.time_stop_fixed if args.time_stop_fixed is not None 
-                            else trial.suggest_int("time_stop_bars", 5, 30),
-            
-            "threshold": args.threshold_fixed if args.threshold_fixed != 0.04 
-                        else trial.suggest_float("threshold", 0.002, 0.015),
-                        
-            "loss_floor": args.loss_floor if args.loss_floor != 0.001 
-                        else trial.suggest_float("loss_floor", 0.0001, 0.001),
-
-            "regime_ratio": trial.suggest_float("regime_ratio", 1.5, 5.0),
-            "commission": args.commission_rate_per_side,
-            "fill_mode": args.fill,
-            "use_regime": args.use_regime if args.use_regime else trial.suggest_categorical("use_regime", [True, False]),
-            "cooldown_bars": 1
-        }
-
-        ticker_results = []
-        total_tickers = len(loaded_data)
-
-        # 2. RUN BACKTEST ENGINE
-        for ticker, df_data in loaded_data.items():
-            # Pass the parameters as unpacked keyword arguments
-            res = backtest_vidya_engine(df_data, **params)
-            
-            res_dict = res.__dict__
-            res_dict['ticker'] = ticker
-            ticker_results.append(res_dict)
-
-        df_res = pd.DataFrame(ticker_results)
-        traded_df = df_res[df_res['trades'] > 0]
-        
-        # 3. GRADIENT FLOW PROTECTION
-        # If no trades occur with these settings, return a penalty to guide Optuna away.
-        if len(traded_df) == 0:
-            return -1.0 
-
-        # 4. METRIC CALCULATION
-        coverage = len(traded_df) / total_tickers
-        median_expectancy = traded_df['gl_per_trade'].median() 
-        ticker_win_rate = (traded_df['tot_ret'] > 0).mean()
-
-        # 5. PENALTIES (Multiplier approach for stability)
-        avg_trades = traded_df['trades'].mean()
-        trade_mult = min(1.0, avg_trades / 3.0) # Penalize settings with < 3 trades/ticker
-        
-        high_dd_penalty = (traded_df['maxdd'] < -0.10).mean()
-        dd_mult = 1.0 - (high_dd_penalty * 0.5) # Penalize strategies causing > 10% DD
-
-        # 6. FINAL SCORE CALCULATION
-        # Formula: Profitability * Reliability * Coverage * Penalties
-        final_score = (
-            median_expectancy * (ticker_win_rate + 0.5) * coverage * trade_mult * dd_mult
-        )
-
-        return float(final_score)
 
     # --------------------------------------------------------
-    # Run Optuna (if requested)
+    # Wrap objective correctly
+    # --------------------------------------------------------
+    def wrapped_objective(trial):
+        return objective(trial, loaded_data, args)
+
+    # --------------------------------------------------------
+    # Run Optuna
     # --------------------------------------------------------
     if args.optimize:
         sampler = optuna.samplers.TPESampler(
             n_startup_trials=args.n_startup_trials,
-            seed=args.seed if args.seed is not None else None
+            seed=args.seed
         )
 
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=sampler,
-        )
+        study = optuna.create_study(direction="maximize", sampler=sampler)
 
-        # Use a wrapper that doesn't capture args via closure
-        def wrapped_objective(trial):
-            return objective(trial, args)  # still captures, but see below
-
-        # Better: pass args explicitly if possible, or use global (not recommended)
-        # Alternative A: keep n_jobs=1 for safety (recommended on Windows)
         study.optimize(
             wrapped_objective,
             n_trials=args.trials,
-            n_jobs=1,                    # force 1 on Windows
-            callbacks=[TQDMProgressBarCallback()] if TQDMProgressBarCallback is not None else None,
+            n_jobs=1,
+            callbacks=[TQDMProgressBarCallback()] if TQDMProgressBarCallback else None,
             show_progress_bar=True
         )
 
-        # --- AFTER OPTIMIZATION ---
-        # 1. Get best results from Optuna
         best_params = study.best_trial.params
 
-        # 2. Ensure ALL overrides (fixed args) are included for the report
-        # If these aren't in best_params, the report will use old defaults
+        # Merge fixed overrides
         overrides = {
             "vidya_len": args.vidya_len_fixed,
             "vidya_smooth": args.vidya_smooth_fixed,
             "time_stop_bars": args.time_stop_fixed,
             "threshold": args.threshold_fixed,
             "loss_floor": args.loss_floor,
-            "fastPeriod": args.fast_min,
-            "slowPeriod": args.slow_min,
-            "regime_ratio": args.regime_ratio if hasattr(args, 'regime_ratio') else None          
+            "regime_ratio": args.regime_ratio_min,
         }
-        # Merge overrides into best_params (ignoring None values)
         best_params.update({k: v for k, v in overrides.items() if v is not None})
 
         best = dict(best_params)
-        print(f"Best trial: {study.best_trial.number}")
-        print(f"Best value: {study.best_value:.6f}")
-        print(f"Best params: {best}")
 
     else:
-        # When not optimizing, use the passed parameters
         best = {
             "vidya_len": args.vidya_len_fixed,
             "vidya_smooth": args.vidya_smooth_fixed,
             "fastPeriod": args.fast_min,
             "slowPeriod": args.slow_min,
             "time_stop_bars": args.time_stop_fixed,
-            "regime_ratio": args.regime_ratio if hasattr(args, 'regime_ratio') else 3.0,
+            "regime_ratio": args.regime_ratio_min,
         }
-        print("Running with user-provided parameters (no optimization)")
-        
+
     # --------------------------------------------------------
-    # Build best parameter set (for next_open baseline)
+    # Build best parameter set for evaluation
     # --------------------------------------------------------
-    # Handle both "short" keys (vl, vs) and "full" keys (vidya_len, vidya_smooth)
     def get_param(best_dict, short_key, full_key, default):
-        # Try full key first (used in optimization)
         if full_key in best_dict:
             return best_dict[full_key]
-        # Try short key (used in non-optimization fallback)
         if short_key in best_dict:
             return best_dict[short_key]
-        # Default fallback
         return default
 
     best_p = {
@@ -1466,7 +1565,7 @@ def main():
         "vol_floor_mult": args.vol_floor_mult_fixed,
         "commission": args.commission_rate_per_side,
         "fill_mode": "next_open",
-        "use_regime": bool(best.get("use_regime", args.use_regime)), 
+        "use_regime": bool(best.get("use_regime", args.use_regime)),
         "loss_floor": args.loss_floor,
         "pf_cap_score_only": args.pf_cap,
         "cooldown_bars": 1,
@@ -1478,11 +1577,7 @@ def main():
     # Evaluation + Reporting
     # --------------------------------------------------------
     def run_eval(fill_mode: str, suffix: str):
-        """
-        Evaluate the best parameters on the selected data files.
-        Produces a CSV with per-ticker results and computes global aggregate metrics.
-        """
-        p = dict(best_p)  # best_p comes from earlier Optuna best params
+        p = dict(best_p)
         p["fill_mode"] = fill_mode
 
         stats = []
@@ -1491,10 +1586,6 @@ def main():
         for name, df in data_list:
             st = backtest_vidya_engine(df, **p)
             stats.append(st)
-            
-            # Per-ticker score (using your existing score_trial function)
-            score = score_trial(st, args)
-
             rows.append({
                 "ticker": name,
                 "gp": st.gp,
@@ -1510,64 +1601,36 @@ def main():
                 "pf_capped": st.pf_capped,
                 "gl_per_trade": st.gl_per_trade,
                 "atr_pct_med": st.atr_pct_med,
-                "score": score,
-                # "fill_mode": fill_mode,
+                "score": score_trial(st, args),
             })
 
-        # Save per-ticker results
         now = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y%m%d_%H%M%S")
-
         df_out = pd.DataFrame(rows)
-        csv_path = out_dir / f"{MODULE_PREFIX}per_ticker_{suffix}_{now}.csv"
+        csv_path = Path(args.output_dir) / f"{MODULE_PREFIX}per_ticker_{suffix}_{now}.csv"
         df_out.to_csv(csv_path, index=False)
 
-        # ───────────────────────────────────────────────────────────────
-        # Compute global aggregate metrics (fixed version)
-        # ───────────────────────────────────────────────────────────────
         eligible_stats = [s for s in stats if s.trades >= args.min_trades]
-        
-        if not eligible_stats:
-            print(f"Warning: No symbols with >= {args.min_trades} trades for {fill_mode}")
-            agg = 0.0
-            pen = {"penalty_mult": 0.0}  # or whatever default you want
-            stab = 0.0
-            coverage = 0.0
-        else:
-            # ── ADD THE SAFE MEDIANS HERE ──
-            pf_med = float(np.nanmedian([s.profit_factor_diag for s in eligible_stats])) if eligible_stats else 0.0
-            glpt_med = float(np.nanmedian([s.gl_per_trade for s in eligible_stats])) if eligible_stats else 0.0
-            ret_med = float(np.nanmedian([s.tot_ret for s in eligible_stats])) if eligible_stats else 0.0
-            trades_med = float(np.nanmedian([s.trades for s in eligible_stats])) if eligible_stats else 0.0
+        coverage = len(eligible_stats) / len(stats) if stats else 0.0
+        stab = stability_score(stats, args)
 
-            # Call the aggregate function with the correct arguments
-            agg = robust_objective_aggregate(
-                pf_med=pf_med,
-                glpt_med=glpt_med,
-                ret_med=ret_med,
-                trades_med=trades_med,
-                weight_pf=args.weight_pf,
-                score_power=args.score_power   # or use your global SCORE_POWER constant if preferred
-            )
+        pf_med = np.nanmedian([s.profit_factor_diag for s in eligible_stats]) if eligible_stats else 0.0
+        glpt_med = np.nanmedian([s.gl_per_trade for s in eligible_stats]) if eligible_stats else 0.0
+        ret_med = np.nanmedian([s.tot_ret for s in eligible_stats]) if eligible_stats else 0.0
+        trades_med = np.nanmedian([s.trades for s in eligible_stats]) if eligible_stats else 0.0
 
-            # Compute stability and coverage
-            stab = stability_score(stats, args)  # your existing function
-            coverage = len(eligible_stats) / len(stats)
+        agg = robust_objective_aggregate(
+            pf_med=pf_med,
+            glpt_med=glpt_med,
+            ret_med=ret_med,
+            trades_med=trades_med,
+            weight_pf=args.weight_pf,
+            score_power=args.score_power
+        )
 
-            # Compute penalties (using your existing function)
-            pen = objective_penalty_multiplier(stats, args)
+        pen = objective_penalty_multiplier(stats, args)
 
-        # --------------------------------------------------
-        # FINAL OBJECTIVE SCORE (escape zero-penalty plateau)
-        # --------------------------------------------------
-        raw_score = agg
-        penalty_mult = pen.get("penalty_mult", 0.0)
+        final_score = agg * max(pen.get("penalty_mult", 0.1), 0.1)
 
-        if penalty_mult == 0 or penalty_mult < 1e-3:
-            final_score = float(raw_score * 0.1)   # escape zero plateau
-        else:
-            final_score = float(raw_score * penalty_mult)
-
-        # Return dictionary with all computed metrics
         return {
             "stats": stats,
             "agg": agg,
@@ -1578,64 +1641,40 @@ def main():
             "csv_path": csv_path,
         }
 
-    # Always run baseline next_open
     res_next = run_eval("next_open", "next_open")
-
-    # Optionally run same_close
-    res_same = None
-    if args.report_both_fills:
-        res_same = run_eval("same_close", "same_close")
+    res_same = run_eval("same_close", "same_close") if args.report_both_fills else None
 
     # --------------------------------------------------------
     # Summary TXT
     # --------------------------------------------------------
     now = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y%m%d_%H%M%S")
-    summary_path = out_dir / f"{MODULE_PREFIX}best_{now}.txt"
+    summary_path = Path(args.output_dir) / f"{MODULE_PREFIX}best_{now}.txt"
 
     with summary_path.open("w") as f:
-        f.write(f"Vidya_RSI Hybrid Adaptive — Summary\n")
+        f.write("Vidya_RSI Hybrid Adaptive — Summary\n")
         f.write(f"Generated: {now}\n")
         f.write(f"Data dir: {args.data_dir}\n")
         f.write(f"Files used: {len(data_list)} (requested {args.files})\n")
-        f.write(f"Optimize: {args.optimize} (trials={args.trials})\n")
-        f.write("\nBest parameters (Optuna / effective):\n")
+        f.write(f"Optimize: {args.optimize} (trials={args.trials})\n\n")
+
+        f.write("Best parameters:\n")
         for k, v in best_p.items():
             f.write(f"  {k}: {v}\n")
 
-        def write_block(label: str, res):
+        def write_block(label, res):
             f.write(f"\n=== {label} ===\n")
             f.write(f"Objective aggregate (raw): {res['agg']:.6f}\n")
             f.write(f"Final score (penalized): {res['final_score']:.6f}\n")
-
             f.write(f"Coverage: {res['coverage']:.3f}\n")
             f.write(f"Stability: {res['stab']:.6f}\n")
-            
-            pen = res["pen"]
-            f.write("Penalties:\n")
-            f.write(f"  penalty_mult: {pen.get('penalty_mult', 0.0):.6f}\n")
-            f.write(f"  zero_loss_pct: {pen.get('zero_loss_pct', 0.0):.3f}\n")
-            f.write(f"  cap_pct: {pen.get('cap_pct', 0.0):.3f}\n")
-            
-            # Use args for targets (safe with .get() if key missing)
-            f.write(f"  glpt_med: {pen.get('glpt_med', 0.0):.6f} (target {args.min_glpt:.6f})\n")
-            f.write(f"  ret_med: {pen.get('ret_med', 0.0):.6f} (floor {args.ret_floor:.6f})\n")
-            f.write(f"  pf_med: {pen.get('pf_med', 0.0):.6f} (floor {args.pf_floor if hasattr(args, 'pf_floor') else 1.0:.6f})\n")
-            f.write(f"  trades_med: {pen.get('trades_med', 0.0):.3f}\n")  # no target for trades usually
-            
-            # Optional: add vol_med if you have it in pen
-            if 'vol_med' in pen:
-                f.write(f"  vol_med (ATR%): {pen['vol_med']:.6f}\n")
-            
-            f.write(f"  eligible_count: {len([s for s in res['stats'] if s.trades >= args.min_trades])} / total_count: {len(res['stats'])}\n")
-            
+
         write_block("next_open baseline", res_next)
-        if res_same is not None:
+        if res_same:
             write_block("same_close evaluation", res_same)
 
-    # Also print a short console summary
     print("Vidya_RSI Hybrid Adaptive — done.")
     print(f"next_open CSV: {res_next['csv_path']}")
-    if res_same is not None:
+    if res_same:
         print(f"same_close CSV: {res_same['csv_path']}")
     print(f"Summary TXT: {summary_path}")
 
