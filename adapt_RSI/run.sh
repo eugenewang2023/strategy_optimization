@@ -1,141 +1,264 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
-set +x   # force-disable xtrace if inherited
 
-###=================================================================================
-### PHASE-4 (Two-Regime High-Density Aggression)
-### Goal: Push trades to 10+ | Balanced Trend/Chop scoring | Forced Rotation
-###=================================================================================
+# ───────────────────────────────────────────────────────────────
+# Configuration & Defaults
+# ───────────────────────────────────────────────────────────────
+SCRIPT_NAME="$(basename "$0")"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+command -v "$PYTHON_BIN" >/dev/null 2>&1 || PYTHON_BIN="python"
 
-# --- run from script directory ---
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+# Default hardware/execution settings
+SEED=7
+TRIALS=300
+FILES=300
+FILL_MODE="next_open"
+DATA_DIR="data"
+LOG_DIR="logs"
+N_JOBS=4
+N_STARTUP_TRIALS=200
 
-# --- python resolver ---
-PYTHON_BIN="${PYTHON_BIN:-}"
-if [[ -z "${PYTHON_BIN}" ]]; then
-  if command -v python3 >/dev/null 2>&1; then
-    PYTHON_BIN="python3"
-  elif command -v python >/dev/null 2>&1; then
-    PYTHON_BIN="python"
-  else
-    echo "ERROR: python/python3 not found in PATH" >&2
-    exit 1
-  fi
-fi
+# Strategy / Scoring related defaults (adjusted for adapt_RSI.py)
+TRADES_BASELINE=8.0
+COMMISSION=0.0006
+PF_BASELINE=1.8
+PF_K=1.5
+MIN_TRADES_PHASED=(2 3 4 5 6 8)
 
-# --- reproducibility ---
-seed=7
+SELECTED_PHASES=()
 
-nTrials=1500      # Sufficient trials to explore the sensitive search space
-nFiles=300
-fillOpt=next_open
+# ───────────────────────────────────────────────────────────────
+# Usage / Help
+# ───────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+Usage: $SCRIPT_NAME [OPTIONS] [phase_code ...]
+Multi-phase adapt_RSI optimization runner
 
-# 1) Trade gating (AGGRESSIVE TARGETS)
-min_trades=5
-trades_baseline=10.0  # Crucial: Rewards peak at 10 trades per ticker
-trades_k=0.4          # Punishes low frequency heavily
-max_trades=250        # High ceiling for momentum runners
-max_trades_k=0.03
+Options:
+  --seed INT        Random seed (default: $SEED)
+  --trials INT      Trials per phase (default: $TRIALS)
+  --files INT       Number of data files (default: $FILES)
+  --fill MODE       Fill mode: next_open | same_close (default: $FILL_MODE)
+  --n-jobs INT      Parallel trials (default: $N_JOBS)
+  --dry-run         Show commands without executing
+  --help            Show this help
 
-# 2) Returns & penalties
-ret_floor=0.01        # Low enough to capture micro-momentum
-ret_floor_k=8.0       # Steep tail protection
-penalty_center=0.0    
-penalty_k=6.0
+Phases (runs D,E,F if none specified):
+  A     Wide / discovery phase
+  B     Robustness formation
+  C     Expectancy tightening
+  D     Institutional stability
+  E     High-expectancy tightening
+  F     Final institutional tightening
+EOF
+    exit "${1:-0}"
+}
 
-# 3) PF shaping
-pf_cap=5.0            # Keeps Optuna focused on consistency over "lottery" wins
-pf_baseline=1.02      
-pf_k=1.2              
-pf_floor=1.0
-pf_floor_k=1.5
+# ───────────────────────────────────────────────────────────────
+# Parse Arguments
+# ───────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --seed)          SEED="$2"; shift 2 ;;
+        --trials)        TRIALS="$2"; shift 2 ;;
+        --files)         FILES="$2"; shift 2 ;;
+        --fill)          FILL_MODE="$2"; shift 2 ;;
+        --n-jobs)        N_JOBS="$2"; shift 2 ;;
+        --dry-run)       DRY_RUN=true; shift ;;
+        --help|-h)       usage 0 ;;
+        A|B|C|D|E|F)     SELECTED_PHASES+=("$1"); shift ;;
+        *) echo "Unknown option: $1"; usage 1 ;;
+    esac
+done
 
-# 4) Scoring balance
-weight_pf=0.40        # Favors trade count and stability over raw PF
-score_power=1.1       
-coverage_target=0.85  # Targets high participation across tickers
-coverage_k=8.0
+# Default phases if none selected
+[[ ${#SELECTED_PHASES[@]} -eq 0 ]] && SELECTED_PHASES=(A B C D E F)
 
-# 5) Execution (FORCED ROTATION)
-commission_per_side=0.0006
-loss_floor=0.001
-cooldown=1            # FORCED: Immediate re-entry allowed
-time_stop=15          # FORCED: Fast rotation (15-bar max hold)
+mkdir -p "$LOG_DIR"
 
-# 6) Risk constraint
-min_tp2sl=1.10
+# ───────────────────────────────────────────────────────────────
+# Phase Definitions
+#     min_trades  weight_pf  score_power  ret_floor  ret_floor_k  pf_floor_k
+# ───────────────────────────────────────────────────────────────
+declare -A PHASE_PARAMS
+declare -A PHASE_NAMES
 
-# 7) SIGNAL REGIME (LOCKED)
-threshold_mode="fixed"
-threshold_fixed=0.04
-vol_floor_len=50
-vol_floor_mult_fixed=0.55
+PHASE_PARAMS["A"]="2 0.40 1.10 -0.40 1.00 0.0008"
+PHASE_NAMES["A"]="Discovery: wide search"
 
-# 8) Two-Regime Scoring Knobs
-# Pivot point: 1.2 Return/DD ratio defines a "Trend"
-trend_center=1.20
-trend_k=4.0
+PHASE_PARAMS["B"]="3 0.60 1.40 -0.22 1.60 0.00120"
+PHASE_NAMES["B"]="Robustness formation"
 
-CMD=(
-  "$PYTHON_BIN" Bayes_opt_adapt_RSI.py
-  --optimize
-  --seed "$seed"
-  --trials "$nTrials"
-  --files "$nFiles"
-  --fill "$fillOpt"
+PHASE_PARAMS["C"]="4 0.70 1.45 -0.22 1.95 0.00110"
+PHASE_NAMES["C"]="Expectancy tightening"
 
-  --penalty
-  --penalty-ret-center "$penalty_center"
-  --penalty-ret-k "$penalty_k"
+PHASE_PARAMS["D"]="5 0.75 1.75 -0.12 2.20 0.00140"
+PHASE_NAMES["D"]="Institutional stability"
 
-  --min-trades "$min_trades"
-  --trades-baseline "$trades_baseline"
-  --trades-k "$trades_k"
-  --max-trades "$max_trades"
-  --max-trades-k "$max_trades_k"
+PHASE_PARAMS["E"]="6 0.80 1.90 -0.08 2.50 0.00155"
+PHASE_NAMES["E"]="High-expectancy tightening"
 
-  --ret-floor "$ret_floor"
-  --ret-floor-k "$ret_floor_k"
+PHASE_PARAMS["F"]="8 0.85 2.10 -0.05 3.00 0.00170"
+PHASE_NAMES["F"]="Final institutional"
 
-  --pf-cap "$pf_cap"
-  --pf-baseline "$pf_baseline"
-  --pf-k "$pf_k"
-  --pf-floor "$pf_floor"
-  --pf-floor-k "$pf_floor_k"
+# ───────────────────────────────────────────────────────────────
+# Runner Function
+# ───────────────────────────────────────────────────────────────
+run_phase() {
+    local phase_code="$1"
+    local params="${PHASE_PARAMS[$phase_code]}"
 
-  --weight-pf "$weight_pf"
-  --score-power "$score_power"
+    IFS=' ' read -r \
+        min_trades weight_pf score_power \
+        ret_floor ret_floor_k pf_floor_k <<< "$params"
 
-  --commission_rate_per_side "$commission_per_side"
-  --loss_floor "$loss_floor"
+    local phase_name="${PHASE_NAMES[$phase_code]}"
+    local log_file="$LOG_DIR/phase_${phase_code}_adapt_RSI.log"
 
-  --cooldown "$cooldown"
-  --time-stop "$time_stop"
-  --opt-time-stop
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo " PHASE $phase_code : $phase_name   (adapt_RSI)"
+    echo " min_trades     : $min_trades"
+    echo " weight-pf      : $weight_pf"
+    echo " score-power    : $score_power"
+    echo " ret-floor      : $ret_floor"
+    echo "═══════════════════════════════════════════════════════════════"
 
-  --min-tp2sl "$min_tp2sl"
+    local CMD=(
+        "$PYTHON_BIN" adapt_RSI.py
+        --seed               "$SEED"
+        --trials             "$TRIALS"
+        --files              "$FILES"
+        --fill               "$FILL_MODE"
+        --data_dir           "$DATA_DIR"
+        --output_dir         "output_adapt_RSI_phase_${phase_code}"
+        --optimize
 
-  --coverage-target "$coverage_target"
-  --coverage-k "$coverage_k"
+        # Core scoring parameters
+        --min-trades         "$min_trades"
+        --trades-baseline    "$TRADES_BASELINE"
+        --weight-pf          "$weight_pf"
+        --score-power        "$score_power"
+        --ret-floor          "$ret_floor"
+        --ret-floor-k        "$ret_floor_k"
+        --pf-floor-k         "$pf_floor_k"
 
-  --threshold-mode "$threshold_mode"
-  --threshold-fixed "$threshold_fixed"
-  --vol-floor-len "$vol_floor_len"
-  --vol-floor-mult-fixed "$vol_floor_mult_fixed"
+        --commission_rate_per_side "$COMMISSION"
+        --pf-baseline        "$PF_BASELINE"
+        --pf-k               "$PF_K"
 
-  --trend-center "$trend_center"
-  --trend-k "$trend_k"
+        # Adaptive RSI specific parameters
+        --basePeriod-fixed   20
+        --minPeriod-fixed    5
+        --maxPeriod-fixed    35
+        --fastPeriod-fixed   4
+        --slowPeriod-fixed   50
+        --smooth_len-fixed   5
+        --shift-fixed        0
+        --threshold-fixed    0.5
+        --threshold-mode     "dynamic"
+        --threshold-floor    0.1
+        --threshold-std-mult 0.5
+        --vol-floor-mult-fixed 1.0
+        --vol-floor-len      100
+        
+        # Trend scoring
+        --trend-center       0.80
+        --trend-k           3.0
+        
+        # Coverage control
+        --coverage-target    0.70
+        --coverage-k         12.0
 
-  --opt-adaptive
-  --opt-fastslow
-)
+        # Optimization toggles
+        --opt-adaptive
+        --opt-fastslow
+        --opt-time-stop
+        --opt-cooldown
 
-echo "-------------------------------------------------------"
-echo "PHASE-4: TWO-REGIME AGGRESSION (Target: 10+ trades)"
-echo "Baseline: ${trades_baseline} | Cooldown: ${cooldown} | Time-Stop: ${time_stop}"
-echo "Trend Pivot: ${trend_center} | Coverage Target: ${coverage_target}"
-echo "-------------------------------------------------------"
+        # Exit parameters (pass boolean values)
+        --use_trailing_exit  "True"
+        --trail_mode         "trail_only"
+        --close_on_sellSignal "True"
 
-# Execute
-"${CMD[@]}"
+        # TP/SL constraints
+        --tp2sl-auto
+        --tp2sl-base         1.25
+        --tp2sl-sr0          30.0
+        --tp2sl-k            0.01
+        --tp2sl-min          1.10
+        --tp2sl-max          1.80
+
+        # Penalty settings
+        --penalty
+        --loss_floor         0.001
+        --penalty-ret-center -0.02
+        --penalty-ret-k      8.0
+        
+        # Trade limits
+        --max-trades         60
+        --max-trades-k       0.15
+        --pf-floor           1.0
+        --pf-cap             12.0
+    )
+    
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+        echo "DRY RUN COMMAND:"
+        printf '  %s\n' "${CMD[@]}"
+        echo ""
+    else
+        echo "Running phase $phase_code..."
+        echo "→ Log: $log_file"
+        echo ""
+
+        if ! "${CMD[@]}" 2>&1 | tee "$log_file"; then
+            local exit_code=${PIPESTATUS[0]}
+            echo "ERROR: Phase $phase_code failed (exit $exit_code)"
+            echo "See: $log_file"
+            return $exit_code
+        fi
+    fi
+
+    echo "Phase $phase_code completed."
+    echo ""
+}
+
+# ───────────────────────────────────────────────────────────────
+# Main Execution
+# ───────────────────────────────────────────────────────────────
+echo "Starting adapt_RSI Optimization Sweep..."
+echo "Seed       : $SEED"
+echo "Trials/phase: $TRIALS"
+echo "Parallel jobs: $N_JOBS"
+echo "Files       : $FILES"
+echo "Phases      : ${SELECTED_PHASES[*]}"
+echo "Python      : $PYTHON_BIN"
+echo ""
+
+# Validate phases
+for phase in "${SELECTED_PHASES[@]}"; do
+    if [[ -z "${PHASE_PARAMS[$phase]:-}" ]]; then
+        echo "ERROR: Phase '$phase' not defined."
+        exit 1
+    fi
+done
+
+# Run selected phases
+for phase in "${SELECTED_PHASES[@]}"; do
+    if ! run_phase "$phase"; then
+        echo "FATAL: Phase $phase failed → stopping."
+        exit 1
+    fi
+
+    if [[ "$phase" != "${SELECTED_PHASES[-1]}" ]]; then
+        echo "--- Pausing 3 seconds before next phase ---"
+        sleep 3
+    fi
+done
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "Multi-phase adapt_RSI optimization complete."
+echo "Logs: $LOG_DIR/"
+echo "═══════════════════════════════════════════════════════════════"

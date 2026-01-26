@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bayes_opt_adapt_half_RSI.py  —  with clean, timestamped result saving + module prefix
+adapt_half_RSI.py  —  with clean, timestamped result saving + module prefix
 Saves:
 - adapt_half_RSI_per_ticker_YYYYMMDD_HHMMSS.csv
 - adapt_half_RSI_best_YYYYMMDD_HHMMSS.txt
@@ -562,22 +562,22 @@ def parse_args():
     ap.add_argument("--score-power", type=float, default=1.0)
     ap.add_argument("--min-trades", type=int, default=8)
     ap.add_argument("--penalty", action="store_true")
-    ap.add_argument("--loss-floor", type=float, default=0.001)
-    ap.add_argument("--penalty-ret-center", type=float, default=-0.02)   # required
-    ap.add_argument("--penalty-ret-k", type=float, default=8.0)          # required
+    ap.add_argument("--loss-floor", type=float, default=0.001, dest="loss_floor")
+    ap.add_argument("--penalty-ret-center", type=float, default=-0.02)
+    ap.add_argument("--penalty-ret-k", type=float, default=8.0)
     ap.add_argument("--ret-floor", type=float, default=0.0)
     ap.add_argument("--ret-floor-k", type=float, default=8.0)
-    ap.add_argument("--max-trades", type=int, default=60)                # required
-    ap.add_argument("--max-trades-k", type=float, default=0.15)          # required
+    ap.add_argument("--max-trades", type=int, default=60)
+    ap.add_argument("--max-trades-k", type=float, default=0.15)
     ap.add_argument("--pf-floor", type=float, default=1.0)
     ap.add_argument("--pf-floor-k", type=float, default=6.0)
 
     ap.add_argument("--fill", type=str, default="same_close", choices=["same_close", "next_open"])
 
-    # Exits
-    ap.add_argument("--use_trailing_exit", type=bool, default=True)
+    # Exits - FIXED: Changed from type=bool to action='store_true' for proper boolean handling
+    ap.add_argument("--use_trailing_exit", action="store_true", default=True)
     ap.add_argument("--trail_mode", type=str, default="trail_only", choices=["trail_only", "trail_plus_hard_sl"])
-    ap.add_argument("--close_on_sellSignal", type=bool, default=True)
+    ap.add_argument("--close_on_sellSignal", action="store_true", default=True)
 
     # Cooldown / time stop
     ap.add_argument("--cooldown", type=int, default=1)
@@ -585,7 +585,7 @@ def parse_args():
     ap.add_argument("--time-stop", type=int, default=0)
     ap.add_argument("--opt-time-stop", action="store_true")
 
-    # TP/SL constraint
+    # TP/SL constraint - ADDED FROM half_RSI.py
     ap.add_argument("--min-tp2sl", type=float, default=1.30)
     ap.add_argument("--tp2sl-auto", action="store_true")
     ap.add_argument("--tp2sl-base", type=float, default=1.25)
@@ -594,7 +594,7 @@ def parse_args():
     ap.add_argument("--tp2sl-min", type=float, default=1.10)
     ap.add_argument("--tp2sl-max", type=float, default=1.80)
 
-    # Coverage
+    # Coverage - ADDED FROM adapt_RSI.py
     ap.add_argument("--coverage-target", type=float, default=0.70)
     ap.add_argument("--coverage-k", type=float, default=12.0)
 
@@ -615,6 +615,10 @@ def parse_args():
     ap.add_argument("--shift-fixed", type=int, default=0)
     ap.add_argument("--smooth_len-fixed", type=int, default=12)
 
+    # ADDED: Boolean flags to disable trailing exit features if needed
+    ap.add_argument("--no-use_trailing_exit", action="store_false", dest="use_trailing_exit")
+    ap.add_argument("--no-close_on_sellSignal", action="store_false", dest="close_on_sellSignal")
+
     return ap.parse_args()
 
 
@@ -623,6 +627,7 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    # TP/SL constraint validation - ADDED FROM half_RSI.py
     if args.tp2sl_auto:
         if args.tp2sl_min <= 0 or args.tp2sl_max <= 0:
             raise SystemExit("--tp2sl-min and --tp2sl-max must be > 0")
@@ -631,6 +636,12 @@ def main():
     else:
         if args.min_tp2sl <= 0:
             raise SystemExit("--min-tp2sl must be > 0")
+
+    # Coverage validation - ADDED FROM adapt_RSI.py
+    if not (0.0 <= args.coverage_target <= 1.0):
+        raise SystemExit("--coverage-target must be in [0, 1]")
+    if args.coverage_k <= 0:
+        raise SystemExit("--coverage-k must be > 0")
 
     data_dir = Path(args.data_dir)
     out_dir = Path(args.output_dir)
@@ -645,6 +656,7 @@ def main():
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     ROBUST_FILLS = ["same_close", "next_open"]
 
+    # ADDED FROM half_RSI.py: TP/SL constraint function
     def min_tp2sl_eff_for(atr_val: int) -> float:
         if args.tp2sl_auto:
             v = args.tp2sl_base + args.tp2sl_k * (float(atr_val) - float(args.tp2sl_sr0))

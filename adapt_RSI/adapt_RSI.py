@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bayes_opt_adapt_RSI.py  —  with clean, timestamped result saving + module prefix
+adapt_RSI.py  —  with clean, timestamped result saving + module prefix
 Saves:
 - adapt_RSI_per_ticker_YYYYMMDD_HHMMSS.csv
 - adapt_RSI_best_YYYYMMDD_HHMMSS.txt
@@ -91,6 +91,16 @@ def crossover(a_prev, a_now, b_prev, b_now):
 
 def crossunder(a_prev, a_now, b_prev, b_now):
     return (a_prev >= b_prev) and (a_now < b_now)
+
+
+def shift_series(x: np.ndarray, shift: int) -> np.ndarray:
+    """Shift series forward by 'shift' positions (like TradingView's offset)"""
+    n = len(x)
+    out = np.full(n, np.nan, dtype=float)
+    if shift <= 0:
+        return x.astype(float, copy=True)
+    out[shift:] = x[:-shift]
+    return out
 
 
 # =============================
@@ -211,6 +221,9 @@ def backtest_adapt_rsi_dynamic_engine(
     tpMult: float,
     commission_per_side: float,
     fill_mode: str,
+    use_trailing_exit: bool = True,
+    trail_mode: str = "trail_only",
+    close_on_sellSignal: bool = True,
     cooldown_bars: int,
     time_stop_bars: int,
     basePeriod: int,
@@ -227,6 +240,7 @@ def backtest_adapt_rsi_dynamic_engine(
     vol_floor_len: int,
     loss_floor: float,
     pf_cap_score_only: float,
+    shift: int = 0,
 ) -> TradeStats:
     df = ensure_ohlc(df)
     o = df["open"].to_numpy(dtype=float)
@@ -267,6 +281,7 @@ def backtest_adapt_rsi_dynamic_engine(
     fp = max(1, int(fastPeriod))
     sp = max(fp + 1, int(slowPeriod))
     sm = max(1, int(smooth_len))
+    sh = max(0, int(shift))
 
     base_rsi = rsi_tv(sigClose, baseP)
     k_sigmoid = 1.0 / (1.0 + np.exp(-0.1 * (base_rsi - 50.0)))
@@ -284,9 +299,19 @@ def backtest_adapt_rsi_dynamic_engine(
         if p in rsi_map:
             adaptive_rsi[i] = rsi_map[p][i]
 
-    fast_rsi = ema_tv(adaptive_rsi, fp)
-    slow_rsi = ema_tv(adaptive_rsi, sp)
-    hot_sm = sma(fast_rsi - slow_rsi, sm)
+    fast_rsi_raw = ema_tv(adaptive_rsi, fp)
+    slow_rsi_raw = ema_tv(adaptive_rsi, sp)
+    
+    # Apply shift if specified
+    if sh > 0:
+        fast_rsi = shift_series(fast_rsi_raw, sh)
+        slow_rsi = shift_series(slow_rsi_raw, sh)
+    else:
+        fast_rsi = fast_rsi_raw
+        slow_rsi = slow_rsi_raw
+    
+    hot = fast_rsi - slow_rsi
+    hot_sm = sma(hot, sm)
 
     # Dynamic threshold
     if threshold_mode == "dynamic":
@@ -312,6 +337,12 @@ def backtest_adapt_rsi_dynamic_engine(
     bars_in_trade = 0
     ts_bars = max(0, int(time_stop_bars))
     has_hit_be = False
+    
+    # Trailing exit variables
+    trail_active = False
+    trail_stop = np.nan
+    trail_high_since = np.nan
+    trail_dist = np.nan
 
     def apply_commission(eq: float) -> float:
         return eq * (1.0 - commission_per_side)
@@ -328,8 +359,12 @@ def backtest_adapt_rsi_dynamic_engine(
 
         th = float(dyn_thresh[i])
 
-        buy_sig = (hot_sm[i - 1] <= th) and (hot_sm[i] > th)
-        sell_sig = (hot_sm[i - 1] >= -th) and (hot_sm[i] < -th)
+        # Signal detection - use crossover/crossunder logic for consistency
+        cross_up = crossover(hot_sm[i - 1], hot_sm[i], -th, -th)
+        cross_dn = crossunder(hot_sm[i - 1], hot_sm[i], th, th)
+        
+        buy_sig = bool(cross_up)
+        sell_sig = bool(cross_dn)
 
         if (not in_pos) and buy_sig and bool(vol_ok[i]):
             fill = get_fill(i)
@@ -341,6 +376,10 @@ def backtest_adapt_rsi_dynamic_engine(
             equity = apply_commission(equity)
             bars_in_trade = 0
             has_hit_be = False
+            trail_active = False
+            trail_stop = np.nan
+            trail_high_since = np.nan
+            trail_dist = np.nan
             continue
 
         if in_pos:
@@ -349,31 +388,55 @@ def backtest_adapt_rsi_dynamic_engine(
             if pnl_atr > 1.5:
                 has_hit_be = True
 
+            # Basic stop and target levels
             stop_level = entry if has_hit_be else (entry - atr[i] * slMult)
             tgt_level = entry + atr[i] * tpMult
+            
+            # Trailing exit setup
+            trail_dist = atr[i] * tpMult
+            
+            if use_trailing_exit:
+                if (not trail_active) and (h[i] >= entry + trail_dist):
+                    trail_active = True
+                    trail_high_since = float(h[i])
+                    trail_stop = trail_high_since - trail_dist
+                elif trail_active:
+                    trail_high_since = float(h[i]) if np.isnan(trail_high_since) else max(trail_high_since, float(h[i]))
+                    trail_stop = trail_high_since - trail_dist
 
             exit_now = False
             exit_price: Optional[float] = None
 
-            if l[i] <= stop_level:
+            # Check exits in priority order
+            hard_stop_enabled = (not use_trailing_exit) or (trail_mode == "trail_plus_hard_sl")
+            if hard_stop_enabled and (l[i] <= stop_level):
                 exit_now = True
                 exit_price = float(stop_level)
-            elif h[i] >= tgt_level:
+
+            if (not exit_now) and use_trailing_exit and trail_active and (not np.isnan(trail_stop)):
+                if l[i] <= trail_stop:
+                    exit_now = True
+                    exit_price = float(trail_stop)
+
+            if (not exit_now) and (h[i] >= tgt_level):
                 exit_now = True
                 exit_price = float(tgt_level)
-            elif (ts_bars > 0) and (bars_in_trade >= ts_bars):
+
+            if (not exit_now) and (ts_bars > 0) and (bars_in_trade >= ts_bars):
                 fill = get_fill(i)
                 if fill is not None:
                     unreal = (float(fill) - entry) / entry
                     if unreal <= 0.0:
                         exit_now = True
                         exit_price = float(fill)
-            elif sell_sig:
+                        
+            if (not exit_now) and close_on_sellSignal and sell_sig:
                 fill = get_fill(i)
                 if fill is not None:
                     exit_now = True
                     exit_price = float(fill)
-            elif i == n - 2:
+
+            if (not exit_now) and i == n - 2:
                 fill = get_fill(i)
                 if fill is not None:
                     exit_now = True
@@ -392,6 +455,10 @@ def backtest_adapt_rsi_dynamic_engine(
                 entry = 0.0
                 bars_in_trade = 0
                 has_hit_be = False
+                trail_active = False
+                trail_stop = np.nan
+                trail_high_since = np.nan
+                trail_dist = np.nan
 
         if equity > peak:
             peak = equity
@@ -482,6 +549,9 @@ def evaluate_params_on_files(file_paths: List[Path], **kwargs) -> Tuple[float, D
             tpMult=kwargs["tpMultiplier"],
             commission_per_side=kwargs["commission_rate_per_side"],
             fill_mode=kwargs["fill_mode"],
+            use_trailing_exit=kwargs.get("use_trailing_exit", True),
+            trail_mode=kwargs.get("trail_mode", "trail_only"),
+            close_on_sellSignal=kwargs.get("close_on_sellSignal", True),
             cooldown_bars=kwargs["cooldown_bars"],
             time_stop_bars=kwargs["time_stop_bars"],
             basePeriod=kwargs["basePeriod"],
@@ -498,6 +568,7 @@ def evaluate_params_on_files(file_paths: List[Path], **kwargs) -> Tuple[float, D
             vol_floor_len=kwargs["vol_floor_len"],
             loss_floor=kwargs["loss_floor"],
             pf_cap_score_only=kwargs["pf_cap_score_only"],
+            shift=kwargs.get("shift", 0),
         )
 
         sc = score_from_stats(
@@ -520,8 +591,8 @@ def evaluate_params_on_files(file_paths: List[Path], **kwargs) -> Tuple[float, D
             pf_floor_k=kwargs["pf_floor_k"],
             ret_floor=kwargs["ret_floor"],
             ret_floor_k=kwargs["ret_floor_k"],
-            trend_center=kwargs["trend_center"],
-            trend_k=kwargs["trend_k"],
+            trend_center=kwargs.get("trend_center", 0.80),
+            trend_k=kwargs.get("trend_k", 3.0),
         )
 
         is_eligible = (st.num_trades >= kwargs["min_trades"])
@@ -602,6 +673,11 @@ def parse_args():
 
     ap.add_argument("--fill", type=str, default="same_close", choices=["same_close", "next_open"])
 
+    # Exits - ADDED FROM half_RSI.py
+    ap.add_argument("--use_trailing_exit", type=bool, default=True)
+    ap.add_argument("--trail_mode", type=str, default="trail_only", choices=["trail_only", "trail_plus_hard_sl"])
+    ap.add_argument("--close_on_sellSignal", type=bool, default=True)
+
     # Cooldown / time stop
     ap.add_argument("--cooldown", type=int, default=1)
     ap.add_argument("--opt-cooldown", action="store_true")
@@ -624,6 +700,7 @@ def parse_args():
     # Modes
     ap.add_argument("--optimize", action="store_true")
     ap.add_argument("--report-both-fills", action="store_true")
+    ap.add_argument("--report-only", action="store_true")  # ADDED FROM half_RSI.py
 
     # Fixed params
     ap.add_argument("--atrPeriod-fixed", type=int, default=25)
@@ -642,6 +719,9 @@ def parse_args():
     ap.add_argument("--fastPeriod-fixed", type=int, default=4)
     ap.add_argument("--slowPeriod-fixed", type=int, default=50)
     ap.add_argument("--smooth_len-fixed", type=int, default=5)
+    
+    # ADDED FROM half_RSI.py
+    ap.add_argument("--shift-fixed", type=int, default=0)
 
     ap.add_argument("--threshold-fixed", type=float, default=0.5)
     ap.add_argument("--threshold-mode", type=str, default="dynamic", choices=["fixed", "dynamic"])
@@ -705,8 +785,17 @@ def main():
             return False
         return True
 
-    # ── REPORT MODE ─────────────────────────────────────────────
-    if not args.optimize:
+    # ── REPORT-ONLY MODE (ADDED FROM half_RSI.py) ─────────────────────────────
+    if args.report_only:
+        required = [
+            ("--atrPeriod-fixed", args.atrPeriod_fixed),
+            ("--slMultiplier-fixed", args.slMultiplier_fixed),
+            ("--tpMultiplier-fixed", args.tpMultiplier_fixed),
+        ]
+        missing = [name for name, val in required if val is None]
+        if missing:
+            raise SystemExit("Missing required flags for report-only")
+
         atrP = int(args.atrPeriod_fixed)
         slM = float(args.slMultiplier_fixed)
         tpM = float(args.tpMultiplier_fixed)
@@ -729,6 +818,8 @@ def main():
         sm = int(args.smooth_len_fixed)
         if sm < 1:
             raise SystemExit("--smooth_len-fixed must be >= 1")
+            
+        shift = int(args.shift_fixed)
 
         threshold = float(args.threshold_fixed)
         vol_floor_mult = float(args.vol_floor_mult_fixed)
@@ -743,6 +834,9 @@ def main():
                 tpMultiplier=tpM,
                 commission_rate_per_side=args.commission_rate_per_side,
                 fill_mode=fm,
+                use_trailing_exit=args.use_trailing_exit,
+                trail_mode=args.trail_mode,
+                close_on_sellSignal=args.close_on_sellSignal,
                 cooldown_bars=int(args.cooldown),
                 time_stop_bars=int(args.time_stop),
                 basePeriod=baseP,
@@ -777,6 +871,7 @@ def main():
                 ret_floor_k=args.ret_floor_k,
                 trend_center=float(args.trend_center),
                 trend_k=float(args.trend_k),
+                shift=shift,
             )
 
             per_df = pd.DataFrame(per)
@@ -812,6 +907,125 @@ def main():
         print(f"  adaptive RSI  : base={baseP}, min={minP}, max={maxP}")
         print(f"  fast/slow EMA : fast={fp}, slow={sp}")
         print(f"  smooth_len    : {sm}")
+        print(f"  shift         : {shift}")
+        print(f"  threshold_mode: {args.threshold_mode}")
+        print(f"  vol_floor_mult: {vol_floor_mult}")
+        return
+
+    # ── REPORT MODE (non-optimize) ─────────────────────────────────────────────
+    if not args.optimize:
+        atrP = int(args.atrPeriod_fixed)
+        slM = float(args.slMultiplier_fixed)
+        tpM = float(args.tpMultiplier_fixed)
+
+        min_eff = min_tp2sl_eff_for(atrP)
+        if slM <= min_eff * tpM:
+            raise SystemExit("Constraint violated: slMultiplier <= min_tp2sl_eff * tpMultiplier")
+
+        baseP = int(args.basePeriod_fixed)
+        minP = int(args.minPeriod_fixed)
+        maxP = int(args.maxPeriod_fixed)
+        if not validate_adaptive_params(baseP, minP, maxP):
+            raise SystemExit("Invalid adaptive RSI parameters (fixed)")
+
+        fp = int(args.fastPeriod_fixed)
+        sp = int(args.slowPeriod_fixed)
+        if not validate_fastslow(fp, sp):
+            raise SystemExit("Invalid fast/slow EMA parameters (fixed)")
+
+        sm = int(args.smooth_len_fixed)
+        if sm < 1:
+            raise SystemExit("--smooth_len-fixed must be >= 1")
+            
+        shift = int(args.shift_fixed)
+
+        threshold = float(args.threshold_fixed)
+        vol_floor_mult = float(args.vol_floor_mult_fixed)
+
+        fills = ROBUST_FILLS if args.report_both_fills else [args.fill]
+
+        for fm in fills:
+            _, overall, per, _, _, coverage, eligible_count = evaluate_params_on_files(
+                file_paths,
+                atrPeriod=atrP,
+                slMultiplier=slM,
+                tpMultiplier=tpM,
+                commission_rate_per_side=args.commission_rate_per_side,
+                fill_mode=fm,
+                use_trailing_exit=args.use_trailing_exit,
+                trail_mode=args.trail_mode,
+                close_on_sellSignal=args.close_on_sellSignal,
+                cooldown_bars=int(args.cooldown),
+                time_stop_bars=int(args.time_stop),
+                basePeriod=baseP,
+                minPeriod=minP,
+                maxPeriod=maxP,
+                fastPeriod=fp,
+                slowPeriod=sp,
+                smooth_len=sm,
+                threshold=threshold,
+                threshold_mode=args.threshold_mode,
+                threshold_floor=float(args.threshold_floor),
+                threshold_std_mult=float(args.threshold_std_mult),
+                vol_floor_mult=vol_floor_mult,
+                vol_floor_len=int(args.vol_floor_len),
+                min_trades=args.min_trades,
+                pf_baseline=args.pf_baseline,
+                pf_k=args.pf_k,
+                trades_baseline=args.trades_baseline,
+                trades_k=args.trades_k,
+                weight_pf=args.weight_pf,
+                score_power=args.score_power,
+                pf_cap_score_only=args.pf_cap_score_only,
+                penalty_enabled=args.penalty,
+                loss_floor=args.loss_floor,
+                penalty_ret_center=args.penalty_ret_center,
+                penalty_ret_k=args.penalty_ret_k,
+                max_trades=args.max_trades,
+                max_trades_k=args.max_trades_k,
+                pf_floor=args.pf_floor,
+                pf_floor_k=args.pf_floor_k,
+                ret_floor=args.ret_floor,
+                ret_floor_k=args.ret_floor_k,
+                trend_center=float(args.trend_center),
+                trend_k=float(args.trend_k),
+                shift=shift,
+            )
+
+            per_df = pd.DataFrame(per)
+            per_df["ticker_score"] = per_df["ticker_score"].fillna(0.0)
+            per_df = per_df.sort_values(
+                ["ticker_score", "total_return", "profit_factor_diag", "num_trades"],
+                ascending=False
+            )
+
+            csv_path = out_dir / f"{MODULE_PREFIX}per_ticker_report-only_{fm}_{now_str}.csv"
+            per_df.to_csv(csv_path, index=False)
+
+            txt_path = out_dir / f"{MODULE_PREFIX}report_summary_{fm}_{now_str}.txt"
+            with txt_path.open("w", encoding='utf-8') as f:  # explicit UTF-8
+                f.write(f"REPORT ONLY - fill = {fm}\n")
+                f.write(f"Run: {now_str}\n\n")
+                f.write(f"Mean ticker score (eligible): {overall['mean_ticker_score']:.6f}\n")
+                f.write(f"Avg PF (raw)                  : {overall['avg_pf_raw'] if np.isfinite(overall['avg_pf_raw']) else 'inf'}\n")
+                f.write(f"Avg PF (diag)                 : {overall['avg_pf_diag']:.6f}\n")
+                f.write(f"Avg trades/ticker             : {overall['avg_trades']:.2f}\n")
+                f.write(f"Coverage                      : {coverage:.3f} ({eligible_count}/{len(per)})\n")
+                f.write(f"Negative returns              : {overall['num_neg']}\n")
+
+            print(f"Saved: {csv_path}")
+            print(f"Saved: {txt_path}")
+
+        mode = "auto" if args.tp2sl_auto else "fixed"
+        print("\nFixed parameters used:")
+        print(f"  atrPeriod     : {atrP}")
+        print(f"  slMultiplier  : {slM:.4f}")
+        print(f"  tpMultiplier  : {tpM:.4f}")
+        print(f"  min_tp2sl_eff : {min_eff:.4f} ({mode})")
+        print(f"  adaptive RSI  : base={baseP}, min={minP}, max={maxP}")
+        print(f"  fast/slow EMA : fast={fp}, slow={sp}")
+        print(f"  smooth_len    : {sm}")
+        print(f"  shift         : {shift}")
         print(f"  threshold_mode: {args.threshold_mode}")
         print(f"  vol_floor_mult: {vol_floor_mult}")
         return
@@ -839,9 +1053,10 @@ def main():
             slowPeriod = int(args.slowPeriod_fixed)
 
         smooth_len = trial.suggest_int("smooth_len", 2, 6)
+        shift = trial.suggest_int("shift", 0, 3)  # ADDED FROM half_RSI.py
         vol_floor_mult = float(args.vol_floor_mult_fixed)
 
-        cooldown_bars = 1  # forced
+        cooldown_bars = trial.suggest_int("cooldown", 0, 7) if args.opt_cooldown else int(args.cooldown)  # MODIFIED
         time_stop_bars = trial.suggest_int("time_stop", 5, 15) if args.opt_time_stop else int(args.time_stop)
 
         if tpMultiplier < 1.01 * slMultiplier:
@@ -868,6 +1083,9 @@ def main():
             tpMultiplier=float(tpMultiplier),
             commission_rate_per_side=float(args.commission_rate_per_side),
             fill_mode=str(args.fill),
+            use_trailing_exit=bool(args.use_trailing_exit),  # ADDED
+            trail_mode=str(args.trail_mode),  # ADDED
+            close_on_sellSignal=bool(args.close_on_sellSignal),  # ADDED
             cooldown_bars=int(cooldown_bars),
             time_stop_bars=int(time_stop_bars),
             basePeriod=int(basePeriod),
@@ -902,6 +1120,7 @@ def main():
             ret_floor_k=float(args.ret_floor_k),
             trend_center=float(args.trend_center),
             trend_k=float(args.trend_k),
+            shift=int(shift),  # ADDED
         )
 
         if not per or coverage <= 0.0:
@@ -949,9 +1168,15 @@ def main():
         best_params["slowPeriod"] = int(args.slowPeriod_fixed)
     if "smooth_len" not in best_params:
         best_params["smooth_len"] = int(args.smooth_len_fixed)
+    if "shift" not in best_params:  # ADDED
+        best_params["shift"] = int(args.shift_fixed)
+    if "cooldown" not in best_params:  # ADDED
+        best_params["cooldown"] = int(args.cooldown)
+    if "time_stop" not in best_params:  # ADDED
+        best_params["time_stop"] = int(args.time_stop)
 
-    best_cooldown = 1  # forced
-    best_time_stop = int(best_params.get("time_stop", args.time_stop)) if args.opt_time_stop else int(args.time_stop)
+    best_cooldown = int(best_params.get("cooldown", args.cooldown))
+    best_time_stop = int(best_params.get("time_stop", args.time_stop))
 
     best_score_single, overall, per, _, _, coverage, eligible_count = evaluate_params_on_files(
         file_paths,
@@ -960,6 +1185,9 @@ def main():
         tpMultiplier=float(best_params["tpMultiplier"]),
         commission_rate_per_side=args.commission_rate_per_side,
         fill_mode=args.fill,
+        use_trailing_exit=args.use_trailing_exit,  # ADDED
+        trail_mode=args.trail_mode,  # ADDED
+        close_on_sellSignal=args.close_on_sellSignal,  # ADDED
         cooldown_bars=best_cooldown,
         time_stop_bars=best_time_stop,
         basePeriod=int(best_params["basePeriod"]),
@@ -994,6 +1222,7 @@ def main():
         ret_floor_k=args.ret_floor_k,
         trend_center=float(args.trend_center),
         trend_k=float(args.trend_k),
+        shift=int(best_params.get("shift", args.shift_fixed)),  # ADDED
     )
 
     per_df = pd.DataFrame(per)
@@ -1029,6 +1258,9 @@ def main():
         f"  Commission/side              : {args.commission_rate_per_side:.6f}",
         f"  Penalty enabled              : {args.penalty}",
         f"  min_tp2sl_eff                : {min_tp2sl_eff_for(int(best_params['atrPeriod'])):.4f}",
+        f"  use_trailing_exit            : {args.use_trailing_exit}",
+        f"  trail_mode                   : {args.trail_mode}",
+        f"  close_on_sellSignal          : {args.close_on_sellSignal}",
     ])
 
     txt_path = out_dir / f"{MODULE_PREFIX}best_{now_str}.txt"
