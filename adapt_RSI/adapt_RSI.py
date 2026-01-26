@@ -640,7 +640,7 @@ def evaluate_params_on_files(file_paths: List[Path], **kwargs) -> Tuple[float, D
 
 
 # =============================
-# CLI
+# CLI - UPDATED TO ACCEPT RANGE PARAMETERS
 # =============================
 def parse_args():
     ap = argparse.ArgumentParser(description="Adaptive RSI strategy optimization")
@@ -673,7 +673,7 @@ def parse_args():
 
     ap.add_argument("--fill", type=str, default="same_close", choices=["same_close", "next_open"])
 
-    # Exits - ADDED FROM half_RSI.py
+    # Exits
     ap.add_argument("--use_trailing_exit", type=bool, default=True)
     ap.add_argument("--trail_mode", type=str, default="trail_only", choices=["trail_only", "trail_plus_hard_sl"])
     ap.add_argument("--close_on_sellSignal", type=bool, default=True)
@@ -700,15 +700,43 @@ def parse_args():
     # Modes
     ap.add_argument("--optimize", action="store_true")
     ap.add_argument("--report-both-fills", action="store_true")
-    ap.add_argument("--report-only", action="store_true")  # ADDED FROM half_RSI.py
+    ap.add_argument("--report-only", action="store_true")
 
-    # Fixed params
+    # ADDED: Range parameters for optimization
+    ap.add_argument("--basePeriod-min", type=int)
+    ap.add_argument("--basePeriod-max", type=int)
+    ap.add_argument("--minPeriod-min", type=int)
+    ap.add_argument("--minPeriod-max", type=int)
+    ap.add_argument("--maxPeriod-min", type=int)
+    ap.add_argument("--maxPeriod-max", type=int)
+    ap.add_argument("--fastPeriod-min", type=int)
+    ap.add_argument("--fastPeriod-max", type=int)
+    ap.add_argument("--slowPeriod-min", type=int)
+    ap.add_argument("--slowPeriod-max", type=int)
+    ap.add_argument("--smooth_len-min", type=int)
+    ap.add_argument("--smooth_len-max", type=int)
+    ap.add_argument("--shift-min", type=int)
+    ap.add_argument("--shift-max", type=int)
+    ap.add_argument("--threshold_floor-min", type=float)
+    ap.add_argument("--threshold_floor-max", type=float)
+    ap.add_argument("--threshold_std_mult-min", type=float)
+    ap.add_argument("--threshold_std_mult-max", type=float)
+    ap.add_argument("--atrPeriod-min", type=int)
+    ap.add_argument("--atrPeriod-max", type=int)
+    ap.add_argument("--slMultiplier-min", type=float)
+    ap.add_argument("--slMultiplier-max", type=float)
+    ap.add_argument("--tpMultiplier-min", type=float)
+    ap.add_argument("--tpMultiplier-max", type=float)
+    ap.add_argument("--cooldown-min", type=int)
+    ap.add_argument("--cooldown-max", type=int)
+    ap.add_argument("--time_stop-min", type=int)
+    ap.add_argument("--time_stop-max", type=int)
+
+    # Fixed params (for backwards compatibility)
     ap.add_argument("--atrPeriod-fixed", type=int, default=25)
     ap.add_argument("--slMultiplier-fixed", type=float, default=3.0)
     ap.add_argument("--tpMultiplier-fixed", type=float, default=3.0)
 
-    ap.add_argument("--basePeriod-min", type=int)
-    ap.add_argument("--basePeriod-max", type=int)
     ap.add_argument("--basePeriod-fixed", type=int, default=20)
     ap.add_argument("--minPeriod-fixed", type=int, default=5)
     ap.add_argument("--maxPeriod-fixed", type=int, default=35)
@@ -722,7 +750,6 @@ def parse_args():
     ap.add_argument("--slowPeriod-fixed", type=int, default=50)
     ap.add_argument("--smooth_len-fixed", type=int, default=5)
     
-    # ADDED FROM half_RSI.py
     ap.add_argument("--shift-fixed", type=int, default=0)
 
     ap.add_argument("--threshold-fixed", type=float, default=0.5)
@@ -787,7 +814,7 @@ def main():
             return False
         return True
 
-    # ── REPORT-ONLY MODE (ADDED FROM half_RSI.py) ─────────────────────────────
+    # ── REPORT-ONLY MODE ─────────────────────────────
     if args.report_only:
         required = [
             ("--atrPeriod-fixed", args.atrPeriod_fixed),
@@ -1032,35 +1059,92 @@ def main():
         print(f"  vol_floor_mult: {vol_floor_mult}")
         return
 
-    # ── OPTIMIZATION ────────────────────────────────────────────
+    # ── OPTIMIZATION (UPDATED TO USE RANGE PARAMETERS) ────────────────────────────────────────────
     def objective(trial: optuna.Trial) -> float:
-        atrPeriod = trial.suggest_int("atrPeriod", 10, 25)
-        slMultiplier = trial.suggest_float("slMultiplier", 1.2, 2.5)
-        tpMultiplier = trial.suggest_float("tpMultiplier", 2.0, 5.0)
+        # Use range parameters if provided, otherwise use defaults
+        if args.atrPeriod_min is not None and args.atrPeriod_max is not None:
+            atrPeriod = trial.suggest_int("atrPeriod", args.atrPeriod_min, args.atrPeriod_max)
+        else:
+            atrPeriod = trial.suggest_int("atrPeriod", 10, 25)
+            
+        if args.slMultiplier_min is not None and args.slMultiplier_max is not None:
+            slMultiplier = trial.suggest_float("slMultiplier", args.slMultiplier_min, args.slMultiplier_max)
+        else:
+            slMultiplier = trial.suggest_float("slMultiplier", 1.2, 2.5)
+            
+        if args.tpMultiplier_min is not None and args.tpMultiplier_max is not None:
+            tpMultiplier = trial.suggest_float("tpMultiplier", args.tpMultiplier_min, args.tpMultiplier_max)
+        else:
+            tpMultiplier = trial.suggest_float("tpMultiplier", 2.0, 5.0)
 
+        # Adaptive RSI parameters
         if args.opt_adaptive:
-            basePeriod = trial.suggest_int("basePeriod", 10, 25)
-            minPeriod = trial.suggest_int("minPeriod", 2, 5)
-            maxPeriod = trial.suggest_int("maxPeriod", 12, 25)
+            if args.basePeriod_min is not None and args.basePeriod_max is not None:
+                basePeriod = trial.suggest_int("basePeriod", args.basePeriod_min, args.basePeriod_max)
+            else:
+                basePeriod = trial.suggest_int("basePeriod", 10, 25)
+                
+            if args.minPeriod_min is not None and args.minPeriod_max is not None:
+                minPeriod = trial.suggest_int("minPeriod", args.minPeriod_min, args.minPeriod_max)
+            else:
+                minPeriod = trial.suggest_int("minPeriod", 2, 5)
+                
+            if args.maxPeriod_min is not None and args.maxPeriod_max is not None:
+                maxPeriod = trial.suggest_int("maxPeriod", args.maxPeriod_min, args.maxPeriod_max)
+            else:
+                maxPeriod = trial.suggest_int("maxPeriod", 12, 25)
         else:
             basePeriod = int(args.basePeriod_fixed)
             minPeriod = int(args.minPeriod_fixed)
             maxPeriod = int(args.maxPeriod_fixed)
 
+        # Fast/slow EMA parameters
         if args.opt_fastslow:
-            fastPeriod = trial.suggest_int("fastPeriod", 2, 8)
-            slowPeriod = trial.suggest_int("slowPeriod", 15, 50)
+            if args.fastPeriod_min is not None and args.fastPeriod_max is not None:
+                fastPeriod = trial.suggest_int("fastPeriod", args.fastPeriod_min, args.fastPeriod_max)
+            else:
+                fastPeriod = trial.suggest_int("fastPeriod", 2, 8)
+                
+            if args.slowPeriod_min is not None and args.slowPeriod_max is not None:
+                slowPeriod = trial.suggest_int("slowPeriod", args.slowPeriod_min, args.slowPeriod_max)
+            else:
+                slowPeriod = trial.suggest_int("slowPeriod", 15, 50)
         else:
             fastPeriod = int(args.fastPeriod_fixed)
             slowPeriod = int(args.slowPeriod_fixed)
 
-        smooth_len = trial.suggest_int("smooth_len", 2, 6)
-        shift = trial.suggest_int("shift", 0, 3)  # ADDED FROM half_RSI.py
+        # Smooth length
+        if args.smooth_len_min is not None and args.smooth_len_max is not None:
+            smooth_len = trial.suggest_int("smooth_len", args.smooth_len_min, args.smooth_len_max)
+        else:
+            smooth_len = trial.suggest_int("smooth_len", 2, 6)
+            
+        # Shift
+        if args.shift_min is not None and args.shift_max is not None:
+            shift = trial.suggest_int("shift", args.shift_min, args.shift_max)
+        else:
+            shift = trial.suggest_int("shift", 0, 3)
+            
         vol_floor_mult = float(args.vol_floor_mult_fixed)
 
-        cooldown_bars = trial.suggest_int("cooldown", 0, 7) if args.opt_cooldown else int(args.cooldown)  # MODIFIED
-        time_stop_bars = trial.suggest_int("time_stop", 5, 15) if args.opt_time_stop else int(args.time_stop)
+        # Cooldown and time stop
+        if args.opt_cooldown:
+            if args.cooldown_min is not None and args.cooldown_max is not None:
+                cooldown_bars = trial.suggest_int("cooldown", args.cooldown_min, args.cooldown_max)
+            else:
+                cooldown_bars = trial.suggest_int("cooldown", 0, 7)
+        else:
+            cooldown_bars = int(args.cooldown)
+            
+        if args.opt_time_stop:
+            if args.time_stop_min is not None and args.time_stop_max is not None:
+                time_stop_bars = trial.suggest_int("time_stop", args.time_stop_min, args.time_stop_max)
+            else:
+                time_stop_bars = trial.suggest_int("time_stop", 5, 15)
+        else:
+            time_stop_bars = int(args.time_stop)
 
+        # Constraints
         if tpMultiplier < 1.01 * slMultiplier:
             raise optuna.TrialPruned()
         if fastPeriod >= slowPeriod:
@@ -1075,8 +1159,15 @@ def main():
             threshold_std_mult = 0.0
         else:
             threshold = 0.0
-            threshold_floor = trial.suggest_float("threshold_floor", 0.005, 0.08)
-            threshold_std_mult = trial.suggest_float("threshold_std_mult", 0.05, 0.40)
+            if args.threshold_floor_min is not None and args.threshold_floor_max is not None:
+                threshold_floor = trial.suggest_float("threshold_floor", args.threshold_floor_min, args.threshold_floor_max)
+            else:
+                threshold_floor = trial.suggest_float("threshold_floor", 0.005, 0.08)
+                
+            if args.threshold_std_mult_min is not None and args.threshold_std_mult_max is not None:
+                threshold_std_mult = trial.suggest_float("threshold_std_mult", args.threshold_std_mult_min, args.threshold_std_mult_max)
+            else:
+                threshold_std_mult = trial.suggest_float("threshold_std_mult", 0.05, 0.40)
 
         mean_score, overall, per, _, _, coverage, eligible_count = evaluate_params_on_files(
             file_paths,
@@ -1085,9 +1176,9 @@ def main():
             tpMultiplier=float(tpMultiplier),
             commission_rate_per_side=float(args.commission_rate_per_side),
             fill_mode=str(args.fill),
-            use_trailing_exit=bool(args.use_trailing_exit),  # ADDED
-            trail_mode=str(args.trail_mode),  # ADDED
-            close_on_sellSignal=bool(args.close_on_sellSignal),  # ADDED
+            use_trailing_exit=bool(args.use_trailing_exit),
+            trail_mode=str(args.trail_mode),
+            close_on_sellSignal=bool(args.close_on_sellSignal),
             cooldown_bars=int(cooldown_bars),
             time_stop_bars=int(time_stop_bars),
             basePeriod=int(basePeriod),
@@ -1122,7 +1213,7 @@ def main():
             ret_floor_k=float(args.ret_floor_k),
             trend_center=float(args.trend_center),
             trend_k=float(args.trend_k),
-            shift=int(shift),  # ADDED
+            shift=int(shift),
         )
 
         if not per or coverage <= 0.0:
@@ -1170,11 +1261,11 @@ def main():
         best_params["slowPeriod"] = int(args.slowPeriod_fixed)
     if "smooth_len" not in best_params:
         best_params["smooth_len"] = int(args.smooth_len_fixed)
-    if "shift" not in best_params:  # ADDED
+    if "shift" not in best_params:
         best_params["shift"] = int(args.shift_fixed)
-    if "cooldown" not in best_params:  # ADDED
+    if "cooldown" not in best_params:
         best_params["cooldown"] = int(args.cooldown)
-    if "time_stop" not in best_params:  # ADDED
+    if "time_stop" not in best_params:
         best_params["time_stop"] = int(args.time_stop)
 
     best_cooldown = int(best_params.get("cooldown", args.cooldown))
@@ -1187,9 +1278,9 @@ def main():
         tpMultiplier=float(best_params["tpMultiplier"]),
         commission_rate_per_side=args.commission_rate_per_side,
         fill_mode=args.fill,
-        use_trailing_exit=args.use_trailing_exit,  # ADDED
-        trail_mode=args.trail_mode,  # ADDED
-        close_on_sellSignal=args.close_on_sellSignal,  # ADDED
+        use_trailing_exit=args.use_trailing_exit,
+        trail_mode=args.trail_mode,
+        close_on_sellSignal=args.close_on_sellSignal,
         cooldown_bars=best_cooldown,
         time_stop_bars=best_time_stop,
         basePeriod=int(best_params["basePeriod"]),
@@ -1224,7 +1315,7 @@ def main():
         ret_floor_k=args.ret_floor_k,
         trend_center=float(args.trend_center),
         trend_k=float(args.trend_k),
-        shift=int(best_params.get("shift", args.shift_fixed)),  # ADDED
+        shift=int(best_params.get("shift", args.shift_fixed)),
     )
 
     per_df = pd.DataFrame(per)

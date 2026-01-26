@@ -81,7 +81,7 @@ mkdir -p "$LOG_DIR" "$OUTPUT_BASE_DIR"
 # Each phase narrows the search based on previous results
 # ───────────────────────────────────────────────────────────────
 declare -A PHASE_NAMES
-declare -A PHASE_FLAGS  # Store optimization flags for each phase
+declare -A PHASE_SEARCH_RANGES
 
 PHASE_NAMES["A"]="Wide Exploration - Broad parameter discovery"
 PHASE_NAMES["B"]="Refinement - Narrow based on A results"
@@ -90,75 +90,98 @@ PHASE_NAMES["D"]="Tightening - Reduce to robust parameters"
 PHASE_NAMES["E"]="Final Tuning - Small adjustments"
 PHASE_NAMES["F"]="Validation - Test final parameters"
 
-# Phase A: Initial wide exploration (all parameters optimized)
-PHASE_FLAGS["A"]="
---optimize
---opt-adaptive
---opt-fastslow
---opt-cooldown
---opt-time-stop
---atrPeriod-fixed 25
---slMultiplier-fixed 3.0
---tpMultiplier-fixed 3.0
---basePeriod-fixed 20
---minPeriod-fixed 5
---maxPeriod-fixed 35
---fastPeriod-fixed 4
---slowPeriod-fixed 50
---smooth_len-fixed 5
---shift-fixed 0
---threshold-fixed 0.5
---threshold-floor 0.1
---threshold-std-mult 0.5
---cooldown 1
---time-stop 0
+# Phase A: Initial wide ranges (based on typical RSI parameters)
+PHASE_SEARCH_RANGES["A"]="
+--atrPeriod-min 10 --atrPeriod-max 25
+--slMultiplier-min 1.2 --slMultiplier-max 3.0
+--tpMultiplier-min 2.0 --tpMultiplier-max 5.0
+--basePeriod-min 10 --basePeriod-max 25
+--minPeriod-min 2 --minPeriod-max 8
+--maxPeriod-min 12 --maxPeriod-max 30
+--fastPeriod-min 2 --fastPeriod-max 10
+--slowPeriod-min 15 --slowPeriod-max 50
+--smooth_len-min 2 --smooth_len-max 6
+--shift-min 0 --shift-max 3
+--threshold_floor-min 0.005 --threshold_floor-max 0.08
+--threshold_std_mult-min 0.05 --threshold_std_mult-max 0.40
+--cooldown-min 0 --cooldown-max 7
+--time_stop-min 5 --time_stop-max 15
 "
 
-# Phase B: Narrower exploration (only some parameters optimized)
-PHASE_FLAGS["B"]="
---optimize
---opt-adaptive
---opt-fastslow
---opt-cooldown
---opt-time-stop
---threshold-floor 0.05
---threshold-std-mult 0.3
---cooldown 1
---time-stop 5
+# Phase B: Narrower ranges (focus on areas that worked in A)
+PHASE_SEARCH_RANGES["B"]="
+--atrPeriod-min 12 --atrPeriod-max 20
+--slMultiplier-min 1.5 --slMultiplier-max 2.5
+--tpMultiplier-min 2.5 --tpMultiplier-max 4.5
+--basePeriod-min 15 --basePeriod-max 22
+--minPeriod-min 3 --minPeriod-max 6
+--maxPeriod-min 15 --maxPeriod-max 25
+--fastPeriod-min 3 --fastPeriod-max 8
+--slowPeriod-min 20 --slowPeriod-max 40
+--smooth_len-min 3 --smooth_len-max 5
+--shift-min 1 --shift-max 3
+--threshold_floor-min 0.02 --threshold_floor-max 0.06
+--threshold_std_mult-min 0.08 --threshold_std_mult-max 0.30
+--cooldown-min 1 --cooldown-max 5
+--time_stop-min 8 --time_stop-max 12
 "
 
-# Phase C: Focus on key parameters
-PHASE_FLAGS["C"]="
---optimize
---opt-adaptive
---opt-fastslow
---cooldown 3
---time-stop 10
---threshold-floor 0.03
---threshold-std-mult 0.2
+# Phase C: Even narrower (focus on best performers from B)
+PHASE_SEARCH_RANGES["C"]="
+--atrPeriod-min 14 --atrPeriod-max 18
+--slMultiplier-min 1.7 --slMultiplier-max 2.2
+--tpMultiplier-min 3.0 --tpMultiplier-max 4.0
+--basePeriod-min 18 --basePeriod-max 22
+--minPeriod-min 4 --minPeriod-max 5
+--maxPeriod-min 18 --maxPeriod-max 22
+--fastPeriod-min 4 --fastPeriod-max 7
+--slowPeriod-min 25 --slowPeriod-max 35
+--smooth_len-min 3 --smooth_len-max 4
+--shift-min 2 --shift-max 3
+--threshold_floor-min 0.03 --threshold_floor-max 0.05
+--threshold_std_mult-min 0.10 --threshold_std_mult-max 0.25
+--cooldown-min 2 --cooldown-max 4
+--time_stop-min 10 --time_stop-max 12
 "
 
-# Phase D: Tight tuning
-PHASE_FLAGS["D"]="
---optimize
---opt-fastslow
---cooldown 3
---time-stop 12
---threshold-floor 0.04
---threshold-std-mult 0.15
+# Phase D: Tight ranges around likely optimal values
+PHASE_SEARCH_RANGES["D"]="
+--atrPeriod-min 15 --atrPeriod-max 17
+--slMultiplier-min 1.8 --slMultiplier-max 2.0
+--tpMultiplier-min 3.3 --tpMultiplier-max 3.8
+--basePeriod-min 19 --basePeriod-max 21
+--minPeriod-min 4 --minPeriod-max 5
+--maxPeriod-min 19 --maxPeriod-max 21
+--fastPeriod-min 5 --fastPeriod-max 6
+--slowPeriod-min 28 --slowPeriod-max 32
+--smooth_len-min 3 --smooth_len-max 3
+--shift-min 2 --shift-max 3
+--threshold_floor-min 0.035 --threshold_floor-max 0.045
+--threshold_std_mult-min 0.15 --threshold_std_mult-max 0.20
+--cooldown-min 3 --cooldown-max 4
+--time_stop-min 11 --time_stop-max 12
 "
 
-# Phase E: Very tight tuning
-PHASE_FLAGS["E"]="
---optimize
---cooldown 4
---time-stop 12
---threshold-floor 0.045
---threshold-std-mult 0.1
+# Phase E: Very tight ranges for final tuning
+PHASE_SEARCH_RANGES["E"]="
+--atrPeriod-min 15 --atrPeriod-max 16
+--slMultiplier-min 1.85 --slMultiplier-max 1.95
+--tpMultiplier-min 3.5 --tpMultiplier-max 3.7
+--basePeriod-min 20 --basePeriod-max 21
+--minPeriod-min 4 --minPeriod-max 5
+--maxPeriod-min 20 --maxPeriod-max 21
+--fastPeriod-min 5 --fastPeriod-max 6
+--slowPeriod-min 30 --slowPeriod-max 32
+--smooth_len-min 3 --smooth_len-max 3
+--shift-min 3 --shift-max 3
+--threshold_floor-min 0.040 --threshold_floor-max 0.045
+--threshold_std_mult-min 0.18 --threshold_std_mult-max 0.22
+--cooldown-min 3 --cooldown-max 4
+--time_stop-min 12 --time_stop-max 12
 "
 
 # Phase F: Validation with fixed best parameters (no optimization)
-PHASE_FLAGS["F"]="
+PHASE_SEARCH_RANGES["F"]="
 --report-only
 --atrPeriod-fixed 14
 --slMultiplier-fixed 1.85
@@ -178,7 +201,7 @@ PHASE_FLAGS["F"]="
 "
 
 # ───────────────────────────────────────────────────────────────
-# Load Best Parameters from Previous Phase
+# Load Best Parameters from Previous Phase (FIXED VERSION)
 # ───────────────────────────────────────────────────────────────
 load_previous_params() {
     local prev_phase="$1"
@@ -190,27 +213,46 @@ load_previous_params() {
     if [[ -n "$param_file" && -f "$param_file" ]]; then
         echo "Loading best parameters from: $param_file"
         
-        # Extract parameters from the result file
+        # Extract only parameters from "Best parameters:" section (stop at empty line or "Performance:")
         local params=""
-        params=$(grep -A 20 "Best parameters:" "$param_file" | tail -n +2 | grep -v "^$" | while read -r line; do
-            key=$(echo "$line" | awk -F ':' '{print $1}' | xargs)
-            value=$(echo "$line" | awk -F ':' '{print $2}' | xargs)
-            # Convert parameter names to what adapt_RSI.py expects
-            case "$key" in
-                "adapt_k") echo "--threshold-std-mult $value" ;;
-                "atrPeriod") echo "--atrPeriod-fixed $value" ;;
-                "base_slow_window") echo "--slowPeriod-fixed $value" ;;
-                "cooldown") echo "--cooldown $value" ;;
-                "shift") echo "--shift-fixed $value" ;;
-                "slMultiplier") echo "--slMultiplier-fixed $value" ;;
-                "smooth_len") echo "--smooth_len-fixed $value" ;;
-                "time_stop") echo "--time-stop $value" ;;
-                "tpMultiplier") echo "--tpMultiplier-fixed $value" ;;
-                *) echo "--${key}-fixed $value" ;;
-            esac
-        done)
+        local in_params=false
         
-        echo "$params"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^Best\ parameters: ]]; then
+                in_params=true
+                continue
+            fi
+            
+            if [[ "$in_params" == true ]]; then
+                # Stop when we hit an empty line or "Performance:" section
+                if [[ -z "$line" ]] || [[ "$line" =~ ^Performance: ]]; then
+                    break
+                fi
+                
+                # Extract parameter name and value
+                if [[ "$line" =~ ^[[:space:]]+([a-zA-Z0-9_]+)[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+                    key="${BASH_REMATCH[1]}"
+                    value="${BASH_REMATCH[2]}"
+                    
+                    # Map parameter names to what adapt_RSI.py expects
+                    case "$key" in
+                        "atrPeriod"|"slMultiplier"|"tpMultiplier"|"basePeriod"|"minPeriod"|"maxPeriod"|"fastPeriod"|"slowPeriod"|"smooth_len"|"shift"|"cooldown"|"time_stop")
+                            # These can be used as-is with -fixed suffix
+                            echo "--${key}-fixed $value"
+                            ;;
+                        "threshold_floor")
+                            echo "--threshold-floor $value"
+                            ;;
+                        "threshold_std_mult")
+                            echo "--threshold-std-mult $value"
+                            ;;
+                        # Skip parameters that aren't recognized
+                        *) echo "# Skipping unknown parameter: $key" >&2 ;;
+                    esac
+                fi
+            fi
+        done < "$param_file"
+        
         return 0
     else
         echo "No previous results found for phase $prev_phase"
@@ -235,54 +277,19 @@ build_command() {
         "F") prev_phase="E" ;;
     esac
     
-    local base_flags="${PHASE_FLAGS[$phase]}"
+    local search_params="${PHASE_SEARCH_RANGES[$phase]}"
     
-    # If using progressive mode and we have a previous phase, load its best params
+    # If using progressive mode and we have a previous phase
     if [[ "$USE_PREVIOUS_RESULTS" == true && -n "$prev_phase" && "$phase" != "F" ]]; then
-        local previous_params
-        if previous_params=$(load_previous_params "$prev_phase"); then
-            echo "Using progressive optimization with previous phase $prev_phase results"
-            
-            # For phases B-E, use previous params as fixed values
-            local fixed_params=""
-            while IFS= read -r param; do
-                if [[ -n "$param" ]]; then
-                    # Extract parameter name
-                    if [[ "$param" =~ ^--([^-]+)- ]]; then
-                        param_name="${BASH_REMATCH[1]}"
-                        
-                        # Check if this parameter should remain optimized in current phase
-                        case "$phase" in
-                            "B"|"C"|"D"|"E")
-                                # For these phases, some parameters remain optimized
-                                case "$param_name" in
-                                    "atrPeriod"|"slMultiplier"|"tpMultiplier"|"basePeriod"|"minPeriod"|"maxPeriod"|"fastPeriod"|"slowPeriod"|"smooth_len"|"shift")
-                                        # These remain optimized, don't fix them
-                                        continue
-                                        ;;
-                                    *)
-                                        # Keep as fixed
-                                        fixed_params+="$param"$'\n'
-                                        ;;
-                                esac
-                                ;;
-                            *)
-                                # Keep all as fixed
-                                fixed_params+="$param"$'\n'
-                                ;;
-                        esac
-                    fi
-                fi
-            done <<< "$previous_params"
-            
-            echo "$base_flags"
-            echo "$fixed_params"
-            return
-        fi
+        echo "# Using progressive optimization with previous phase $prev_phase results" >&2
+        
+        # Just use the predefined search ranges for this phase
+        # The optimization will naturally build on previous results
+        echo "$search_params"
+    else
+        # Not using progressive mode or no previous results
+        echo "$search_params"
     fi
-    
-    # Not using progressive mode or no previous results
-    echo "$base_flags"
 }
 
 # ───────────────────────────────────────────────────────────────
@@ -300,8 +307,8 @@ run_phase() {
     echo "═══════════════════════════════════════════════════════════════"
     
     # Build the command
-    local phase_flags
-    phase_flags=$(build_command "$phase")
+    local search_params
+    search_params=$(build_command "$phase")
     
     # Build command array
     local CMD=(
@@ -314,7 +321,7 @@ run_phase() {
         --output_dir "$output_dir"
         --commission_rate_per_side "$COMMISSION"
         
-        # Core scoring parameters (FIXED values)
+        # Core scoring parameters
         --min-trades 2
         --trades-baseline 6.0
         --weight-pf 0.6
@@ -353,7 +360,7 @@ run_phase() {
         --coverage-target 0.65
         --coverage-k 10.0
         
-        # Fixed parameters that don't change
+        # Fixed parameters
         --threshold-mode "dynamic"
         --vol-floor-mult-fixed 1.0
         --vol-floor-len 100
@@ -361,8 +368,20 @@ run_phase() {
         --trend-k 3.0
     )
     
-    # Add phase-specific flags
+    # Check if this is an optimization phase or validation phase
+    if [[ "$phase" == "F" ]]; then
+        # Phase F is validation (report-only)
+        CMD+=(--report-only)
+    else
+        # Phases A-E are optimization phases
+        CMD+=(--optimize --opt-adaptive --opt-fastslow --opt-cooldown --opt-time-stop)
+    fi
+    
+    # Add search parameters
     while IFS= read -r line; do
+        # Skip comment lines
+        [[ "$line" =~ ^# ]] && continue
+        
         if [[ -n "$line" ]]; then
             # Split the line into arguments
             read -ra args <<< "$line"
@@ -370,14 +389,14 @@ run_phase() {
                 CMD+=("$arg")
             done
         fi
-    done <<< "$phase_flags"
+    done <<< "$search_params"
     
     if [[ "${DRY_RUN:-false}" == true ]]; then
         echo "DRY RUN COMMAND:"
         echo "${CMD[*]}"
         echo ""
-        echo "Phase flags for phase $phase:"
-        echo "$phase_flags"
+        echo "Search parameters for phase $phase:"
+        echo "$search_params"
         echo ""
         return 0
     fi
