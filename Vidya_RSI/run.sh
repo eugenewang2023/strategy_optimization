@@ -19,6 +19,9 @@ LOG_DIR="logs"
 N_JOBS=4                  # Parallel trial execution
 N_STARTUP_TRIALS=200      # Initial random exploration count
 
+# Enhanced Objective Settings (new feature)
+USE_ENHANCED_OBJECTIVE=true  # Set to false to use original objective
+
 # Global Strategy Baselines
 TRADES_BASELINE=5.0       # Targets ~5 trades per ticker for stability
 COMMISSION=0.0006         # 0.06% per side (adjust to your broker)
@@ -59,16 +62,21 @@ Options:
   --files INT          Number of data files (default: $FILES)
   --fill MODE          Fill mode: next_open | same_close (default: $FILL_MODE)
   --n-jobs INT         Parallel trials (default: $N_JOBS)
+  --use-enhanced       Use enhanced objective function with returns/trades data
+  --use-original       Use original objective function (default: enhanced)
   --dry-run            Show commands without executing
   --help               Show this help message
 
 Phases (runs all if none specified):
-  A   Discovery: Escape the zero-plateau (wide search)
-  B   Robustness: Filter for consistency and regime stability
-  C   Quality: Tighten for high expectancy and low drawdown
   D   Institutional Stability
   E   High‑Expectancy Tightening
   F   Final Institutional
+
+Enhanced Objective Features:
+  - Uses daily returns and individual trades data
+  - Better risk-adjusted return metrics
+  - More robust coverage and stability calculations
+  - Balanced composite scoring
 
 EOF
     exit "${1:-0}"
@@ -85,9 +93,11 @@ while [[ $# -gt 0 ]]; do
         --files)            FILES="$2"; shift 2 ;;
         --fill)             FILL_MODE="$2"; shift 2 ;;
         --n-jobs)           N_JOBS="$2"; shift 2 ;;
+        --use-enhanced)     USE_ENHANCED_OBJECTIVE=true; shift ;;
+        --use-original)     USE_ENHANCED_OBJECTIVE=false; shift ;;
         --dry-run)          DRY_RUN=true; shift ;;
         --help|-h)          usage 0 ;;
-        A|B|C|D|E|F)        SELECTED_PHASES+=("$1"); shift ;;
+        D|E|F)              SELECTED_PHASES+=("$1"); shift ;;
         *)                  echo "Unknown option: $1"; usage 1 ;;
     esac
 done
@@ -106,18 +116,6 @@ mkdir -p "$LOG_DIR"
 declare -A PHASE_PARAMS
 declare -A PHASE_NAMES
 
-# Phase A — Discovery
-PHASE_PARAMS["A"]="2 0.40 1.10 -0.40 1.00 0.0008 0.0010 6 0.45 1.5 6.0 0.0010"
-PHASE_NAMES["A"]="Discovery: Escape the zero-plateau (wide search)"
-
-# Phase B — Robustness Formation
-PHASE_PARAMS["B"]="3 0.60 1.40 -0.22 1.60 0.00120 0.00130 10 0.55 3.8 6.0 0.00110"
-PHASE_NAMES["B"]="Robustness Formation"
-
-# Phase C — Expectancy Tightening
-PHASE_PARAMS["C"]="4 0.70 1.45 -0.22 1.95 0.00110 0.00140 12 0.50 2.7 6.0 0.00120"
-PHASE_NAMES["C"]="Expectancy Tightening"
-
 # Phase D — Institutional Stability
 PHASE_PARAMS["D"]="4 0.75 1.75 -0.12 2.20 0.00140 0.00145 12 0.54 3.0 6.0 0.00105"
 PHASE_NAMES["D"]="Institutional Stability"
@@ -129,6 +127,32 @@ PHASE_NAMES["E"]="High‑Expectancy Tightening"
 # Phase F — Final Institutional
 PHASE_PARAMS["F"]="6 0.85 2.10 -0.05 3.00 0.00170 0.00180 16 0.55 3.0 5.0 0.00100"
 PHASE_NAMES["F"]="Final Institutional"
+
+# ───────────────────────────────────────────────────────────────
+# Enhanced Objective Phase Adjustments
+# These adjust parameters for the enhanced objective function
+# ───────────────────────────────────────────────────────────────
+
+declare -A ENHANCED_ADJUSTMENTS
+
+# For enhanced objective, we can use slightly different parameters
+ENHANCED_ADJUSTMENTS["min_trades"]="4"        # Keep at 4 for enhanced
+ENHANCED_ADJUSTMENTS["weight_pf"]="0.70"      # Lower PF weight due to more metrics
+ENHANCED_ADJUSTMENTS["score_power"]="1.70"    # Slightly less sharpening
+ENHANCED_ADJUSTMENTS["min_glpt"]="0.0015"     # Slightly higher GLPT target
+ENHANCED_ADJUSTMENTS["coverage_target"]="0.56" # Slightly higher coverage
+
+# Function to get enhanced-adjusted value
+get_enhanced_value() {
+    local var_name="$1"
+    local original_value="$2"
+    
+    if $USE_ENHANCED_OBJECTIVE && [[ -n "${ENHANCED_ADJUSTMENTS[$var_name]:-}" ]]; then
+        echo "${ENHANCED_ADJUSTMENTS[$var_name]}"
+    else
+        echo "$original_value"
+    fi
+}
 
 # ───────────────────────────────────────────────────────────────
 # Runner Function
@@ -146,12 +170,22 @@ run_phase() {
         coverage_target coverage_k \
         pf_cap_val loss_floor_val <<< "$params"
     
+    # Get enhanced-adjusted values if enabled
+    if $USE_ENHANCED_OBJECTIVE; then
+        min_trades=$(get_enhanced_value "min_trades" "$min_trades")
+        weight_pf=$(get_enhanced_value "weight_pf" "$weight_pf")
+        score_power=$(get_enhanced_value "score_power" "$score_power")
+        min_glpt=$(get_enhanced_value "min_glpt" "$min_glpt")
+        coverage_target=$(get_enhanced_value "coverage_target" "$coverage_target")
+    fi
+    
     local phase_name="${PHASE_NAMES[$phase_code]}"
     local log_file="$LOG_DIR/phase_${phase_code}.log"
 
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
     echo " PHASE $phase_code : $phase_name"
+    echo " Objective: $($USE_ENHANCED_OBJECTIVE && echo "Enhanced" || echo "Original")"
     echo " min_trades: $min_trades | weight_pf: $weight_pf | score_power: $score_power"
     echo " ret_floor: $ret_floor | min_glpt: $min_glpt | coverage_target: $coverage_target"
     echo "═══════════════════════════════════════════════════════════════"
@@ -216,6 +250,11 @@ run_phase() {
         --commission_rate_per_side "$COMMISSION"
         --objective-mode "hybrid"
     )
+    
+    # Add enhanced objective flag if enabled
+    if $USE_ENHANCED_OBJECTIVE; then
+        CMD+=(--use-enhanced-objective)
+    fi
 
     if $DRY_RUN; then
         echo "DRY RUN COMMAND:"
@@ -227,6 +266,7 @@ run_phase() {
         echo "  min_glpt: $min_glpt, min_glpt_k: $min_glpt_k"
         echo "  coverage_target: $coverage_target, coverage_k: $coverage_k"
         echo "  pf_cap: $pf_cap_val, loss_floor: $loss_floor_val"
+        echo "  Enhanced objective: $USE_ENHANCED_OBJECTIVE"
     else
         echo "Running phase $phase_code..."
         echo "Command: ${CMD[*]}"
@@ -253,6 +293,7 @@ echo "Starting Vidya_RSI Optimization Sweep..."
 echo "Seed: $SEED | Trials: $TRIALS | Jobs: $N_JOBS | Files: $FILES"
 echo "Selected phases: ${SELECTED_PHASES[*]}"
 echo "Using Python: $PYTHON_BIN"
+echo "Objective function: $($USE_ENHANCED_OBJECTIVE && echo "Enhanced" || echo "Original")"
 echo ""
 
 # Validate all selected phases exist
@@ -282,4 +323,18 @@ echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "Multi-phase optimization complete."
 echo "Logs saved in $LOG_DIR/"
+echo "Objective used: $($USE_ENHANCED_OBJECTIVE && echo "Enhanced" || echo "Original")"
 echo "═══════════════════════════════════════════════════════════════"
+
+# Final recommendation based on objective used
+if $USE_ENHANCED_OBJECTIVE; then
+    echo ""
+    echo "RECOMMENDATION: Run validation with enhanced objective:"
+    echo "  python3 Vidya_RSI.py --use-enhanced-objective --files $FILES \\"
+    echo "    --threshold-fixed <best_threshold> --vol-floor-mult-fixed <best_vol_floor> \\"
+    echo "    --vidya-len-fixed <best_len> --vidya-smooth-fixed <best_smooth>"
+else
+    echo ""
+    echo "RECOMMENDATION: Consider running with enhanced objective:"
+    echo "  $SCRIPT_NAME --use-enhanced ${SELECTED_PHASES[@]}"
+fi
