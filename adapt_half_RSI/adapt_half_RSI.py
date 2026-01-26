@@ -552,6 +552,11 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--commission_rate_per_side", type=float, default=0.0006)
 
+    ap.add_argument("--slMultiplier-min", type=float, default=1.0)
+    ap.add_argument("--slMultiplier-max", type=float, default=5.0)
+    ap.add_argument("--tpMultiplier-min", type=float, default=1.0)
+    ap.add_argument("--tpMultiplier-max", type=float, default=5.0)
+
     # Scoring & penalty parameters — ALL required flags are here
     ap.add_argument("--pf-cap", type=float, default=10.0, dest="pf_cap_score_only")
     ap.add_argument("--pf-baseline", type=float, default=1.8)
@@ -752,8 +757,8 @@ def main():
     # ── OPTIMIZATION ────────────────────────────────────────────
     def objective(trial: optuna.Trial) -> float:
         atrPeriod = trial.suggest_int("atrPeriod", 5, 80)
-        slMultiplier = trial.suggest_float("slMultiplier", 0.5, 12.0)
-        tpMultiplier = trial.suggest_float("tpMultiplier", 0.5, 12.0)
+        slMultiplier = trial.suggest_float("slMultiplier", args.slMultiplier_min, args.slMultiplier_max)
+        tpMultiplier = trial.suggest_float("tpMultiplier", args.tpMultiplier_min, args.tpMultiplier_max)
 
         min_eff = min_tp2sl_eff_for(atrPeriod)
         if slMultiplier <= min_eff * tpMultiplier:

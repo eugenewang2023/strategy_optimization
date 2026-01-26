@@ -1,0 +1,24 @@
+=== BEST RESULT - Adaptive Half-RSI ===
+Run timestamp         : 20260126_104205
+Objective value       : 0.106272
+
+Best parameters:
+  adapt_k            : 0.16339094376101734
+  atrPeriod          : 10
+  base_slow_window   : 21
+  cooldown           : 1
+  shift              : 1
+  slMultiplier       : 4.990845996525748
+  smooth_len         : 3
+  time_stop          : 0
+  tpMultiplier       : 4.442103699864539
+
+Performance:
+  Mean ticker score   : 0.110428
+  Avg PF (raw)        : 8.71319137452176
+  Avg trades/ticker   : 6.46
+  Negative returns    : 23/147
+
+  Commission/side     : 0.000600
+  Penalty enabled     : True
+  min_tp2sl_eff       : 1.0750
