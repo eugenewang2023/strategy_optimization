@@ -28,8 +28,11 @@ def load_runs_from_dir(input_dir: Path):
         # Take everything AFTER the last "per_ticker"
         if "per_ticker" in stem:
             parts = stem.split("per_ticker")
+            head = parts[0]
             tail = parts[-1].lstrip("_-")
-            run_id = tail if tail else stem
+            run_id = head + tail
+            if not run_id:
+                run_id = stem
         else:
             run_id = stem  # fallback
 
