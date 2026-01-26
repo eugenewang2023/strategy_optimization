@@ -707,6 +707,8 @@ def parse_args():
     ap.add_argument("--slMultiplier-fixed", type=float, default=3.0)
     ap.add_argument("--tpMultiplier-fixed", type=float, default=3.0)
 
+    ap.add_argument("--basePeriod-min", type=int)
+    ap.add_argument("--basePeriod-max", type=int)
     ap.add_argument("--basePeriod-fixed", type=int, default=20)
     ap.add_argument("--minPeriod-fixed", type=int, default=5)
     ap.add_argument("--maxPeriod-fixed", type=int, default=35)
