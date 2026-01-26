@@ -1,3 +1,52 @@
+1/25/2026
+Vidya_RSI_v0.2.2
+The Vidya_RSI strategy has been optimized into an ultra-sensitive, short-term trading system with a best score of 0.3877. Key parameters show extreme sensitivity (fastPeriod=6, threshold=0.0016) and short holding periods (9 bars). While risk controls have tightened (cooldown=3, regime_ratio=3.5), the strategy now faces overfitting risks due to its highly tuned nature. Optimization progress has plateaued after 900 trials, indicating the current parameter set represents a local optimum. Next steps should prioritize out-of-sample validation with more data before further optimization.
+
+=== OPTIMIZER HEALTH REPORT ===
+Trials completed: 300
+Score mean:       0.253143
+Score median:     0.271978
+Score std:        0.094747
+Degenerate trials (0 or None): 0
+Best-so-far monotonic: False
+
+Parameter usage counts:
+  regime_ratio: 300
+  vidya_len: 300
+  vidya_smooth: 300
+  fastPeriod: 300
+  slowPeriod: 300
+  time_stop_bars: 300
+  threshold: 300
+  vol_floor_mult: 300
+  cooldown_bars: 300
+
+Parameter entropy:
+  regime_ratio: std=0.8790
+  vidya_len: std=4.5990
+  vidya_smooth: std=13.2229
+  fastPeriod: std=3.9666
+  slowPeriod: std=4.7455
+  time_stop_bars: std=3.3698
+  threshold: std=0.0021
+  vol_floor_mult: std=0.0541
+  cooldown_bars: std=0.8455
+
+=== END REPORT ===
+
+Vidya_RSI Hybrid Adaptive ▒ done.
+next_open CSV: output\vidya_RSI_per_ticker_next_open_20260125_210339.csv
+Summary TXT: output\vidya_RSI_best_20260125_210339.txt
+
+Done with phase F
+
+═══════════════════════════════════════════════════════════════
+Multi-phase optimization complete.
+Logs saved in logs/
+Objective used: Enhanced
+═══════════════════════════════════════════════════════════════
+
+
 vl – VIDYA EMA length (efficiency lookback window)
 vs – VIDYA EMA smoothing factor (base EMA responsiveness)
 fp – Fast ZLEMA period applied to VIDYA

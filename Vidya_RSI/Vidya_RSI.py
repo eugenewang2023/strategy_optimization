@@ -566,6 +566,491 @@ class TradeStats:
     coverage: float = 0.0 
     stability: float = 0.0
 
+@dataclass
+class EnhancedTradeStats:
+    """Enhanced stats with returns and trades data."""
+    # Original TradeStats fields
+    gp: float = 0.0
+    gl: float = 0.0
+    trades: int = 0
+    tot_ret: float = 0.0
+    maxdd: float = 0.0
+    num_neg_trades: int = 0
+    profit_factor_raw: float = 0.0
+    profit_factor_eff: float = 0.0
+    profit_factor_diag: float = 0.0
+    zero_loss: int = 0
+    pf_capped: int = 0
+    gl_per_trade: float = 0.0
+    atr_pct_med: float = 0.0
+    coverage: float = 0.0
+    stability: float = 0.0
+    
+    # New fields for enhanced analysis
+    daily_returns: np.ndarray = None
+    equity_curve: np.ndarray = None
+    individual_trades: list = None  # List of dicts with trade details
+
+
+def backtest_vidya_engine_enhanced(df: pd.DataFrame, **p) -> EnhancedTradeStats:
+    """
+    Enhanced hybrid-adaptive backtest engine.
+    Returns complete data for objective functions.
+    """
+    # --------------------------------------------------------
+    # Extract OHLC
+    # --------------------------------------------------------
+    o = df["open"].to_numpy(dtype=float)
+    h = df["high"].to_numpy(dtype=float)
+    l = df["low"].to_numpy(dtype=float)
+    c = df["close"].to_numpy(dtype=float)
+    n = len(c)
+
+    # --------------------------------------------------------
+    # Regime length
+    # --------------------------------------------------------
+    regime_ratio = float(p.get("regime_ratio", 3.0))
+    reg_len = int(p["slowPeriod"] * regime_ratio)
+
+    if n < max(200, reg_len + 50):
+        return EnhancedTradeStats()
+
+    # --------------------------------------------------------
+    # Heikin-Ashi close proxy
+    # --------------------------------------------------------
+    ha_c = (o + h + l + c) / 4.0
+
+    # --------------------------------------------------------
+    # ATR and ATR%
+    # --------------------------------------------------------
+    prev_c = np.roll(c, 1)
+    prev_c[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+    atr = pd.Series(tr).rolling(25).mean().to_numpy()
+
+    atr_pct = atr / (c + 1e-12)
+    finite_atr_pct = atr_pct[np.isfinite(atr_pct)]
+    atr_pct_med = float(np.nanmedian(finite_atr_pct)) if finite_atr_pct.size else 0.0
+
+    # --------------------------------------------------------
+    # Indicators: VIDYA (for regime only) + half_RSI fast/slow
+    # --------------------------------------------------------
+    v_main = vidya_ema(ha_c, p["vidya_len"], p["vidya_smooth"])
+
+    # --- half_RSI-style fast/slow RSI lengths ---
+    slow_len = int(p["slowPeriod"])
+    fast_len = max(1, int(round(slow_len / 2)))
+
+    # --- Compute RSI on Heikin-Ashi close ---
+    fast_rsi_raw = rsi_tv(ha_c, fast_len)
+    slow_rsi_raw = rsi_tv(ha_c, slow_len)
+
+    # --- Apply shift if provided ---
+    shift = int(p.get("shift", 0))
+    if shift > 0:
+        fast_rsi = np.roll(fast_rsi_raw, shift)
+        slow_rsi = np.roll(slow_rsi_raw, shift)
+        fast_rsi[:shift] = np.nan
+        slow_rsi[:shift] = np.nan
+    else:
+        fast_rsi = fast_rsi_raw
+        slow_rsi = slow_rsi_raw
+
+    # --- Invert slow RSI (half_RSI logic) ---
+    slow_rsi_inv = 100.0 - slow_rsi
+
+    # --- Hot spread identical to half_RSI ---
+    hot = fast_rsi - slow_rsi_inv
+
+    # --- Smooth hot spread ---
+    def rolling_mean(arr, window, min_periods=1):
+        arr = np.asarray(arr, dtype=np.float64).ravel()
+        n = len(arr)
+        
+        if n == 0:
+            return np.array([], dtype=float)
+        
+        window = int(window)
+        if window <= 1:
+            return arr.copy()
+        
+        if window > n:
+            cumsum = np.cumsum(arr)
+            result = cumsum / (np.arange(n) + 1)
+            result[:min_periods-1] = np.nan
+            return result
+        
+        kernel = np.ones(window, dtype=float) / window
+        pad_width = window - 1
+        padded = np.concatenate([
+            np.full(pad_width, arr[0] if min_periods > 1 else np.nan),
+            arr
+        ])
+        
+        conv = np.convolve(padded, kernel, mode='valid')
+        result = conv.copy()
+        
+        if min_periods > 1:
+            result[:min_periods-1] = np.nan
+        return result
+
+    smooth_len = int(p.get("smooth_len", 5))
+    hot_sm = rolling_mean(hot, smooth_len, min_periods=1)
+
+    # --------------------------------------------------------
+    # Regime EMA + slope
+    # --------------------------------------------------------
+    reg_ema = regime_ema_series(c, reg_len)
+    non_nan_count = np.sum(~np.isnan(reg_ema))
+    if non_nan_count < 10:
+        return EnhancedTradeStats()
+    
+    reg_slope = momentum_slope(reg_ema, window=5)
+    if (np.isscalar(reg_slope) or not isinstance(reg_slope, np.ndarray) 
+        or reg_slope.ndim != 1 or len(reg_slope) != n):
+        return EnhancedTradeStats()
+
+    # --------------------------------------------------------
+    # Adaptive regime classification
+    # --------------------------------------------------------
+    vol_regime = classify_volatility_regime(atr_pct)
+    trend_regime = classify_trend_regime(reg_ema, slope_window=5)
+
+    # --------------------------------------------------------
+    # Adaptive threshold
+    # --------------------------------------------------------
+    base_thr = float(p.get("threshold", 0.04))
+    thr = adaptive_threshold(base_thr, vol_regime, trend_regime)
+
+    # --------------------------------------------------------
+    # Adaptive ATR multipliers
+    # --------------------------------------------------------
+    stop_mult, tgt_mult = adaptive_atr_multipliers(
+        vol_regime,
+        trend_regime,
+        base_stop_mult=1.5,
+        base_tgt_mult=2.0
+    )
+
+    # --------------------------------------------------------
+    # Backtest state with ENHANCED TRACKING
+    # --------------------------------------------------------
+    equity = 1.0
+    gp = 0.0
+    gl = 0.0
+    trades = 0
+    in_pos = False
+    entry = 0.0
+    entry_bar = 0
+    bars_in_trade = 0
+    cooldown_left = 0
+    
+    # ENHANCED: Track daily returns and equity curve
+    daily_returns = np.zeros(n)
+    equity_curve = np.ones(n)
+    
+    # ENHANCED: Track individual trades
+    individual_trades = []
+    
+    fill_mode = p.get("fill_mode", "next_open")
+    commission = float(p.get("commission", 0.0))
+    cooldown_bars = int(p.get("cooldown_bars", 1))
+    time_stop_bars = int(p.get("time_stop_bars", 15))
+    use_regime = bool(p.get("use_regime", False))
+
+    # --------------------------------------------------------
+    # Main loop with ENHANCED TRACKING
+    # --------------------------------------------------------
+    for i in range(reg_len + 10, n - 2):
+        # Track equity and returns for each day
+        if i > 0:
+            equity_curve[i] = equity
+        
+        # Cooldown after losing trades
+        if cooldown_left > 0:
+            cooldown_left -= 1
+            daily_returns[i] = 0.0
+            continue
+
+        # Need valid hot_sm and ATR
+        if not (np.isfinite(hot_sm[i]) and np.isfinite(hot_sm[i - 1]) and np.isfinite(atr[i])):
+            daily_returns[i] = 0.0
+            continue
+
+        # ----------------------------------------------------
+        # Regime filter (adaptive)
+        # ----------------------------------------------------
+        if use_regime and i - 5 >= 0:
+            regime_ok = (
+                c[i] > reg_ema[i] and
+                reg_ema[i] > reg_ema[i - 5] and
+                reg_slope[i] > 0
+            )
+        else:
+            regime_ok = True
+
+        # ----------------------------------------------------
+        # ENTRY LOGIC — hot crosses above threshold
+        # ----------------------------------------------------
+        if (not in_pos) and (hot_sm[i - 1] <= thr) and (hot_sm[i] > thr) and regime_ok:
+            entry = float(o[i + 1]) if fill_mode == "next_open" else float(c[i])
+            if entry > 0 and np.isfinite(entry):
+                in_pos = True
+                entry_bar = i
+                trades += 1
+                bars_in_trade = 0
+            daily_returns[i] = 0.0
+            continue
+
+        # ----------------------------------------------------
+        # EXIT LOGIC
+        # ----------------------------------------------------
+        if in_pos:
+            bars_in_trade += 1
+
+            # Adaptive stop/target
+            stop = entry - atr[i] * stop_mult
+            tgt = entry + atr[i] * tgt_mult
+
+            exit_p = None
+            exit_reason = ""
+
+            # 1) Hard stop
+            if np.isfinite(stop) and l[i] <= stop:
+                exit_p = float(stop)
+                exit_reason = "stop_loss"
+
+            # 2) Target
+            elif np.isfinite(tgt) and h[i] >= tgt:
+                exit_p = float(tgt)
+                exit_reason = "target"
+
+            # 3) Time-stop (adaptive)
+            elif time_stop_bars > 0 and bars_in_trade >= time_stop_bars:
+                exit_p = float(o[i + 1] if i + 1 < n else c[i])
+                exit_reason = "time_stop"
+
+            # 4) Momentum fade exit
+            elif hot_sm[i] < hot_sm[i - 3] if i - 3 >= 0 else False:
+                exit_p = float(o[i + 1] if i + 1 < n else c[i])
+                exit_reason = "momentum_fade"
+
+            # 5) Regime flip exit
+            elif use_regime and reg_ema[i] < reg_ema[i - 3]:
+                exit_p = float(o[i + 1] if i + 1 < n else c[i])
+                exit_reason = "regime_flip"
+
+            # 6) Final bar
+            elif i == n - 3:
+                exit_p = float(c[i])
+                exit_reason = "final_bar"
+
+            # ------------------------------------------------
+            # EXECUTE EXIT
+            # ------------------------------------------------
+            if exit_p is not None and np.isfinite(exit_p) and entry > 0:
+                # Calculate P&L
+                pnl = ((exit_p - entry) / entry) - (commission * 2.0)
+                equity *= (1.0 + pnl)
+                
+                # ENHANCED: Record daily return
+                daily_returns[i] = pnl
+                equity_curve[i] = equity
+                
+                if pnl >= 0:
+                    gp += pnl
+                else:
+                    gl += abs(pnl)
+                    cooldown_left = cooldown_bars
+                
+                # ENHANCED: Record individual trade
+                individual_trades.append({
+                    'entry_price': entry,
+                    'exit_price': exit_p,
+                    'entry_bar': entry_bar,
+                    'exit_bar': i,
+                    'pnl': pnl,
+                    'bars_held': bars_in_trade,
+                    'exit_reason': exit_reason,
+                    'is_win': pnl >= 0
+                })
+                
+                in_pos = False
+                continue
+        
+        # If no trade action, record 0 return
+        daily_returns[i] = 0.0
+
+    # Fill in the rest of equity curve
+    for i in range(n - 2, n):
+        equity_curve[i] = equity
+    
+    # Trim arrays to actual data length
+    daily_returns = daily_returns[reg_len + 10:]
+    equity_curve = equity_curve[reg_len + 10:]
+    
+    # --------------------------------------------------------
+    # Max Drawdown
+    # --------------------------------------------------------
+    if len(equity_curve) >= 2:
+        peak = np.maximum.accumulate(equity_curve)
+        dd = (equity_curve / (peak + 1e-12)) - 1.0
+        maxdd = float(dd.min())
+    else:
+        maxdd = 0.0
+
+    # --------------------------------------------------------
+    # PF metrics
+    # --------------------------------------------------------
+    pfm = compute_pf_metrics(
+        gp, gl,
+        loss_floor=float(p.get("loss_floor", 0.001)),
+        pf_diag_cap=float(p.get("pf_cap_score_only", 5.0)),
+    )
+
+    pf_raw_csv = safe_pf_raw_for_csv(pfm["profit_factor_raw"], inf_placeholder=1e9)
+    gl_per_trade = float(gl / max(trades, 1))
+    
+    # ENHANCED: Calculate num_neg_trades from individual trades
+    num_neg_trades = sum(1 for trade in individual_trades if not trade['is_win'])
+
+    # --------------------------------------------------------
+    # Coverage & Stability
+    # --------------------------------------------------------
+    coverage = trades / max(n, 1)
+
+    # ENHANCED: Calculate stability from daily returns
+    if len(daily_returns) > 2:
+        returns_std = np.std(daily_returns)
+        stability = 1.0 / (1.0 + returns_std)
+    else:
+        stability = 0.0
+
+    return EnhancedTradeStats(
+        # Original fields
+        gp=float(gp),
+        gl=float(gl),
+        trades=int(trades),
+        tot_ret=float(equity - 1.0),
+        maxdd=float(maxdd),
+        num_neg_trades=int(num_neg_trades),
+        profit_factor_raw=float(pf_raw_csv),
+        profit_factor_eff=float(pfm["profit_factor_eff"]),
+        profit_factor_diag=float(pfm["profit_factor_diag"]),
+        zero_loss=int(pfm["zero_loss"]),
+        pf_capped=int(pfm["pf_capped"]),
+        gl_per_trade=float(gl_per_trade),
+        atr_pct_med=float(atr_pct_med),
+        coverage=float(coverage),
+        stability=float(stability),
+        
+        # New enhanced fields
+        daily_returns=daily_returns,
+        equity_curve=equity_curve,
+        individual_trades=individual_trades
+    )
+
+
+def stats_to_dataframes(stats_list, ticker_names=None):
+    """
+    Convert list of EnhancedTradeStats to returns_df and trades_df.
+    
+    Returns:
+        returns_df: DataFrame with columns ['ticker', 'returns', 'equity']
+        trades_df: DataFrame with columns ['ticker', 'profit_loss']
+    """
+    returns_data = []
+    trades_data = []
+    
+    for idx, st in enumerate(stats_list):
+        if not isinstance(st, EnhancedTradeStats):
+            continue
+            
+        ticker = ticker_names[idx] if ticker_names and idx < len(ticker_names) else f"ticker_{idx}"
+        
+        # Build returns DataFrame
+        if st.daily_returns is not None and len(st.daily_returns) > 0:
+            for j, (ret, equity) in enumerate(zip(st.daily_returns, st.equity_curve)):
+                returns_data.append({
+                    'ticker': ticker,
+                    'returns': ret,
+                    'equity': equity
+                })
+        else:
+            # Fallback: single return
+            returns_data.append({
+                'ticker': ticker,
+                'returns': st.tot_ret,
+                'equity': 1.0 + st.tot_ret
+            })
+        
+        # Build trades DataFrame
+        if st.individual_trades:
+            for trade in st.individual_trades:
+                trades_data.append({
+                    'ticker': ticker,
+                    'profit_loss': trade['pnl']
+                })
+        elif st.trades > 0:
+            # Fallback: aggregate trade
+            trades_data.append({
+                'ticker': ticker,
+                'profit_loss': st.gp - st.gl
+            })
+    
+    returns_df = pd.DataFrame(returns_data) if returns_data else pd.DataFrame()
+    trades_df = pd.DataFrame(trades_data) if trades_data else pd.DataFrame()
+    
+    return returns_df, trades_df
+
+
+def objective_balanced_enhanced(trial, all_data, args):
+    """
+    Enhanced objective using the balanced objective functions.
+    """
+    # 1. Sample parameters
+    p = sample_params(trial, args)
+    
+    # 2. Run enhanced backtest on all tickers
+    stats = []
+    for ticker, df in all_data.items():
+        st = backtest_vidya_engine_enhanced(df, **p)
+        stats.append(st)
+    
+    # 3. Convert to dataframes for objective functions
+    ticker_names = list(all_data.keys())
+    returns_df, trades_df = stats_to_dataframes(stats, ticker_names)
+    
+    # 4. Calculate aggregate metrics
+    eligible_stats = [s for s in stats if s.trades >= args.min_trades]
+    coverage = len(eligible_stats) / len(stats) if stats else 0.0
+    
+    # Calculate stability from daily returns
+    all_returns = []
+    for st in stats:
+        if hasattr(st, 'daily_returns') and st.daily_returns is not None:
+            all_returns.extend(st.daily_returns)
+    
+    if len(all_returns) > 1:
+        returns_std = np.std(all_returns)
+        stability = 1.0 / (1.0 + returns_std)
+    else:
+        stability = 0.5  # Default
+    
+    # 5. Prepare data for objective
+    data_for_obj = {
+        'coverage': coverage,
+        'stability': stability
+    }
+    
+    # 6. Use the appropriate objective function
+    if len(returns_df) > 0 and len(trades_df) > 0:
+        score = objective_balanced_simple(p, data_for_obj, returns_df, trades_df)
+    else:
+        # Fallback to minimal objective
+        score = objective_balanced_minimal(p, data_for_obj, returns_df, trades_df)
+    return score
+
 
 def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
     """
@@ -1368,19 +1853,49 @@ def sample_params(trial, args):
 
 def objective_for_params(params, args):
     """
-    Run backtest with given parameters and compute score.
+    Run backtest with given parameters and compute score using enhanced engine.
     """
-    # Run backtest on all tickers
+    # Run enhanced backtest on all tickers
     stats = []
     for ticker, df in loaded_data.items():
         try:
-            st = backtest_vidya_engine(df, **params)
+            st = backtest_vidya_engine_enhanced(df, **params)
         except Exception as e:
-            st = TradeStats()
+            st = EnhancedTradeStats()
         stats.append(st)
     
-    # Compute score using the objective function logic
-    score = objective(trial=None, all_data=loaded_data, args=args)
+    # Use enhanced objective function
+    ticker_names = list(loaded_data.keys())
+    returns_df, trades_df = stats_to_dataframes(stats, ticker_names)
+    
+    # Calculate aggregate metrics
+    eligible_stats = [s for s in stats if s.trades >= args.min_trades]
+    coverage = len(eligible_stats) / len(stats) if stats else 0.0
+    
+    # Calculate stability from daily returns
+    all_returns = []
+    for st in stats:
+        if hasattr(st, 'daily_returns') and st.daily_returns is not None:
+            all_returns.extend(st.daily_returns)
+    
+    if len(all_returns) > 1:
+        returns_std = np.std(all_returns)
+        stability = 1.0 / (1.0 + returns_std)
+    else:
+        stability = 0.5  # Default
+    
+    # Prepare data for objective
+    data_for_obj = {
+        'coverage': coverage,
+        'stability': stability
+    }
+    
+    # Use the appropriate objective function
+    if len(returns_df) > 0 and len(trades_df) > 0:
+        score = objective_balanced_simple(params, data_for_obj, returns_df, trades_df)
+    else:
+        # Fallback to minimal objective
+        score = objective_balanced_minimal(params, data_for_obj, returns_df, trades_df)
     
     # Diagnostics
     diagnostics = {
@@ -1574,6 +2089,168 @@ def objective(trial, all_data, args):
     base_score = float(np.mean([score_trial(st, args) for st in stats]))
     final_score = base_score * penalty_mult
     return final_score
+
+# ========== REQUIRED FUNCTIONS ==========
+
+def calculate_sharpe(returns, risk_free_rate=0.02):
+    """Annualized Sharpe Ratio"""
+    if len(returns) < 2 or returns.std() == 0:
+        return 0
+    excess_returns = returns - risk_free_rate/252  # Daily risk-free
+    return excess_returns.mean() / returns.std() * np.sqrt(252)
+
+def calculate_max_drawdown(equity_curve):
+    """Maximum drawdown (positive value)"""
+    if len(equity_curve) == 0:
+        return 0.5  # Conservative penalty
+    
+    peak = equity_curve.expanding().max()
+    drawdown = (equity_curve - peak) / peak
+    return abs(drawdown.min())  # Returns positive value (e.g., 0.15 for 15% DD)
+
+# ========== OPTIONAL (but helpful) ==========
+
+def calculate_sortino(returns, risk_free_rate=0.02, target_return=0):
+    """Only needed if you want Sortino Ratio"""
+    excess_returns = returns - risk_free_rate/252
+    downside_returns = excess_returns[excess_returns < target_return]
+    if len(downside_returns) < 2 or downside_returns.std() == 0:
+        return 0
+    return excess_returns.mean() / downside_returns.std() * np.sqrt(252)
+
+def objective_balanced_minimal(params, data, returns_df, trades_df):
+    """
+    Minimal balanced objective - requires only pandas/numpy.
+    """
+    # 1. Basic metrics (handle empty cases)
+    if len(returns_df) == 0 or len(trades_df) == 0:
+        return -100  # Very bad score
+    
+    # Total Return
+    total_return = returns_df['equity'].iloc[-1] / returns_df['equity'].iloc[0] - 1
+    
+    # Simple Risk-Adjusted Return (Sharpe-like)
+    returns = returns_df['returns']
+    if returns.std() > 0:
+        risk_adj_return = returns.mean() / returns.std()
+    else:
+        risk_adj_return = 0
+    
+    # Win Rate
+    win_rate = (trades_df['profit_loss'] > 0).mean()
+    
+    # Profit Factor
+    wins = trades_df[trades_df['profit_loss'] > 0]['profit_loss'].sum()
+    losses = abs(trades_df[trades_df['profit_loss'] < 0]['profit_loss'].sum())
+    profit_factor = wins / losses if losses > 0 else 1.0
+    
+    # Composite Score
+    score = (
+        total_return * 0.3 +
+        risk_adj_return * 0.3 +
+        min(profit_factor, 3.0) * 0.2 +  # Cap at 3
+        win_rate * 0.2
+    )
+    
+    # Apply data quality penalties
+    score *= data.get('coverage', 0.5)
+    score *= data.get('stability', 0.5)
+    return score
+
+def objective_balanced_simple(params, data, returns_df, trades_df):
+    """
+    Balanced objective - NO external dependencies needed.
+    """
+    # ========== 1. Calculate metrics from returns_df ==========
+    # Total Return
+    if len(returns_df) > 0:
+        total_return = returns_df['equity'].iloc[-1] / returns_df['equity'].iloc[0] - 1
+    else:
+        total_return = -0.5  # Heavy penalty for no returns
+    
+    # Sharpe Ratio (built-in)
+    if len(returns_df) > 1 and returns_df['returns'].std() > 0:
+        risk_free_daily = 0.02 / 252
+        excess_returns = returns_df['returns'] - risk_free_daily
+        sharpe_ratio = excess_returns.mean() / returns_df['returns'].std() * np.sqrt(252)
+    else:
+        sharpe_ratio = 0
+    
+    # Max Drawdown (built-in)
+    if len(returns_df) > 0:
+        equity = returns_df['equity']
+        peak = equity.expanding().max()
+        drawdown = (equity - peak) / peak
+        max_dd = abs(drawdown.min())
+    else:
+        max_dd = 0.5  # Conservative penalty
+    
+    # ========== 2. Calculate metrics from trades_df ==========
+    if len(trades_df) > 0:
+        # Win Rate
+        win_rate = (trades_df['profit_loss'] > 0).mean()
+        
+        # Profit Factor
+        gross_profit = trades_df[trades_df['profit_loss'] > 0]['profit_loss'].sum()
+        gross_loss = abs(trades_df[trades_df['profit_loss'] < 0]['profit_loss'].sum())
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 1.0
+        profit_factor = min(profit_factor, 5.0)  # Cap at 5.0
+    else:
+        win_rate = 0
+        profit_factor = 0
+    
+    # ========== 3. Penalties ==========
+    # Coverage penalty
+    coverage = data.get('coverage', 0.5)
+    coverage_penalty = max(0.5, coverage)
+    
+    # Stability penalty
+    stability = data.get('stability', 0.5)
+    stability_penalty = stability ** 2  # Quadratic
+    
+    # Diversity penalty
+    if 'ticker' in trades_df.columns:
+        unique_tickers = trades_df['ticker'].nunique()
+        diversity_penalty = min(1.0, unique_tickers / 20)
+    else:
+        diversity_penalty = 0.5
+    
+    # ========== 4. Composite Score ==========
+    weights = {
+        'total_return': 0.25,
+        'sharpe_ratio': 0.25,
+        'profit_factor': 0.20,
+        'max_dd': 0.15,  # Note: max_dd is positive, so we invert
+        'win_rate': 0.15
+    }
+    
+    # Invert max_dd (lower is better)
+    max_dd_score = 1 - min(max_dd, 0.5)  # Cap at 50% DD
+    
+    # Normalize profit factor (0-5 becomes 0-1)
+    pf_score = profit_factor / 5.0
+    
+    score = (
+        total_return * weights['total_return'] +
+        sharpe_ratio * weights['sharpe_ratio'] +
+        pf_score * weights['profit_factor'] +
+        max_dd_score * weights['max_dd'] +
+        win_rate * weights['win_rate']
+    )
+    
+    # Apply penalties
+    score *= coverage_penalty
+    score *= stability_penalty
+    score *= diversity_penalty
+    
+    # Penalty for too few trades
+    min_trades = 20
+    trade_count = len(trades_df)
+    if trade_count < min_trades:
+        penalty = (trade_count / min_trades) ** 2  # Quadratic penalty
+        score *= penalty
+    return score
+
 
 def update_optimizer_diagnostics(diag, trial, score):
     """
@@ -1770,6 +2447,10 @@ def main():
     ap.add_argument("--output_dir", type=str, default="output")
     ap.add_argument("--report-both-fills", action="store_true")
 
+    # Add option to use enhanced objective
+    ap.add_argument("--use-enhanced-objective", action="store_true", 
+                   help="Use enhanced objective with returns and trades data")
+
     args = ap.parse_args()
 
     # --------------------------------------------------------
@@ -1799,8 +2480,13 @@ def main():
 
     def wrapped_objective(trial):
         params = sample_params(trial, args)
-        # run per-ticker backtests, aggregate TradeStats, etc.
-        score, diagnostics_payload = objective_for_params(params, args)
+        if args.use_enhanced_objective:
+            # Use enhanced objective
+            score = objective_balanced_enhanced(trial, loaded_data, args)
+        else:
+            # Use original objective
+            score, diagnostics_payload = objective_for_params(params, args)
+        
         # Update Optuna diagnostics with the *score* we just computed
         update_optimizer_diagnostics(diagnostics, trial, score)
         return score
@@ -1896,7 +2582,8 @@ def main():
         rows = []
 
         for name, df in data_list:
-            st = backtest_vidya_engine(df, **p)
+            # Use enhanced engine for better reporting
+            st = backtest_vidya_engine_enhanced(df, **p)
             stats.append(st)
             rows.append({
                 "ticker": name,
@@ -1914,6 +2601,8 @@ def main():
                 "gl_per_trade": st.gl_per_trade,
                 "atr_pct_med": st.atr_pct_med,
                 "score": score_trial(st, args),
+                "stability": st.stability,
+                "coverage": st.coverage,
             })
 
         now = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y%m%d_%H%M%S")
@@ -1970,7 +2659,8 @@ def main():
         f.write(f"Generated: {now}\n")
         f.write(f"Data dir: {args.data_dir}\n")
         f.write(f"Files used: {len(data_list)} (requested {args.files})\n")
-        f.write(f"Optimize: {args.optimize} (trials={args.trials})\n\n")
+        f.write(f"Optimize: {args.optimize} (trials={args.trials})\n")
+        f.write(f"Enhanced objective: {args.use_enhanced_objective}\n\n")
 
         f.write("Best parameters:\n")
         for k, v in best_p.items():
