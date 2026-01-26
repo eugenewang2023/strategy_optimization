@@ -11,12 +11,12 @@ command -v "$PYTHON_BIN" >/dev/null 2>&1 || PYTHON_BIN="python"
 
 # Default hardware/execution settings
 SEED=7
-TRIALS=1000
+TRIALS=300
 FILES=300
 FILL_MODE="next_open"
 DATA_DIR="data"
 LOG_DIR="logs"
-N_JOBS=4                  # Parallel trial execution
+N_JOBS=8                  # Parallel trial execution
 N_STARTUP_TRIALS=200      # Initial random exploration count
 
 # Global Strategy Baselines
@@ -79,8 +79,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Run all phases if none selected
-# [[ ${#SELECTED_PHASES[@]} -eq 0 ]] && SELECTED_PHASES=(A B C D E F)
-[[ ${#SELECTED_PHASES[@]} -eq 0 ]] && SELECTED_PHASES=(F)
+#[[ ${#SELECTED_PHASES[@]} -eq 0 ]] && SELECTED_PHASES=(A B C D E F)
+[[ ${#SELECTED_PHASES[@]} -eq 0 ]] && SELECTED_PHASES=(D E F)
 
 mkdir -p "$LOG_DIR"
 
@@ -92,46 +92,27 @@ mkdir -p "$LOG_DIR"
 
 declare -A PHASE_PARAMS
 
-# PHASE A — Exploration / Zero‑Plateau Escape
-# Loose floors, shallow steepness, generous coverage.
-#PHASE_PARAMS["A"]="2 0.40 1.1 -0.40 1.0 0.0 0.0012 4 0.40 2.0 1.8 6.0 0.0010 # Phase A: Exploration"
-#PHASE_PARAMS["A"]="2 0.40 1.10 -0.40 1.00 0.0008 0.0010 6 0.40 3.0 1.6 6.0 0.0010 # Phase A: Exploration"
-PHASE_PARAMS["A"]="2 0.40 1.10 -0.40 1.00 0.0008 0.0010 6 0.40 3.0 6.0 0.0010 # A"
+# Phase A — Discovery
+PHASE_PARAMS["A"]="2 0.40 1.10 -0.40 1.00 0.0008 0.0010 6 0.45 1.5 6.0 0.0010"
 
-# PHASE B — Robustness Formation
-# Slightly tighter returns, more PF weight, higher coverage.
-#PHASE_PARAMS["B"]="3 0.55 1.4 -0.25 1.5 2.0 0.0013 6 0.45 2.5 1.9 6.0 0.0010 # Phase B: Robustness Formation"
-#PHASE_PARAMS["B"]="3 0.55 1.30 -0.28 1.40 0.0010 0.00115 8 0.48 3.4 1.8 6.0 0.0010 # Phase B: Robustness"
-PHASE_PARAMS["B"]="3 0.55 1.30 -0.28 1.40 0.0010 0.00115 8 0.48 3.4 6.0 0.0010 # B"
+# Phase B — Robustness Formation
+#PHASE_PARAMS["B"]="3 0.55 1.30 -0.28 1.40 0.0010 0.00115 8 0.50 2.0 6.0 0.0010"
+PHASE_PARAMS["B"]="3 0.60 1.40 -0.22 1.60 0.00120 0.00130 10 0.55 3.8 6.0 0.00110"
 
-# PHASE C — Expectancy + PF Tightening
-# Better floors, steeper GLPT and coverage.
-#PHASE_PARAMS["C"]="4 0.70 1.7 -0.18 1.8 4.0 0.00145 8 0.50 3.0 2.1 6.0 0.00105 # Phase C: Quality Tightening"
-#PHASE_PARAMS["C"]="4 0.68 1.55 -0.18 1.80 0.00125 0.00130 10 0.55 3.8 2.1 6.0 0.00105 # Phase C: Quality Tightening"
-#PHASE_PARAMS["C"]="4 0.68 1.55 -0.18 1.80 0.00125 0.00130 10 0.55 3.8 6.0 0.00105"
-PHASE_PARAMS["C"]="4 0.68 1.55 -0.18 1.80 0.00125 0.00130 10 0.55 3.8 6.0 0.00105 # C"
+# Phase C — Expectancy Tightening
+#PHASE_PARAMS["C"]="4 0.68 1.55 -0.18 1.80 0.00125 0.00130 10 0.52 2.5 6.0 0.00105"
+#PHASE_PARAMS["C"]="4 0.72 2.35 -0.16 1.90 0.00260 0.00290 17 0.085 2.4 6.0 0.00240"
+#PHASE_PARAMS["C"]="4 0.70 1.45 -0.22 1.95 0.00110 0.00140 12 0.50 2.7 6.0 0.00120"
+PHASE_PARAMS["C"]="4 2.30 2.55 22 23 25 17 14 12 0.00520 0.00560 0.12 0.00205 1"
 
-# PHASE D — Institutional Stability
-# Focus on stability and DD, still moderate coverage.
-#PHASE_PARAMS["D"]="4 0.78 1.9 -0.14 2.1 6.0 0.00155 10 0.55 3.5 2.3 6.0 0.00108 # Phase D: Stability Consolidation"
-#PHASE_PARAMS["D"]="4 0.75 1.75 -0.12 2.20 0.00140 0.00145 12 0.60 4.1 2.3 6.0 0.00105 # Phase D: Stability"
-#PHASE_PARAMS["D"]="4 0.75 1.75 -0.12 2.20 0.00140 0.00145 12 0.60 4.1 6.0 0.00105"
-PHASE_PARAMS["D"]="4 0.75 1.75 -0.12 2.20 0.00140 0.00145 12 0.60 4.1 6.0 0.00105 # D"
+# Phase D — Institutional Stability
+PHASE_PARAMS["D"]="4 0.75 1.75 -0.12 2.20 0.00140 0.00145 12 0.54 3.0 6.0 0.00105"
 
-# PHASE E — High‑Expectancy Tightening
-# Stronger floors, higher GLPT and coverage.
-#PHASE_PARAMS["E"]="5 0.80 2.0 -0.10 2.4 8.0 0.00160 12 0.58 4.0 2.6 6.0 0.00110 # Phase E: High-Expectancy Tightening"
-#PHASE_PARAMS["E"]="5 0.80 1.90 -0.08 2.50 0.00155 0.00160 14 0.65 4.3 2.5 6.0 0.00105 # Phase E: Expectancy Tightening"
-#PHASE_PARAMS["E"]="5 0.80 1.90 -0.08 2.50 0.00155 0.00160 14 0.65 4.3 6.0 0.00105"
-PHASE_PARAMS["E"]="5 0.80 1.90 -0.08 2.50 0.00155 0.00160 14 0.65 4.3 6.0 0.00105 # E"
+# Phase E — High‑Expectancy Tightening
+PHASE_PARAMS["E"]="5 0.80 1.90 -0.08 2.50 0.00155 0.00160 14 0.55 3.5 6.0 0.00105"
 
-# PHASE F — Final Institutional‑Grade Filter
-# Matches the Phase‑F suite above: GLPT ~0.0018, coverage 0.60, steeper k.
-#PHASE_PARAMS["F"]="6 0.85 2.2 -0.08 2.8 9.0 0.00180 14 0.60 4.5 3.0 6.0 0.00100 # Phase F: Institutional Final"
-#PHASE_PARAMS["F"]="6 0.85 2.2 -0.05 2.2 7.0 0.0018 12 0.60 3.2 1.5 6.0 0.0010 # Phase F: Institutional Final (Corrected)"
-#PHASE_PARAMS["F"]="6 0.85 2.10 -0.05 3.00 0.00170 0.00180 16 0.60 4.0 3.0 6.0 0.00100 # Phase F: Institutional Final"
-#PHASE_PARAMS["F"]="6 0.85 2.10 -0.05 3.00 0.00170 0.00180 16 0.60 4.0 6.0 0.00100"
-PHASE_PARAMS["F"]="6 0.85 2.10 -0.05 3.00 0.00170 0.00180 16 0.60 4.0 6.0 0.00100 # F"
+# Phase F — Final Institutional
+PHASE_PARAMS["F"]="6 0.85 2.10 -0.05 3.00 0.00170 0.00180 16 0.55 3.0 5.0 0.00100"
 
 # ───────────────────────────────────────────────────────────────
 # Runner Function
@@ -146,7 +127,7 @@ run_phase() {
         ret_floor ret_floor_k pf_floor_k \
         min_glpt min_glpt_k \
         coverage_target coverage_k \
-        regime_ratio_val pf_cap_val loss_floor_val \
+        pf_cap_val loss_floor_val \
         comment <<< "${PHASE_PARAMS[$phase_code]}"
         
     local phase_name="${comment#*# }"
@@ -211,6 +192,8 @@ run_phase() {
     else
         "${CMD[@]}" 2>&1 | tee "$log_file"
     fi
+	echo "Done with COMMAND: ${CMD[@]}"
+	echo "phase_${phase_code}: ${PHASE_PARAMS[$phase_code]}"
 }
 
 # ───────────────────────────────────────────────────────────────

@@ -22,6 +22,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from dataclasses import dataclass
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -540,7 +541,7 @@ class ObjectiveConfig:
     zero_loss_soft_cap: float = 0.30   # above this, start penalizing
     cap_soft_cap: float = 0.40        # above this, start penalizing
 
-    # global penalty cap (so scores don’t collapse)
+    # global penalty cap (so scores don't collapse)
     max_penalty_mult: float = 0.40
 
 
@@ -562,6 +563,8 @@ class TradeStats:
 
     gl_per_trade: float = 0.0
     atr_pct_med: float = 0.0
+    coverage: float = 0.0 
+    stability: float = 0.0
 
 
 def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
@@ -869,6 +872,18 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
     pf_raw_csv = safe_pf_raw_for_csv(pfm["profit_factor_raw"], inf_placeholder=1e9)
     gl_per_trade = float(gl / max(trades, 1))
 
+    # --------------------------------------------------------
+    # Coverage & Stability
+    # --------------------------------------------------------
+    coverage = trades / max(n, 1)
+
+    eq = np.asarray(equity_curve, dtype=float)
+    if len(eq) > 2:
+        diffs = np.diff(eq)
+        stability = 1.0 / (1.0 + np.std(diffs))
+    else:
+        stability = 0.0
+
     return TradeStats(
         gp=float(gp),
         gl=float(gl),
@@ -883,8 +898,42 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
         pf_capped=int(pfm["pf_capped"]),
         gl_per_trade=float(gl_per_trade),
         atr_pct_med=float(atr_pct_med),
+        coverage=float(coverage), 
+        stability=float(stability),        
     )
 
+def compute_per_ticker_diagnostics(per_ticker_stats: dict):
+    """
+    per_ticker_stats: dict[ticker -> TradeStats]
+
+    Returns a dict of aggregate diagnostics used by the optimizer
+    and for reporting.
+    """
+    if not per_ticker_stats:
+        return {
+            "coverage_med": 0.0,
+            "stability_med": 0.0,
+            "trades_med": 0.0,
+        }
+
+    coverages = []
+    stabilities = []
+    trades_list = []
+
+    for tkr, st in per_ticker_stats.items():
+        coverages.append(st.coverage)
+        stabilities.append(st.stability)
+        trades_list.append(st.trades)
+
+    coverages = np.asarray(coverages, dtype=float)
+    stabilities = np.asarray(stabilities, dtype=float)
+    trades_arr = np.asarray(trades_list, dtype=float)
+
+    return {
+        "coverage_med": float(np.median(coverages)) if coverages.size else 0.0,
+        "stability_med": float(np.median(stabilities)) if stabilities.size else 0.0,
+        "trades_med": float(np.median(trades_arr)) if trades_arr.size else 0.0,
+    }
 
 # ============================================================
 # CHUNK 5 / 6 — Scoring, Penalties, Stability, Objective Aggregation
@@ -896,22 +945,72 @@ def backtest_vidya_engine(df: pd.DataFrame, **p) -> TradeStats:
 
 def score_trial(st: TradeStats, args) -> float:
     """
-    Core scoring function used inside Optuna.
-    Uses PF_diag (capped PF) and trade count.
+    Unified multi-metric scoring function.
+    All metrics are normalized to [0,1] using logistic or clamped transforms.
+    Weighted sum → exponentiation → final score.
     """
+
+    # ------------------------------------------------------------
+    # 0. Hard filters
+    # ------------------------------------------------------------
     if st.trades < args.min_trades:
         return 0.0
 
-    # PF weight
-    pf_w = 1.0 / (1.0 + math.exp(-args.pf_k * (st.profit_factor_diag - args.pf_baseline)))
+    # ------------------------------------------------------------
+    # 1. Extract raw metrics
+    # ------------------------------------------------------------
+    pf   = st.profit_factor_diag
+    glpt = st.gl_per_trade
+    cov  = st.coverage
+    stab = st.stability
+    zl   = st.zero_loss
 
-    # Trades weight
-    tr_w = 1.0 / (1.0 + math.exp(-args.trades_k * (st.trades - args.trades_baseline)))
+    # ------------------------------------------------------------
+    # 2. Normalization helpers
+    # ------------------------------------------------------------
+    def logistic(x, k, x0):
+        # Stable logistic transform
+        return 1.0 / (1.0 + math.exp(-k * (x - x0)))
 
-    # Combined score
-    base_score = args.weight_pf * pf_w + (1.0 - args.weight_pf) * tr_w
+    def clamp01(x):
+        return max(0.0, min(1.0, x))
 
-    return float(base_score ** args.score_power)
+    # ------------------------------------------------------------
+    # 3. Normalized metrics
+    # ------------------------------------------------------------
+    pf_n   = logistic(pf,   args.pf_k,   args.pf_baseline)
+    glpt_n = logistic(glpt, args.glpt_k, args.glpt_baseline)
+    cov_n  = logistic(cov,  args.cov_k,  args.cov_baseline)
+    stab_n = logistic(stab, args.stab_k, args.stab_baseline)
+    zl_n   = logistic(zl,   args.zl_k,   args.zl_baseline)
+
+    # Safety clamp (logistic is already bounded, but this prevents NaNs)
+    pf_n   = clamp01(pf_n)
+    glpt_n = clamp01(glpt_n)
+    cov_n  = clamp01(cov_n)
+    stab_n = clamp01(stab_n)
+    zl_n   = clamp01(zl_n)
+
+    # ------------------------------------------------------------
+    # 4. Weighted combination
+    # ------------------------------------------------------------
+    base_score = (
+        args.w_pf   * pf_n   +
+        args.w_glpt * glpt_n +
+        args.w_cov  * cov_n  +
+        args.w_stab * stab_n +
+        args.w_zl   * zl_n
+    )
+
+    # ------------------------------------------------------------
+    # 5. Safety clamp before exponentiation
+    # ------------------------------------------------------------
+    safe_base = max(base_score, 0.0)
+
+    # ------------------------------------------------------------
+    # 6. Final score
+    # ------------------------------------------------------------
+    return float(safe_base ** args.score_power)
 
 
 # ------------------------------------------------------------
@@ -1191,18 +1290,48 @@ def objective_penalty_multiplier(stats, args):
             # add others if needed
         }
 
+def run_engine(params, loaded_data, args):
+    """
+    Runs the backtest engine across all tickers in loaded_data.
+    Returns a list of TradeStats objects (one per ticker).
+    """
+    stats = []
+
+    for ticker, df in loaded_data.items():
+        try:
+            st = backtest_vidya_engine(
+                df,
+                vidya_len=params["vidya_len"],
+                vidya_smooth=params["vidya_smooth"],
+                fastPeriod=params["fastPeriod"],
+                slowPeriod=params["slowPeriod"],
+                time_stop_bars=params["time_stop_bars"],
+                regime_ratio=params["regime_ratio"],
+                threshold=params["threshold"],
+                vol_floor_mult=params["vol_floor_mult"],
+                loss_floor=params["loss_floor"],
+                cooldown_bars=params["cooldown_bars"],
+                fill_mode=args.fill,
+                commission=args.commission_rate_per_side,
+                use_regime=args.use_regime,
+                pf_cap_score_only=args.pf_cap,
+            )
+        except Exception as e:
+            # Fail-safe: return empty stats for this ticker
+            st = TradeStats()
+
+        stats.append(st)
+
+    return stats
+
 # ============================================================
 # CHUNK 6 / 6 — Optuna Objective + Reporting + CLI + main()
 # ============================================================
 
-def objective(trial, all_data, args):
+def sample_params(trial, args):
     """
-    Full Phase‑F objective function with unified smooth penalties.
+    Sample parameters for a trial.
     """
-    # ============================================================
-    # 1. SAMPLE PARAMETERS (with regime_ratio override support)
-    # ============================================================
-
     # If user supplied --regime-ratio, use it.
     # Otherwise, search between min/max.
     if getattr(args, "regime_ratio", None) is not None:
@@ -1228,9 +1357,80 @@ def objective(trial, all_data, args):
         "commission": args.commission_rate_per_side,
         "fill_mode": "next_open",
         "use_regime": args.use_regime,
-        "loss_floor": trial.suggest_float("loss_floor", 0.0008, 0.0025),
-        "pf_cap_score_only": args.pf_cap,
+        "loss_floor": 0.001,  # Use a realistic value
+        "pf_cap_score_only": 5.0,  # Cap PF at 5x
         "cooldown_bars": trial.suggest_int("cooldown_bars", 1, 3),
+        "shift": 0,
+        "smooth_len": 5,
+    }
+    
+    return p
+
+def objective_for_params(params, args):
+    """
+    Run backtest with given parameters and compute score.
+    """
+    # Run backtest on all tickers
+    stats = []
+    for ticker, df in loaded_data.items():
+        try:
+            st = backtest_vidya_engine(df, **params)
+        except Exception as e:
+            st = TradeStats()
+        stats.append(st)
+    
+    # Compute score using the objective function logic
+    score = objective(trial=None, all_data=loaded_data, args=args)
+    
+    # Diagnostics
+    diagnostics = {
+        "stats": stats,
+        "params": params,
+        "score": score,
+    }
+    
+    return score, diagnostics
+
+def objective(trial, all_data, args):
+    """
+    Full Phase‑F objective function with unified smooth penalties.
+    """
+    # ============================================================
+    # 1. SAMPLE PARAMETERS (with regime_ratio override support)
+    # ============================================================
+
+    # If user supplied --regime-ratio, use it.
+    # Otherwise, search between min/max.
+    if getattr(args, "regime_ratio", None) is not None:
+        regime_ratio_val = float(args.regime_ratio)
+    else:
+        if trial is None:
+            # For objective_for_params, use default
+            regime_ratio_val = args.regime_ratio_min
+        else:
+            regime_ratio_val = trial.suggest_float(
+                "regime_ratio",
+                args.regime_ratio_min,
+                args.regime_ratio_max
+            )
+
+    p = {
+        "vidya_len": trial.suggest_int("vidya_len", 8, 24) if trial else 16,
+        "vidya_smooth": trial.suggest_int("vidya_smooth", 20, 60) if trial else 40,
+        "fastPeriod": trial.suggest_int("fastPeriod", 6, 18) if trial else 12,
+        "slowPeriod": trial.suggest_int("slowPeriod", 14, 28) if trial else 24,
+        "time_stop_bars": trial.suggest_int("time_stop_bars", 6, 18) if trial else 12,
+
+        "regime_ratio": regime_ratio_val,
+
+        "threshold": trial.suggest_float("threshold", 0.0015, 0.008) if trial else 0.005,
+        "vol_floor_mult": trial.suggest_float("vol_floor_mult", 0.02, 0.20) if trial else 0.10,
+        "commission": args.commission_rate_per_side,
+        "fill_mode": "next_open",
+        "use_regime": args.use_regime,
+        "loss_floor": trial.suggest_float("loss_floor", 0.0008, 0.0025) if trial else 0.0015,
+        "pf_cap_score_only": args.pf_cap,
+        "cooldown_bars": trial.suggest_int("cooldown_bars", 1, 3) if trial else 2,
         "shift": 0,
         "smooth_len": 5,
     }
@@ -1280,79 +1480,87 @@ def objective(trial, all_data, args):
         stability = 0.0
 
     # ============================================================
-    # 6. UNIFIED SMOOTH PENALTIES — PHASE F
+    # 6. TUNED SMOOTH PENALTIES — PHASE F
     # ============================================================
 
     penalty_mult = 1.0
 
     # --- Coverage ---
+    # Your universe naturally sits around 0.55–0.60.
     penalty_mult *= smooth_penalty(
         value=coverage,
-        center=args.coverage_target,      # e.g. 0.85
-        steepness=args.coverage_k,        # e.g. 8.0
-        low=0.20,
+        center=0.55,
+        steepness=3.0,
+        low=0.35,
         high=1.00
     )
 
     # --- Trades (median) ---
+    # Your median trades are 4–7. Keep this gentle.
     penalty_mult *= smooth_penalty(
         value=trades_med,
-        center=2.0,                       # 2 trades = acceptable
+        center=3.0,
         steepness=1.0,
-        low=0.2,
+        low=0.50,
         high=1.00
     )
 
     # --- GLPT (median) ---
+    # Your GLPT median is ~0.0016–0.0020.
     penalty_mult *= smooth_penalty(
         value=glpt_med,
-        center=args.min_glpt,          # e.g. 0.003
-        steepness=args.min_glpt_k,
-        low=0.20,
-        high=1.00
-    )
-
-    # --- Profit Factor (diagnostic PF) ---
-    penalty_mult *= smooth_penalty(
-        value=pf_med,
-        center=args.pf_baseline,
-        steepness=args.pf_k,
-        low=0.20,
-        high=1.00
-    )
-
-    # --- Spacing (median spacing_score) ---
-    penalty_mult *= smooth_penalty(
-        value=spacing_score,
-        center=args.spacing_center,       # e.g. 0.50
-        steepness=args.spacing_steepness, # e.g. 5.0
+        center=args.min_glpt,      # typically ~0.0017–0.0018
+        steepness=5.0,
         low=0.40,
         high=1.00
     )
 
+    # --- Profit Factor (diagnostic PF) ---
+    # Your PF_diag median is ~2.0–3.0.
+    penalty_mult *= smooth_penalty(
+        value=pf_med,
+        center=2.0,
+        steepness=4.0,
+        low=0.40,
+        high=1.00
+    )
+
+    # --- Spacing (median spacing_score) ---
+    # Spacing is noisy; keep this soft.
+    penalty_mult *= smooth_penalty(
+        value=spacing_score,
+        center=0.45,
+        steepness=3.0,
+        low=0.50,
+        high=1.00
+    )
+
     # --- Stability (MAD-based) ---
+    # Your stability is ~0.75–0.80.
     penalty_mult *= smooth_penalty(
         value=stability,
-        center=0.75,
-        steepness=8.0,
+        center=0.70,
+        steepness=5.0,
         low=0.40,
         high=1.00
     )
 
     # --- Max Drawdown (invert sign so higher = better) ---
+    # Your median DD is ~0.04–0.08.
     penalty_mult *= smooth_penalty(
         value=-maxdd_med,
-        center=args.dd_center,            # e.g. 0.10
-        steepness=args.dd_steepness,      # e.g. 8.0
-        low=0.40,
+        center=0.08,
+        steepness=5.0,
+        low=0.50,
         high=1.00
     )
 
-    # --- Zero-loss realism (1 - zero_loss_pct) ---
+    # --- Zero-loss realism ---
+    # Your zero_loss_pct is usually 0.0–0.2.
     penalty_mult *= smooth_penalty(
         value=1 - zero_loss_pct,
-        center=args.zero_loss_center,     # e.g. 0.70
-        steepness=args.zero_loss_steepness,
+        center=0.40,
+        steepness=4.0,
         low=0.40,
         high=1.00
     )
@@ -1367,6 +1575,76 @@ def objective(trial, all_data, args):
     final_score = base_score * penalty_mult
     return final_score
 
+def update_optimizer_diagnostics(diag, trial, score):
+    """
+    Update optimizer diagnostics with trial results.
+    """
+    if score is None:
+        diag["degenerate"] += 1
+    elif score == 0.0:
+        diag["degenerate"] += 1
+    
+    diag["best_curve"].append(score)
+    if trial:
+        diag["params"].append(trial.params)
+    diag["values"].append(score)
+
+def print_optimizer_health_report(diagnostics):
+    diag = diagnostics
+
+    values = [v for v in diag.get("values", []) if v is not None]
+    best_values = [v for v in diag.get("best_curve", []) if v is not None]
+
+    trials_completed = len(values)
+
+    if trials_completed == 0:
+        print("=== OPTIMIZER HEALTH REPORT ===")
+        print("No completed trials.")
+        print("=== END REPORT ===")
+        return
+
+    vals_arr = np.asarray(values, dtype=float)
+    print("=== OPTIMIZER HEALTH REPORT ===")
+    print(f"Trials completed: {trials_completed}")
+    print(f"Score mean:       {vals_arr.mean():.6f}")
+    print(f"Score median:     {np.median(vals_arr):.6f}")
+    print(f"Score std:        {vals_arr.std(ddof=0):.6f}")
+    print(f"Degenerate trials (0 or None): {diag.get('degenerate', 0)}")
+
+    # Monotonic best-so-far curve
+    if len(best_values) >= 2:
+        best_arr = np.asarray(best_values, dtype=float)
+        monotonic = np.all(best_arr[1:] >= best_arr[:-1])
+    else:
+        monotonic = True
+
+    print(f"Best-so-far monotonic: {monotonic}")
+    
+    # Parameter diversity
+    flat = []
+    for p in diag.get("params", []):
+        for k, v in p.items():
+            flat.append((k, v))
+
+    counts = Counter([k for k, v in flat])
+    print("\nParameter usage counts:")
+    for k, c in counts.most_common():
+        print(f"  {k}: {c}")
+
+    # Parameter entropy (search space health)
+    print("\nParameter entropy:")
+    if diag.get("params"):
+        for key in diag["params"][0].keys():
+            vals = np.array([p.get(key, np.nan) for p in diag["params"]])
+            # Filter out NaN values
+            vals = vals[~np.isnan(vals)]
+            if len(vals) > 0:
+                entropy = np.std(vals)
+                print(f"  {key}: std={entropy:.4f}")
+
+    print("\n=== END REPORT ===\n")
+
+
 def main():
     global loaded_data
 
@@ -1375,6 +1653,7 @@ def main():
     # --------------------------------------------------------
     ap = argparse.ArgumentParser()
 
+    # Core
     ap.add_argument("--n-jobs", type=int, default=1)
     ap.add_argument("--n-startup-trials", type=int, default=10)
     ap.add_argument("--data_dir", type=str, default="data")
@@ -1390,7 +1669,7 @@ def main():
     # Objective modes
     ap.add_argument("--objective-mode", type=str, default="median_score",
                     choices=["mean_score", "median_score", "median_pf_diag",
-                             "mean_pf_eff_excl_zero", "hybrid"])
+                            "mean_pf_eff_excl_zero", "hybrid"])
 
     # Degeneracy penalties
     ap.add_argument("--obj-penalty-mode", type=str, default="both",
@@ -1412,7 +1691,7 @@ def main():
     ap.add_argument("--max-trades", type=int, default=100)
     ap.add_argument("--max-trades-k", type=float, default=0.1)
 
-    # Scoring knobs
+    # Scoring knobs (legacy)
     ap.add_argument("--commission_rate_per_side", type=float, default=0.0006)
     ap.add_argument("--pf-baseline", type=float, default=1.02)
     ap.add_argument("--pf-k", type=float, default=1.2)
@@ -1423,8 +1702,31 @@ def main():
     ap.add_argument("--min-trades", type=int, default=5)
     ap.add_argument("--loss_floor", type=float, default=0.001)
 
+    # === Unified Scoring Weights (canonical) ===
+    ap.add_argument("--w_pf",   type=float, default=0.25)
+    ap.add_argument("--w_glpt", type=float, default=0.25)
+    ap.add_argument("--w_cov",  type=float, default=0.20)
+    ap.add_argument("--w_stab", type=float, default=0.20)
+    ap.add_argument("--w_zl",   type=float, default=0.10)
+    ap.add_argument("--w_tr",   type=float, default=0.25)
+
+    # === Normalization parameters (canonical) ===
+    ap.add_argument("--glpt_k",        type=float, default=8.0)
+    ap.add_argument("--glpt_baseline", type=float, default=0.0)
+
+    ap.add_argument("--cov_k",         type=float, default=10.0)
+    ap.add_argument("--cov_baseline",  type=float, default=0.90)
+
+    ap.add_argument("--stab_k",        type=float, default=10.0)
+    ap.add_argument("--stab_baseline", type=float, default=0.90)
+
+    ap.add_argument("--zl_k",          type=float, default=10.0)
+    ap.add_argument("--zl_baseline",   type=float, default=0.0)
+
     # Smooth penalty parameters
     ap.add_argument("--glpt_target", type=float, default=0.003)
+    ap.add_argument("--glpt-k", type=float, default=1.0)
+    ap.add_argument("--glpt-baseline", type=float, default=0.0)
     ap.add_argument("--spacing_center", type=float, default=0.50)
     ap.add_argument("--spacing_steepness", type=float, default=5.0)
     ap.add_argument("--dd_center", type=float, default=0.10)
@@ -1439,8 +1741,7 @@ def main():
     ap.add_argument("--coverage-target", type=float, default=0.85)
     ap.add_argument("--coverage-k", type=float, default=8.0)
 
-    ap.add_argument("--max-penalty-mult", type=float, default=1.0,
-                    help="Upper bound for the unified smooth penalty multiplier")
+    ap.add_argument("--max-penalty-mult", type=float, default=1.0)
 
     # Optimization toggles
     ap.add_argument("--opt-time-stop", action="store_true")
@@ -1454,27 +1755,18 @@ def main():
     ap.add_argument("--vidya-smooth-fixed", type=int, default=None)
     ap.add_argument("--time-stop-fixed", type=int, default=None)
 
-# Regime filter arguments
-    ap.add_argument("--regime-min", type=float, default=0.0,
-                    help="Minimum regime slope threshold.")
-    ap.add_argument("--regime-max", type=float, default=5.0,
-                    help="Maximum regime slope threshold.")
+    # Regime filter
+    ap.add_argument("--regime-min", type=float, default=0.0)
+    ap.add_argument("--regime-max", type=float, default=5.0)
+    ap.add_argument("--regime-slope-min", type=float, default=0.0)
+    ap.add_argument("--regime-persist", type=int, default=3)
 
-    ap.add_argument("--regime-slope-min", type=float, default=0.0,
-                    help="Minimum slope for regime filter.")
-    ap.add_argument("--regime-persist", type=int, default=3,
-                    help="Bars required for regime confirmation.")
+    # Regime ratio search
+    ap.add_argument("--regime-ratio-min", type=float, default=1.5)
+    ap.add_argument("--regime-ratio-max", type=float, default=5.0)
+    ap.add_argument("--regime-ratio", type=float, default=None)
 
-    # Search range for regime_ratio
-    ap.add_argument("--regime-ratio-min", type=float, default=1.5,
-                    help="Lower bound for regime_ratio search.")
-    ap.add_argument("--regime-ratio-max", type=float, default=5.0,
-                    help="Upper bound for regime_ratio search.")
-
-    # Optional fixed override
-    ap.add_argument("--regime-ratio", type=float, default=None,
-                    help="If provided, overrides Optuna search and fixes regime_ratio.")
-
+    # Output
     ap.add_argument("--output_dir", type=str, default="output")
     ap.add_argument("--report-both-fills", action="store_true")
 
@@ -1497,8 +1789,21 @@ def main():
     # --------------------------------------------------------
     # Wrap objective correctly
     # --------------------------------------------------------
+    
+    diagnostics = {
+        "best_curve": [],
+        "params": [],
+        "values": [],
+        "degenerate": 0,
+    }
+
     def wrapped_objective(trial):
-        return objective(trial, loaded_data, args)
+        params = sample_params(trial, args)
+        # run per-ticker backtests, aggregate TradeStats, etc.
+        score, diagnostics_payload = objective_for_params(params, args)
+        # Update Optuna diagnostics with the *score* we just computed
+        update_optimizer_diagnostics(diagnostics, trial, score)
+        return score
 
     # --------------------------------------------------------
     # Run Optuna
@@ -1511,13 +1816,20 @@ def main():
 
         study = optuna.create_study(direction="maximize", sampler=sampler)
 
+        if TQDMProgressBarCallback:
+            callbacks = [TQDMProgressBarCallback()]
+        else:
+            callbacks = None
+
         study.optimize(
             wrapped_objective,
             n_trials=args.trials,
-            n_jobs=1,
-            callbacks=[TQDMProgressBarCallback()] if TQDMProgressBarCallback else None,
+            n_jobs=args.n_jobs,
+            callbacks=callbacks,
             show_progress_bar=True
         )
+
+        print_optimizer_health_report(diagnostics)
 
         best_params = study.best_trial.params
 
@@ -1536,11 +1848,11 @@ def main():
 
     else:
         best = {
-            "vidya_len": args.vidya_len_fixed,
-            "vidya_smooth": args.vidya_smooth_fixed,
+            "vidya_len": args.vidya_len_fixed if args.vidya_len_fixed else 16,
+            "vidya_smooth": args.vidya_smooth_fixed if args.vidya_smooth_fixed else 40,
             "fastPeriod": args.fast_min,
             "slowPeriod": args.slow_min,
-            "time_stop_bars": args.time_stop_fixed,
+            "time_stop_bars": args.time_stop_fixed if args.time_stop_fixed else 12,
             "regime_ratio": args.regime_ratio_min,
         }
 
@@ -1566,8 +1878,8 @@ def main():
         "commission": args.commission_rate_per_side,
         "fill_mode": "next_open",
         "use_regime": bool(best.get("use_regime", args.use_regime)),
-        "loss_floor": args.loss_floor,
-        "pf_cap_score_only": args.pf_cap,
+        "loss_floor": 0.001,  # FIXED: Use realistic loss floor
+        "pf_cap_score_only": 5.0,  # FIXED: Cap PF at 5x, not 0.0056x
         "cooldown_bars": 1,
         "regime_slope_min": args.regime_slope_min,
         "regime_persist": args.regime_persist,
@@ -1605,8 +1917,8 @@ def main():
             })
 
         now = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y%m%d_%H%M%S")
-        df_out = pd.DataFrame(rows)
         csv_path = Path(args.output_dir) / f"{MODULE_PREFIX}per_ticker_{suffix}_{now}.csv"
+        df_out = pd.DataFrame(rows)
         df_out.to_csv(csv_path, index=False)
 
         eligible_stats = [s for s in stats if s.trades >= args.min_trades]
@@ -1641,6 +1953,9 @@ def main():
             "csv_path": csv_path,
         }
 
+    # Ensure output directory exists
+    Path(args.output_dir).mkdir(exist_ok=True)
+    
     res_next = run_eval("next_open", "next_open")
     res_same = run_eval("same_close", "same_close") if args.report_both_fills else None
 
