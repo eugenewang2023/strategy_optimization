@@ -1,0 +1,30 @@
+Vidya_RSI Hybrid Adaptive — Summary
+Generated: 20260125_210339
+Data dir: data
+Files used: 147 (requested 300)
+Optimize: True (trials=300)
+Enhanced objective: True
+
+Best parameters:
+  vidya_len: 12
+  vidya_smooth: 21
+  fastPeriod: 16
+  slowPeriod: 14
+  time_stop_bars: 17
+  regime_ratio: 1.5
+  threshold: 0.04
+  vol_floor_mult: 0.55
+  commission: 0.0006
+  fill_mode: next_open
+  use_regime: False
+  loss_floor: 0.001
+  pf_cap_score_only: 5.0
+  cooldown_bars: 1
+  regime_slope_min: 0.0
+  regime_persist: 3
+
+=== next_open baseline ===
+Objective aggregate (raw): 1.000000
+Final score (penalized): 0.100000
+Coverage: 0.946
+Stability: 0.953640
