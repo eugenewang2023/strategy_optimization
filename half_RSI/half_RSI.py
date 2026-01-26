@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bayes_opt_half_RSI.py  —  with clean, timestamped result saving
+half_RSI.py  —  with clean, timestamped result saving
 Saves:
 - half_RSI_per_ticker_YYYYMMDD_HHMMSS.csv
 - half_RSI_best_YYYYMMDD_HHMMSS.txt  (parameters + metrics)
@@ -571,10 +571,23 @@ def parse_args():
     ap.add_argument("--slMultiplier-fixed", type=float, default=None)
     ap.add_argument("--tpMultiplier-fixed", type=float, default=None)
 
-    # half_RSI params
+    # half_RSI params - ADDED FROM Vidaya_RSI.py
     ap.add_argument("--slow_window-fixed", type=int, default=32)
     ap.add_argument("--shift-fixed", type=int, default=0)
     ap.add_argument("--smooth_len-fixed", type=int, default=12)
+    
+    # half_RSI optimization toggles - ADDED FROM Vidaya_RSI.py
+    ap.add_argument("--opt-slow-window", action="store_true")
+    ap.add_argument("--opt-shift", action="store_true")
+    ap.add_argument("--opt-smooth-len", action="store_true")
+    
+    # half_RSI parameter ranges - ADDED FROM Vidaya_RSI.py
+    ap.add_argument("--slow-window-min", type=int, default=14)
+    ap.add_argument("--slow-window-max", type=int, default=80)
+    ap.add_argument("--shift-min", type=int, default=0)
+    ap.add_argument("--shift-max", type=int, default=3)
+    ap.add_argument("--smooth-len-min", type=int, default=3)
+    ap.add_argument("--smooth-len-max", type=int, default=30)
 
     return ap.parse_args()
 
@@ -707,9 +720,21 @@ def main():
         if slMultiplier <= min_eff * tpMultiplier:
             raise optuna.TrialPruned()
 
-        slow_window = trial.suggest_int("slow_window", 14, 80)
-        shift = trial.suggest_int("shift", 0, 3)
-        smooth_len = trial.suggest_int("smooth_len", 3, 30)
+        # ADDED FROM Vidaya_RSI.py: Optimization toggles for half_RSI parameters
+        if args.opt_slow_window:
+            slow_window = trial.suggest_int("slow_window", args.slow_window_min, args.slow_window_max)
+        else:
+            slow_window = args.slow_window_fixed
+            
+        if args.opt_shift:
+            shift = trial.suggest_int("shift", args.shift_min, args.shift_max)
+        else:
+            shift = args.shift_fixed
+            
+        if args.opt_smooth_len:
+            smooth_len = trial.suggest_int("smooth_len", args.smooth_len_min, args.smooth_len_max)
+        else:
+            smooth_len = args.smooth_len_fixed
 
         cooldown_bars = trial.suggest_int("cooldown", 0, 7) if args.opt_cooldown else int(args.cooldown)
         time_stop_bars = trial.suggest_int("time_stop", 0, 12) if args.opt_time_stop else int(args.time_stop)
@@ -760,12 +785,27 @@ def main():
 
     best = study.best_trial
     best_params = dict(best.params)
+    
+    # ADDED FROM Vidaya_RSI.py: Extract half_RSI parameters
     best_params["atrPeriod"] = int(best_params["atrPeriod"])
     best_params["slMultiplier"] = float(best_params["slMultiplier"])
     best_params["tpMultiplier"] = float(best_params["tpMultiplier"])
-    best_params["slow_window"] = int(best_params["slow_window"])
-    best_params["shift"] = int(best_params["shift"])
-    best_params["smooth_len"] = int(best_params["smooth_len"])
+    
+    # Handle half_RSI parameters (may or may not be in best_params depending on optimization toggles)
+    if "slow_window" in best_params:
+        best_params["slow_window"] = int(best_params["slow_window"])
+    else:
+        best_params["slow_window"] = args.slow_window_fixed
+        
+    if "shift" in best_params:
+        best_params["shift"] = int(best_params["shift"])
+    else:
+        best_params["shift"] = args.shift_fixed
+        
+    if "smooth_len" in best_params:
+        best_params["smooth_len"] = int(best_params["smooth_len"])
+    else:
+        best_params["smooth_len"] = args.smooth_len_fixed
 
     best_cooldown = int(best_params.get("cooldown", args.cooldown)) if not args.opt_cooldown else int(best_params.get("cooldown", 1))
     best_time_stop = int(best_params.get("time_stop", args.time_stop)) if not args.opt_time_stop else int(best_params.get("time_stop", 0))
