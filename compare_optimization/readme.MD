@@ -1,3 +1,94 @@
+1/28/2026
+Result comparison shows that adapt_RSI is way behind other methods. The two top performers are adapt_half_RSI and half_RSI:
+Loaded 17 valid optimization runs:
+  - adapt_half_RSI_per_ticker_20260120_235614.csv
+  - adapt_half_RSI_per_ticker_20260126_104205.csv
+  - adapt_RSI_per_ticker_20260120_231930.csv
+  - adapt_RSI_per_ticker_20260126_140217.csv
+  - adapt_RSI_per_ticker_20260126_141318.csv
+  - adapt_RSI_per_ticker_20260126_143129.csv
+  - adapt_RSI_per_ticker_20260126_150435.csv
+  - adapt_RSI_per_ticker_20260127_204646.csv
+  - adapt_RSI_per_ticker_20260127_212111.csv
+  - adapt_RSI_per_ticker_20260127_213730.csv
+  - adapt_RSI_per_ticker_20260127_215341.csv
+  - adapt_RSI_per_ticker_20260128_153040.csv
+  - half_RSI_per_ticker_20260121_000047.csv
+  - half_RSI_v0.2_per_ticker_20260125_184151.csv
+  - vidya_per_ticker_20260121_meta.csv
+  - vidya_RSI_per_ticker_20260121_001237.csv
+  - vidya_RSI_per_ticker_next_open_20260125_210339.csv
+
+==================================================
+AGGREGATE RUN COMPARISON
+==================================================
+                             run_id  avg_total_return  median_total_return  avg_pf_eff  median_pf_eff  avg_maxdd  eligible_rate  avg_trades  num_tickers
+     adapt_half_RSI_20260126_104205            0.3752               0.2558         NaN            NaN    -0.1027            NaN      6.4558          147
+      half_RSI_v0.2_20260125_184151            0.3324               0.2765         NaN            NaN    -0.1098            NaN      7.7959          147
+           half_RSI_20260121_000047            0.2912               0.2087         NaN            NaN    -0.0817            NaN      6.3741          147
+     adapt_half_RSI_20260120_235614            0.2574               0.1894         NaN            NaN    -0.0972            NaN      6.4286          147
+                vidya_20260121_meta            0.2238               0.1814     21.3420         3.8897    -0.0544         1.0000      7.8163          147
+          adapt_RSI_20260120_231930            0.2047               0.1799         NaN            NaN    -0.0891         0.9932     10.1565          147
+          vidya_RSI_20260121_001237            0.1565               0.1557     46.2702         2.9006    -0.0732         1.0000      6.4898          147
+          adapt_RSI_20260127_213730            0.0643               0.0284         NaN            NaN    -0.0310         0.7687      2.3946          147
+          adapt_RSI_20260127_215341            0.0639               0.0292         NaN            NaN    -0.0243         0.6122      1.8776          147
+          adapt_RSI_20260128_153040            0.0595               0.0290         NaN            NaN    -0.0316         0.7415      2.3605          147
+          adapt_RSI_20260127_212111            0.0353               0.0245         NaN            NaN    -0.0498         0.8163      2.5850          147
+          adapt_RSI_20260127_204646            0.0341               0.0176         NaN            NaN    -0.0318         0.6327      1.8980          147
+          adapt_RSI_20260126_150435            0.0258               0.0000         NaN            NaN    -0.0286         0.5782      1.7483          147
+          adapt_RSI_20260126_140217            0.0254               0.0000         NaN            NaN    -0.0445         0.7075      2.0612          147
+          adapt_RSI_20260126_141318            0.0214               0.0000         NaN            NaN    -0.0365         0.6122      1.7891          147
+          adapt_RSI_20260126_143129            0.0198               0.0047         NaN            NaN    -0.0360         0.6190      1.8707          147
+vidya_RSI_next_open_20260125_210339               NaN                  NaN     57.7408         2.3334    -0.0648            NaN         NaN          147
+
+==================================================
+BEST RUN PER TICKER
+==================================================
+                        run_id  num_best_tickers
+ half_RSI_v0.2_20260125_184151                33
+adapt_half_RSI_20260126_104205                27
+adapt_half_RSI_20260120_235614                27
+      half_RSI_20260121_000047                21
+     adapt_RSI_20260120_231930                20
+     vidya_RSI_20260121_001237                 7
+     adapt_RSI_20260127_215341                 4
+     adapt_RSI_20260127_213730                 3
+     adapt_RSI_20260126_141318                 2
+     adapt_RSI_20260126_150435                 2
+     adapt_RSI_20260126_140217                 1
+
+==================================================
+PER-TICKER MATRIX
+==================================================
+Matrix shape: (147, 15)
+Saved to per_ticker_return_matrix.csv
+
+==================================================
+DIAGNOSTICS
+==================================================
+Files WITH 'total_return' column (16):
+  [YES] adapt_half_RSI_per_ticker_20260120_235614.csv
+  [YES] adapt_half_RSI_per_ticker_20260126_104205.csv
+  [YES] adapt_RSI_per_ticker_20260120_231930.csv
+  [YES] adapt_RSI_per_ticker_20260126_140217.csv
+  [YES] adapt_RSI_per_ticker_20260126_141318.csv
+  [YES] adapt_RSI_per_ticker_20260126_143129.csv
+  [YES] adapt_RSI_per_ticker_20260126_150435.csv
+  [YES] adapt_RSI_per_ticker_20260127_204646.csv
+  [YES] adapt_RSI_per_ticker_20260127_212111.csv
+  [YES] adapt_RSI_per_ticker_20260127_213730.csv
+  [YES] adapt_RSI_per_ticker_20260127_215341.csv
+  [YES] adapt_RSI_per_ticker_20260128_153040.csv
+  [YES] half_RSI_per_ticker_20260121_000047.csv
+  [YES] half_RSI_v0.2_per_ticker_20260125_184151.csv
+  [YES] vidya_per_ticker_20260121_meta.csv
+  [YES] vidya_RSI_per_ticker_20260121_001237.csv
+
+Files WITHOUT 'total_return' column (1):
+  [NO]  vidya_RSI_per_ticker_next_open_20260125_210339.csv
+
+Saved comparison outputs to: C:\Backup\_my\my_Github\strategy_optimization\compare_optimization\comparison_output
+
 1/26/2026
 adapt_half_RSI_v0.2 (phase B: adapt_half_RSI_20260126_104205) is the best so far:
 

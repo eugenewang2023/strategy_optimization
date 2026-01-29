@@ -1,0 +1,34 @@
+=== BEST RESULT - Adaptive RSI ===
+Run timestamp         : 20260127_210434
+Objective value       : 0.043273
+
+Best parameters:
+  atrPeriod          : 13
+  basePeriod         : 18
+  cooldown           : 2
+  fastPeriod         : 4
+  maxPeriod          : 19
+  minPeriod          : 4
+  shift              : 3
+  slMultiplier       : 1.6717569034812034
+  slowPeriod         : 27
+  smooth_len         : 3
+  threshold_floor    : 0.044024133458211184
+  threshold_std_mult : 0.19977077399878593
+  time_stop          : 12
+  tpMultiplier       : 4.1133941215313286
+
+Performance:
+  Mean ticker score (eligible) : 0.080181
+  Avg PF (raw)                 : 4.364867883354535
+  Avg PF (diag)                : 5.065279
+  Avg trades/ticker            : 2.27
+  Coverage                     : 0.741 (109/147)
+  Negative returns             : 62/147
+
+  Commission/side              : 0.000600
+  Penalty enabled              : True
+  min_tp2sl_eff                : 1.1200
+  use_trailing_exit            : True
+  trail_mode                   : trail_only
+  close_on_sellSignal          : True
